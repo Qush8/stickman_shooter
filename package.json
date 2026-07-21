@@ -1,0 +1,26 @@
+{
+  "name": "my-shooter-game",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bordiko": {
+    "gameId": "my-shooter-game",
+    "displayName": "My Shooter Game",
+    "minPlayers": 2,
+    "maxPlayers": 4,
+    "categories": ["action"],
+    "board": "custom"
+  },
+  "scripts": {
+    "dev": "bordiko dev",
+    "build": "bordiko build",
+    "publish:game": "bordiko publish",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@bordiko/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@bordiko/cli": "^0.1.0"
+  }
+}

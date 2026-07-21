@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bordiko Platformer Shooter</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1e1e1e;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script type="module">
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+
+    let latestState = null;
+    let localPlayers = {};
+    let localBullets = new Map();
+    let deadBullets = new Set();
+    let particles = [];
+
+    // Bridge inbound
+    window.addEventListener("message", (event) => {
+      const msg = event.data;
+      if (msg && msg.t === "bordiko:state") {
+        latestState = msg.state;
+        const G = latestState.G;
+
+        if (G && G.players) {
+          for (const [id, p] of Object.entries(G.players)) {
+            if (!localPlayers[id]) {
+              localPlayers[id] = { ...p, serverX: p.x, serverY: p.y, serverAimAngle: p.aimAngle, flash: 0 };
+            } else {
+              // TEMPORARY FOR TESTING: Do not overwrite local position and health with server data
+              // This makes the game 100% client-authoritative for testing purposes.
+              localPlayers[id].serverX = p.x;
+              localPlayers[id].serverY = p.y;
+              localPlayers[id].serverAimAngle = p.aimAngle;
+              
+              // We ignore p.health completely now
+              
+              // localPlayers[id].isCrouching = p.isCrouching; // Ignore this too to stop snapping
+            }
+          }
+        }
+
+        if (G && G.bullets) {
+          const serverBulletIds = new Set(G.bullets.map(b => b.id));
+          for (const id of localBullets.keys()) {
+            if (!serverBulletIds.has(id) && !id.toString().startsWith('dummy-')) {
+              localBullets.delete(id);
+            }
+          }
+          for (const b of G.bullets) {
+            if (deadBullets.has(b.id)) continue;
+            
+            if (!localBullets.has(b.id)) {
+              let matchedDummy = null;
+              for (const [did, db] of localBullets.entries()) {
+                if (did.toString().startsWith('dummy-') && db.owner === b.owner) {
+                  matchedDummy = did;
+                  break;
+                }
+              }
+
+              if (b.owner === latestState.playerId && matchedDummy) {
+                const dummy = localBullets.get(matchedDummy);
+                localBullets.set(b.id, { ...b, x: dummy.x, y: dummy.y });
+                localBullets.delete(matchedDummy);
+              } else {
+                localBullets.set(b.id, { ...b });
+                if (b.owner !== latestState.playerId && localPlayers[b.owner]) {
+                  localPlayers[b.owner].flash = 1.0;
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    window.parent.postMessage({ t: "bordiko:ready" }, "*");
+
+    const activeKeys = new Set();
+    let lastMoveSent = 0;
+    let lastShootSent = 0;
+    
+    let mouseX = 0;
+    let mouseY = 0;
+
+    const ARENA_W = 800;
+    const ARENA_H = 600;
+
+    window.addEventListener("mousemove", (e) => {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      const screenX = (e.clientX - rect.left) * ratio;
+      const screenY = (e.clientY - rect.top) * ratio;
+      
+      const scaleX = canvas.width / ARENA_W;
+      const scaleY = canvas.height / ARENA_H;
+      const scale = Math.min(scaleX, scaleY);
+      const offsetX = (canvas.width - ARENA_W * scale) / 2;
+      const offsetY = (canvas.height - ARENA_H * scale) / 2;
+      
+      mouseX = (screenX - offsetX) / scale;
+      mouseY = (screenY - offsetY) / scale;
+    });
+
+    document.addEventListener("pointerdown", (e) => {
+      if (!latestState) return;
+
+      let canShoot = false;
+
+      // In simultaneous mode, yourTurn might be strict. Let's just check if we are in active players or it's a dev harness.
+      // Or just trust the button if we're not dead.
+      const me = localPlayers[latestState.playerId];
+      if (me && me.health > 0) {
+          canShoot = true;
+      }
+
+      if (canShoot) {
+        let myBullets = 0;
+        for (const [id, b] of localBullets.entries()) {
+          if (b.owner === latestState.playerId && !deadBullets.has(id)) myBullets++;
+        }
+        
+        const now = Date.now();
+        if (myBullets < 3 && now - lastShootSent > 150) {
+          window.parent.postMessage({ 
+            t: "bordiko:move", 
+            type: "shoot", 
+            payload: { aimAngle: me.aimAngle || 0 } 
+          }, "*");
+          lastShootSent = now;
+          
+          me.flash = 1.0;
+          const vx = Math.cos(me.aimAngle) * 15;
+          const vy = Math.sin(me.aimAngle) * 15;
+          const shoulderY = me.isCrouching ? me.y - 12 : me.y - 26;
+          const dummyId = 'dummy-' + Date.now() + '-' + Math.random();
+          localBullets.set(dummyId, { 
+              owner: latestState.playerId, 
+              x: me.x + Math.cos(me.aimAngle) * 26, 
+              y: shoulderY + Math.sin(me.aimAngle) * 26, 
+              vx: vx, 
+              vy: vy 
+          });
+        }
+      }
+    });
+
+    let jumpJustPressed = false;
+    window.addEventListener("keydown", (e) => {
+      activeKeys.add(e.code);
+      if (e.key) activeKeys.add(e.key.toLowerCase());
+      
+      const keyLowerCase = e.key ? e.key.toLowerCase() : "";
+      
+      if ((e.code === "Space" || e.code === "KeyW" || keyLowerCase === "w" || keyLowerCase === "წ") && !e.repeat) {
+        jumpJustPressed = true;
+      }
+      
+      if (e.code === "Space" || e.code === "KeyW" || e.code === "KeyS") {
+        e.preventDefault();
+      }
+    });
+
+    window.addEventListener("keyup", (e) => {
+      activeKeys.delete(e.code);
+      if (e.key) activeKeys.delete(e.key.toLowerCase());
+    });
+
+    const GRAVITY = 0.6;
+    const JUMP_SPEED = 12;
+    const SPEED = 5;
+
+    function isKeyPressed(...k) {
+      return k.some(key => activeKeys.has(key));
+    }
+
+    function processInput(dtScale) {
+      if (!latestState) return;
+
+      const me = localPlayers[latestState.playerId];
+      if (!me || me.health <= 0) return;
+
+      const platforms = (latestState.G && latestState.G.platforms) ? latestState.G.platforms : [];
+
+      me.isCrouching = isKeyPressed("KeyS", "s", "S", "ს", "ArrowDown");
+      const moveSpeed = me.isCrouching ? SPEED * 0.4 : SPEED;
+
+      me.vy += GRAVITY * dtScale;
+
+      let targetVx = 0;
+      if (isKeyPressed("KeyA", "a", "A", "ა", "ArrowLeft")) targetVx -= moveSpeed;
+      if (isKeyPressed("KeyD", "d", "D", "დ", "ArrowRight")) targetVx += moveSpeed;
+
+      // Allow full control in the air so player doesn't freeze
+      me.vx += (targetVx - me.vx) * 0.3 * dtScale;
+      
+      me.x += me.vx * dtScale;
+
+      for (const plat of platforms) {
+        // Taller collision box for horizontal movement
+        if (me.x + 10 > plat.x && me.x - 10 < plat.x + plat.w && me.y + 10 > plat.y && me.y - 50 < plat.y + plat.h) {
+          if (me.vx > 0) me.x = plat.x - 10;
+          else if (me.vx < 0) me.x = plat.x + plat.w + 10;
+          me.vx = 0;
+        }
+      }
+
+      if (me.x < 10) { me.x = 10; me.vx = 0; }
+      if (me.x > ARENA_W - 10) { me.x = ARENA_W - 10; me.vx = 0; }
+
+      me.y += me.vy * dtScale;
+      
+      let grounded = false;
+      
+      for (const plat of platforms) {
+        if (me.x + 10 > plat.x && me.x - 10 < plat.x + plat.w && me.y + 10 > plat.y && me.y - 50 < plat.y + plat.h) {
+          if (me.vy > 0) { 
+            me.y = plat.y - 10; // offset because feet are now at +10
+            me.vy = 0; 
+            grounded = true; 
+          } else if (me.vy < 0) { 
+            me.y = plat.y + plat.h + 50; 
+            me.vy = 0; 
+          }
+        }
+      }
+
+      // Floor collision
+      if (me.y >= ARENA_H - 30) {
+        me.y = ARENA_H - 30;
+        me.vy = 0;
+        grounded = true;
+      }
+
+      if (jumpJustPressed && grounded) {
+        me.vy = -JUMP_SPEED;
+        jumpJustPressed = false;
+        grounded = false;
+      }
+      
+      // Reset the one-frame jump trigger so it doesn't fire continuously
+      jumpJustPressed = false;
+
+        // Update aim angle based on mouse
+        // Note: For bots/remote players we need a way to move their aim, but since we disabled server sync
+        // they will just stand still in this pure-client test mode.
+        const shoulderY = me.isCrouching ? me.y - 12 : me.y - 26;
+        me.aimAngle = Math.atan2(mouseY - shoulderY, mouseX - me.x);
+
+      // Periodically sync our state to the server
+      const now = Date.now();
+      if (now - lastMoveSent > 100) {
+        window.parent.postMessage({ 
+          t: "bordiko:move", 
+          type: "move", 
+          payload: { x: me.x, y: me.y, vx: me.vx, vy: me.vy, aimAngle: me.aimAngle, isCrouching: me.isCrouching } 
+        }, "*");
+        lastMoveSent = now;
+      }
+    }
+
+    function resize() {
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * ratio;
+      canvas.height = window.innerHeight * ratio;
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    function createParticleExplosion(x, y, color, isBig = false) {
+      const count = isBig ? 15 : 8;
+      for(let i=0; i<count; i++) {
+        particles.push({
+          x: x, y: y,
+          vx: (Math.random() - 0.5) * 12,
+          vy: (Math.random() - 0.5) * 12,
+          life: 1.0,
+          color: color
+        });
+      }
+    }
+
+    let lastTime = performance.now();
+
+    function render(time) {
+      requestAnimationFrame(render);
+      
+        const dt = Math.min(time - lastTime, 50);
+        lastTime = time;
+        const dtScale = dt / 16.666;
+
+        processInput(dtScale);
+
+        // Client-Side Physics Interpolation
+        for (const [id, p] of Object.entries(localPlayers)) {
+          if (p.serverX !== undefined) {
+             // FOR TESTING: Completely ignore server for position and health
+             // We only use server for spawning the players initially.
+             /*
+             if (latestState && id === latestState.playerId) {
+               const dist = Math.hypot(p.serverX - p.x, p.serverY - p.y);
+               if (dist > 200) {
+                  p.x = p.serverX; p.y = p.serverY;
+               }
+             } else {
+               p.x += (p.serverX - p.x) * 0.2 * dtScale;
+               p.y += (p.serverY - p.y) * 0.2 * dtScale;
+               p.aimAngle += (p.serverAimAngle - p.aimAngle) * 0.2 * dtScale;
+             }
+             */
+          }
+        }
+
+      const platforms = (latestState.G && latestState.G.platforms) ? latestState.G.platforms : [];
+
+      for (const [id, b] of localBullets.entries()) {
+         b.x += b.vx * dtScale;
+         b.y += b.vy * dtScale;
+
+         let hit = false;
+
+         // Check bullet vs platform
+         for (const plat of platforms) {
+           if (b.x >= plat.x && b.x <= plat.x + plat.w && b.y >= plat.y && b.y <= plat.y + plat.h) {
+             hit = true;
+             createParticleExplosion(b.x, b.y, "#888888", false); // spark
+             break;
+           }
+         }
+
+         // Check bullet vs players
+         if (!hit) {
+           for (const [pid, p] of Object.entries(localPlayers)) {
+             if (pid === b.owner || p.health <= 0) continue;
+             
+             // Horizontal check
+             if (b.x >= p.x - 10 && b.x <= p.x + 10) {
+               // Headshot
+               if (b.y >= p.y - 50 && b.y <= p.y - 34) {
+                 p.health = Math.max(0, p.health - 500);
+                 p.lastDamageTime = Date.now();
+                 hit = true;
+                 createParticleExplosion(b.x, b.y, "#ff0000", true);
+                 break;
+               } 
+               // Bodyshot
+               else if (b.y > p.y - 34 && b.y <= p.y + 10) {
+                 p.health = Math.max(0, p.health - 250);
+                 p.lastDamageTime = Date.now();
+                 hit = true;
+                 createParticleExplosion(b.x, b.y, "#ff3333", false);
+                 break;
+               }
+             }
+           }
+         }
+
+         if (hit) {
+           if (!id.toString().startsWith('dummy-')) deadBullets.add(id);
+           localBullets.delete(id);
+           continue;
+         }
+
+         if (b.x < -100 || b.x > ARENA_W + 100 || b.y < -100 || b.y > ARENA_H + 100) {
+             if (id.toString().startsWith('dummy-')) localBullets.delete(id);
+         }
+      }
+
+      const ratio = window.devicePixelRatio || 1;
+      ctx.save();
+      ctx.scale(ratio, ratio);
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+      if (!latestState) {
+        ctx.restore();
+        return;
+      }
+
+      const scaleX = window.innerWidth / ARENA_W;
+      const scaleY = window.innerHeight / ARENA_H;
+      const scale = Math.min(scaleX, scaleY);
+      const offsetX = (window.innerWidth - ARENA_W * scale) / 2;
+      const offsetY = (window.innerHeight - ARENA_H * scale) / 2;
+
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+
+      // Arena background
+      ctx.fillStyle = "#2c2c2c";
+      ctx.fillRect(0, 0, ARENA_W, ARENA_H);
+      ctx.strokeStyle = "#444";
+      ctx.lineWidth = 4;
+      ctx.strokeRect(0, 0, ARENA_W, ARENA_H);
+
+      // Floor line
+      ctx.strokeStyle = "#5a5a6a";
+      ctx.beginPath();
+      ctx.moveTo(0, ARENA_H - 20);
+      ctx.lineTo(ARENA_W, ARENA_H - 20);
+      ctx.stroke();
+
+      // Draw platforms
+      ctx.fillStyle = "#4a4a5a";
+      ctx.strokeStyle = "#6a6a7a";
+      ctx.lineWidth = 2;
+      for (const plat of (latestState.G.platforms || [])) {
+        ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
+        ctx.strokeRect(plat.x, plat.y, plat.w, plat.h);
+      }
+
+      // Draw bullets
+      for (const [id, b] of localBullets.entries()) {
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        ctx.rotate(Math.atan2(b.vy, b.vx));
+
+        // Tracer tail
+        ctx.fillStyle = "rgba(255, 100, 0, 0.6)";
+        ctx.beginPath();
+        ctx.moveTo(-15, -2);
+        ctx.lineTo(0, -2);
+        ctx.lineTo(5, 0);
+        ctx.lineTo(0, 2);
+        ctx.lineTo(-15, 2);
+        ctx.fill();
+
+        // Bullet head
+        ctx.fillStyle = "#ffff55";
+        ctx.shadowColor = "#ffaa00";
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(2, 0, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.restore();
+      }
+
+      // Draw particles
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const pt = particles[i];
+        pt.x += pt.vx * dtScale;
+        pt.y += pt.vy * dtScale;
+        pt.life -= 0.05 * dtScale;
+        if (pt.life <= 0) {
+          particles.splice(i, 1);
+        } else {
+          ctx.fillStyle = pt.color;
+          ctx.globalAlpha = pt.life;
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, 2 + pt.life * 2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1.0;
+        }
+      }
+
+      // Draw players
+      for (const [id, p] of Object.entries(localPlayers)) {
+        if (p.health <= 0) continue;
+
+        const isMe = latestState && id === latestState.playerId;
+        
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        
+        // Health bar
+        ctx.fillStyle = "#555";
+        ctx.fillRect(-20, -60, 40, 6);
+        ctx.fillStyle = "#55ff55";
+        ctx.fillRect(-20, -60, 40 * (p.health / 1000), 6);
+
+        // Name
+        ctx.fillStyle = "#fff";
+        ctx.font = "12px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(latestState.names[id] || id, 0, -65);
+
+        // Stickman Styling
+        ctx.strokeStyle = isMe ? "#5555ff" : "#8888ff";
+        ctx.lineWidth = 3;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+
+        if (p.isCrouching) {
+          // Crouching pose
+          ctx.beginPath();
+          ctx.arc(0, -26, 8, 0, Math.PI * 2); // Lower head
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(0, -18);
+          ctx.lineTo(0, 0); // Shorter, lower body
+          ctx.stroke();
+
+          // Legs crouched
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(-12, 10);
+          ctx.moveTo(0, 0);
+          ctx.lineTo(12, 10);
+          ctx.stroke();
+        } else {
+          // Standing pose
+          ctx.beginPath();
+          ctx.arc(0, -42, 8, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(0, -34);
+          ctx.lineTo(0, -10);
+          ctx.stroke();
+
+          // Legs (Walking animation based on horizontal movement)
+          let legOffset = 0;
+          if (Math.abs(p.vx) > 1 && p.vy === 0) {
+              legOffset = Math.sin(p.x * 0.15) * 12;
+          }
+          ctx.beginPath();
+          ctx.moveTo(0, -10);
+          ctx.lineTo(-10 + legOffset, 10);
+          ctx.moveTo(0, -10);
+          ctx.lineTo(10 - legOffset, 10);
+          ctx.stroke();
+        }
+
+        // Arms & Gun
+        ctx.save();
+        const drawShoulderY = p.isCrouching ? -12 : -26;
+        ctx.translate(0, drawShoulderY);
+        ctx.rotate(p.aimAngle);
+        
+        // Arms
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(24, 0); 
+        ctx.stroke();
+
+        // Gun
+        ctx.fillStyle = "#aaaaaa";
+        ctx.fillRect(22, -3, 14, 6);
+        ctx.fillRect(24, 0, 4, 8);
+
+        // Muzzle Flash
+        if (p.flash > 0) {
+           ctx.save();
+           ctx.translate(36, 0);
+           ctx.fillStyle = `rgba(255, 200, 0, ${p.flash})`;
+           ctx.beginPath();
+           ctx.moveTo(0, -5);
+           ctx.lineTo(18, 0);
+           ctx.lineTo(0, 5);
+           ctx.closePath();
+           ctx.shadowColor = "#ff8800";
+           ctx.shadowBlur = 12;
+           ctx.fill();
+           ctx.restore();
+           
+           p.flash -= 0.1 * dtScale;
+        }
+        
+        ctx.restore(); // end arms
+        ctx.restore(); // end player
+      }
+
+      ctx.restore();
+
+      // HUD
+      ctx.fillStyle = "#fff";
+      ctx.font = "16px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(`Player: ${latestState.playerId}`, 10, 24);
+      if (latestState.yourTurn) {
+        ctx.fillStyle = "#55ff55";
+        ctx.fillText("Your Turn", 10, 48);
+      }
+      
+      if (latestState.ended) {
+        ctx.fillStyle = "#ffaa00";
+        ctx.font = "32px sans-serif";
+        ctx.textAlign = "center";
+        let resultText = "Game Over";
+        if (latestState.result) {
+          if (latestState.result.winner) {
+             resultText = `Winner: ${latestState.names[latestState.result.winner] || latestState.result.winner}`;
+          } else if (latestState.result.draw) {
+             resultText = "Draw";
+          }
+        }
+        ctx.fillText(resultText, window.innerWidth / 2, window.innerHeight / 2);
+      }
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
