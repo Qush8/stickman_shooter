@@ -4,8 +4,8 @@
   "type": "module",
   "private": true,
   "bordiko": {
-    "gameId": "my-shooter-game",
-    "displayName": "My Shooter Game",
+    "gameId": "stickman-brawler",
+    "displayName": "Stickman Brawler",
     "minPlayers": 2,
     "maxPlayers": 4,
     "categories": [
@@ -16,7 +16,8 @@
   "scripts": {
     "build:ui": "node scripts/embed-sfx.mjs && esbuild src/ui.js --bundle --outfile=dist/ui.bundle.js && node build-ui.cjs",
     "dev": "node scripts/dev.mjs",
-    "build": "bordiko build",
+    "build": "npm run build:ui && bordiko build",
+    "prepublish:game": "npm run build",
     "publish:game": "bordiko publish",
     "test": "node --test \"test/*.test.ts\""
   },

@@ -1,4 +1,10 @@
-import { defineGame, INVALID_MOVE, type GameResult, type Json } from "@bordiko/sdk";
+import {
+  defineGame,
+  INVALID_MOVE,
+  type GameResult,
+  type Json,
+  type RandomAPI,
+} from "@bordiko/sdk";
 import * as planck from "planck";
 import { ARENA_H, ARENA_W, getMap, getNextMapId, type MapId } from "./maps.ts";
 
@@ -425,16 +431,6 @@ function buildMatchResult(G: ShooterState): GameResult | void {
   return { winners, scores: G.scores, reason: "best-of-5" };
 }
 
-function seededRandom(seed: string, n: number): number {
-  let h = 2166136261;
-  const s = `${seed}:${n}`;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0) / 4294967296;
-}
-
 function getFixtureData(fixture: planck.Fixture): FixtureUserData | null {
   return (fixture.getUserData() as FixtureUserData | null) ?? null;
 }
@@ -536,11 +532,10 @@ function getElevators(G: ShooterState) {
   return G.platforms.filter((p) => !p.broken && p.kind === "elevator");
 }
 
-function getRandomElevator(G: ShooterState, n: number): PlatformState | null {
+function getRandomElevator(G: ShooterState, random: RandomAPI): PlatformState | null {
   const elevators = getElevators(G);
   if (!elevators.length) return null;
-  const idx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 17 + n) * elevators.length);
-  return elevators[idx] ?? null;
+  return random.pick(elevators);
 }
 
 function findFallTargetY(
@@ -1577,10 +1572,9 @@ function updatePickupDrops(G: ShooterState) {
   }
 }
 
-function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, n: number) {
+function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, random: RandomAPI) {
   const id = G.nextPickupId++;
-  const roll = seededRandom(G.matchSeed, G.spawnTick * 31 + n);
-  const kind: PickupState["kind"] = roll < 0.5 ? "health" : "weapon";
+  const kind: PickupState["kind"] = random.float() < 0.5 ? "health" : "weapon";
   const targetY = plat.y - 20;
   const pickup: PickupState = {
     id,
@@ -1591,19 +1585,17 @@ function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, n: number) 
     onPlatformId: plat.id,
   };
   if (kind === "weapon") {
-    const wIdx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 37 + n) * WEAPON_ORDER.length);
-    pickup.weaponId = WEAPON_ORDER[wIdx] ?? "winchester";
+    pickup.weaponId = random.pick(WEAPON_ORDER);
   }
   G.pickups.push(pickup);
   createPickupBody(pickup);
 }
 
-function spawnIncomingElevator(G: ShooterState, n: number) {
-  const fromLeft = seededRandom(G.matchSeed, G.spawnTick * 41 + n) < 0.5;
+function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
+  const fromLeft = random.bool();
   const mapDef = getMap(G.currentMapId);
   const yChoices = mapDef.elevatorYLevels;
-  const yIdx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 43 + n) * yChoices.length);
-  const y = yChoices[yIdx] ?? 273;
+  const y = yChoices.length ? random.pick(yChoices) : 273;
   const id = G.nextPlatformId++;
   const w = 100;
   const x = fromLeft ? -140 : ARENA_W + 40;
@@ -1629,19 +1621,18 @@ function spawnIncomingElevator(G: ShooterState, n: number) {
   createPlatformBody(plat);
 }
 
-function runSpawnCycle(G: ShooterState) {
+function runSpawnCycle(G: ShooterState, random: RandomAPI) {
   G.spawnTick += 1;
   if (G.spawnTick % SPAWN_INTERVAL_TICKS !== 0) return;
 
-  const n = G.spawnTick;
-  spawnIncomingElevator(G, n);
+  spawnIncomingElevator(G, random);
 
-  const elev = getRandomElevator(G, n);
+  const elev = getRandomElevator(G, random);
   if (elev) {
-    spawnPickupOnPlatform(G, elev, n);
-    if (seededRandom(G.matchSeed, n * 53) > 0.4) {
-      const elev2 = getRandomElevator(G, n + 7);
-      if (elev2) spawnPickupOnPlatform(G, elev2, n + 1);
+    spawnPickupOnPlatform(G, elev, random);
+    if (random.float() > 0.4) {
+      const elev2 = getRandomElevator(G, random);
+      if (elev2) spawnPickupOnPlatform(G, elev2, random);
     }
   }
 }
@@ -1913,12 +1904,12 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
   }
 }
 
-function advanceWorld(G: ShooterState) {
+function advanceWorld(G: ShooterState, random: RandomAPI) {
   setCurrentG(G);
   G.hitEvents = [];
   G.worldTick += 1;
   if (G.roundPhase === "playing") {
-    runSpawnCycle(G);
+    runSpawnCycle(G, random);
     advancePlatformMotion(G);
     updatePickupDrops(G);
     world.step(1 / 60);
@@ -2010,7 +2001,13 @@ function countActiveProjectiles(G: ShooterState, owner: string, weaponId: Weapon
   return G.bullets.filter((b) => b.owner === owner && b.weaponId === weaponId).length;
 }
 
-function fireWeapon(G: ShooterState, playerId: string, aimAngle: number, facing: number) {
+function fireWeapon(
+  G: ShooterState,
+  playerId: string,
+  aimAngle: number,
+  facing: number,
+  random: RandomAPI,
+) {
   const p = G.players[playerId];
   const bodies = playerBodies[playerId];
   if (!p || !bodies || p.health <= 0) return false;
@@ -2056,7 +2053,7 @@ function fireWeapon(G: ShooterState, playerId: string, aimAngle: number, facing:
   const spawnPad = 0.38;
   for (let i = 0; i < pellets; i++) {
     if (G.bullets.filter((b) => b.owner === playerId).length >= weapon.maxActive) break;
-    const spread = (Math.random() - 0.5) * weapon.spread * 2;
+    const spread = (random.float() - 0.5) * weapon.spread * 2;
     const shotAngle = aimAngle + spread;
     const startX = muzzle.x + Math.cos(shotAngle) * spawnPad;
     const startY = muzzle.y + Math.sin(shotAngle) * spawnPad;
@@ -2068,9 +2065,9 @@ function fireWeapon(G: ShooterState, playerId: string, aimAngle: number, facing:
 }
 
 export default defineGame<ShooterState>({
-  name: "my-shooter-game",
+  name: "stickman-brawler",
   meta: {
-    displayName: "My Shooter Game",
+    displayName: "Stickman Brawler",
     categories: ["action"],
   },
   minPlayers: 2,
@@ -2243,7 +2240,7 @@ export default defineGame<ShooterState>({
         torso.setLinearVelocity(planck.Vec2(0, vel.y));
       }
 
-      advanceWorld(G);
+      advanceWorld(G, ctx.random);
     },
     switchWeapon: (G, payload, ctx) => {
       setCurrentG(G);
@@ -2266,7 +2263,7 @@ export default defineGame<ShooterState>({
         return INVALID_MOVE;
       }
 
-      advanceWorld(G);
+      advanceWorld(G, ctx.random);
     },
     shoot: (G, payload, ctx) => {
       setCurrentG(G);
@@ -2289,9 +2286,9 @@ export default defineGame<ShooterState>({
           : p.facing ?? (Math.cos(aimAngle) >= 0 ? 1 : -1);
       p.facing = facing;
 
-      if (!fireWeapon(G, ctx.playerId, aimAngle, facing)) return INVALID_MOVE;
+      if (!fireWeapon(G, ctx.playerId, aimAngle, facing, ctx.random)) return INVALID_MOVE;
 
-      advanceWorld(G);
+      advanceWorld(G, ctx.random);
     },
   },
   endIf: (G) => buildMatchResult(G),
