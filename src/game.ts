@@ -49,8 +49,8 @@ export interface ShooterState {
   hitEvents: HitEvent[];
 }
 
-const ARENA_W = 800;
-const ARENA_H = 600;
+const ARENA_W = 912;
+const ARENA_H = 500;
 const FLOOR_Y = ARENA_H;
 const SCALE = 30;
 const MAX_HEALTH = 1000;
@@ -60,10 +60,17 @@ const PLAYER_HALF_W = 0.48;
 const PLAYER_HALF_H = 1.06;
 const HEAD_OFFSET = 36;
 const HEAD_RADIUS = 0.46;
-const MOVE_SPEED = 9.2;
-const JUMP_IMPULSE = 19;
+const MOVE_SPEED = 30;
+const JUMP_IMPULSE = 54;
+const GRAVITY = 195;
+const WALL_JUMP_IMPULSE_X = 22;
+const BULLET_SPEED = 58;
+const BULLET_GRAVITY_SCALE = 0.62;
+const AIR_RECOIL_FORCE_MUL = 2.5;
+const AIR_RECOIL_VEL_MUL = 0.45;
+const AIR_RECOIL_IMPULSE_MUL = 1.4;
 const FEET_PIXELS = PLAYER_HALF_H * SCALE;
-const GROUNDED_VEL_Y = 5;
+const GROUNDED_VEL_Y = 12;
 const GROUNDED_GAP = 0.5;
 const STAND_LIFT = 0.14;
 const MAX_BULLET_BOUNCES = 2;
@@ -74,17 +81,17 @@ const PLATFORM_BORDER_PX = 2;
 const STICK_BODY_LEN_PX = 44;
 const STICK_ARM_LEN_PX = 28;
 const STICK_CROUCH_DROP_PX = 18;
-const GUN_BARREL_PX = 22;
-const GUN_TIP_PX = 3.5;
+const GUN_BARREL_PX = 23;
+const GUN_TIP_PX = 2.4;
 
-// Jump reach (px): vertical ~165, diagonal ~115 up + ~150 sideways — keep tiers within that.
+// Jump reach (px): vertical ~195, diagonal ~115 up + ~150 sideways — keep tiers within that.
 const PLATFORMS = [
-  { id: 0, x: 55, y: 488, w: 118, h: 12 },
-  { id: 1, x: 205, y: 373, w: 118, h: 12 },
-  { id: 2, x: 355, y: 488, w: 118, h: 12 },
-  { id: 3, x: 505, y: 373, w: 118, h: 12 },
-  { id: 4, x: 355, y: 258, w: 118, h: 12 },
-  { id: 5, x: 205, y: 143, w: 118, h: 12 },
+  { id: 0, x: 63, y: 388, w: 118, h: 12 },
+  { id: 1, x: 234, y: 273, w: 118, h: 12 },
+  { id: 2, x: 405, y: 388, w: 118, h: 12 },
+  { id: 3, x: 576, y: 273, w: 118, h: 12 },
+  { id: 4, x: 405, y: 158, w: 118, h: 12 },
+  { id: 5, x: 234, y: 43, w: 118, h: 12 },
 ];
 
 const spawnOnFloor = (x: number) => ({
@@ -107,6 +114,9 @@ let platformBodies: Record<number, planck.Body> = {};
 let bulletBodies: Record<number, planck.Body> = {};
 let bulletBounceCounts: Record<number, number> = {};
 let playerGrounded: Record<string, boolean> = {};
+let playerWallJumpUsed: Record<string, boolean> = {};
+let playerWallContact: Record<string, { nx: number; ny: number } | null> = {};
+let playerJumpGrace: Record<string, number> = {};
 const pendingBulletDestroys = new Set<number>();
 const pendingHits: HitEvent[] = [];
 const pendingPlatformDamages: { id: number; damage: number; x: number; y: number }[] = [];
@@ -127,7 +137,7 @@ function createPlatformBody(def: PlatformDef) {
     position: planck.Vec2((def.x + def.w / 2) / SCALE, (def.y + def.h / 2) / SCALE),
   });
   pBody.createFixture(planck.Box(def.w / 2 / SCALE, def.h / 2 / SCALE), {
-    friction: 0.8,
+    friction: 0.15,
     userData: { type: "platform", id: def.id } satisfies FixtureUserData,
   });
   platformBodies[def.id] = pBody;
@@ -249,6 +259,9 @@ function createPlayerPhysics(id: string, x: number, y: number) {
 
   playerBodies[id] = { torso, head };
   playerGrounded[id] = true;
+  playerWallJumpUsed[id] = false;
+  playerWallContact[id] = null;
+  playerJumpGrace[id] = 0;
 }
 
 function destroyPlayerPhysics(id: string) {
@@ -258,6 +271,9 @@ function destroyPlayerPhysics(id: string) {
   world.destroyBody(bodies.head);
   delete playerBodies[id];
   delete playerGrounded[id];
+  delete playerWallJumpUsed[id];
+  delete playerWallContact[id];
+  delete playerJumpGrace[id];
 }
 
 function feetPositionMeters(torso: planck.Body) {
@@ -319,6 +335,42 @@ function hasSupportContact(torso: planck.Body, selfId: string): boolean {
   return false;
 }
 
+function hasTopSupportContact(body: planck.Body, selfId: string): boolean {
+  for (let edge = body.getContactList(); edge; edge = edge.next) {
+    const contact = edge.contact;
+    if (!contact.isTouching()) continue;
+
+    const fixtureA = contact.getFixtureA();
+    const fixtureB = contact.getFixtureB();
+    const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
+    if (fixtureA.getBody() !== body && fixtureB.getBody() !== body) continue;
+    if (!isStandableFixture(otherFixture, selfId)) continue;
+
+    contact.getWorldManifold(sharedWorldManifold);
+    const nx = sharedWorldManifold.normal.x;
+    const ny = sharedWorldManifold.normal.y;
+    if (Math.abs(ny) > 0.45 && Math.abs(nx) < 0.45) return true;
+  }
+  return false;
+}
+
+function canPerformStandingJump(id: string, torso: planck.Body, crouching: boolean): boolean {
+  if (crouching) return false;
+
+  const vel = torso.getLinearVelocity();
+  if (Math.abs(vel.y) > GROUNDED_VEL_Y) return false;
+
+  if (hasTopSupportContact(torso, id) || hasTopSupportContact(playerBodies[id].head, id)) {
+    return true;
+  }
+
+  const feet = feetPositionMeters(torso);
+  const surfaceHit = raycastStandBelow(feet.x, feet.y, id, 0.85);
+  if (surfaceHit !== null && feetOnSurface(feet, surfaceHit.y)) return true;
+
+  return feet.y * SCALE >= FLOOR_Y - 14;
+}
+
 function measureGrounded(id: string, torso: planck.Body): boolean {
   const vel = torso.getLinearVelocity();
   if (Math.abs(vel.y) > GROUNDED_VEL_Y) return false;
@@ -356,7 +408,7 @@ function snapPlayersToGround() {
   for (const [, bodies] of Object.entries(playerBodies)) {
     const torso = bodies.torso;
     const vel = torso.getLinearVelocity();
-    if (Math.abs(vel.y) > 3) continue;
+    if (Math.abs(vel.y) > 12) continue;
 
     const feet = feetPositionMeters(torso);
     const surfaceHit = raycastStaticGroundBelow(feet.x, feet.y, 0.85);
@@ -376,6 +428,128 @@ function snapPlayersToGround() {
 
 function isPlayerGrounded(id: string, torso: planck.Body): boolean {
   return measureGrounded(id, torso);
+}
+
+function applyVerticalJump(
+  torso: planck.Body,
+  playerId: string,
+  opts: { keepVx?: number; horizImpulse?: number } = {},
+) {
+  const mass = torso.getMass();
+  const horiz = opts.horizImpulse ?? 0;
+  if (horiz !== 0) {
+    torso.setLinearVelocity(planck.Vec2(0, 0));
+  } else {
+    torso.setLinearVelocity(planck.Vec2(opts.keepVx ?? 0, 0));
+  }
+  torso.applyLinearImpulse(
+    planck.Vec2(mass * horiz, -mass * JUMP_IMPULSE),
+    torso.getWorldCenter(),
+    true,
+  );
+  playerJumpGrace[playerId] = 8;
+}
+
+function isWallLikeContact(otherFixture: planck.Fixture, selfId: string) {
+  const data = getFixtureData(otherFixture);
+  const body = otherFixture.getBody();
+  if (data?.type === "bullet") return false;
+  if (data?.type === "player" || data?.type === "head") {
+    if (data.id === selfId) return false;
+    return playerBodies[data.id] != null;
+  }
+  return isSolidSurface(data, body);
+}
+
+function readSideContactNormal(contact: planck.Contact, selfBody: planck.Body) {
+  contact.getWorldManifold(sharedWorldManifold);
+  const nx = sharedWorldManifold.normal.x;
+  const ny = sharedWorldManifold.normal.y;
+  if (Math.abs(nx) <= 0.5 || Math.abs(ny) >= 0.45) return null;
+  return { nx, ny };
+}
+
+function scanBodyWallContact(body: planck.Body, selfId: string) {
+  for (let edge = body.getContactList(); edge; edge = edge.next) {
+    const contact = edge.contact;
+    if (!contact.isTouching()) continue;
+
+    const fixtureA = contact.getFixtureA();
+    const fixtureB = contact.getFixtureB();
+    const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
+    if (fixtureA.getBody() !== body && fixtureB.getBody() !== body) continue;
+    if (!isWallLikeContact(otherFixture, selfId)) continue;
+
+    const side = readSideContactNormal(contact, body);
+    if (side) return side;
+  }
+  return null;
+}
+
+function updatePlayerWallContacts() {
+  for (const [id, bodies] of Object.entries(playerBodies)) {
+    if (isPlayerGrounded(id, bodies.torso)) {
+      playerWallJumpUsed[id] = false;
+      playerWallContact[id] = null;
+      continue;
+    }
+
+    playerWallContact[id] =
+      scanBodyWallContact(bodies.torso, id) ?? scanBodyWallContact(bodies.head, id);
+  }
+}
+
+function resolvePlayerSideStick() {
+  for (const [id, bodies] of Object.entries(playerBodies)) {
+    if (isPlayerGrounded(id, bodies.torso)) continue;
+    if ((playerJumpGrace[id] ?? 0) > 0) continue;
+
+    const torso = bodies.torso;
+    const vel = torso.getLinearVelocity();
+    if (vel.y < -2) continue;
+
+    let adjusted = false;
+    let slideVx = vel.x;
+    let slideVy = vel.y;
+
+    for (const body of [torso, bodies.head]) {
+      for (let edge = body.getContactList(); edge; edge = edge.next) {
+        const contact = edge.contact;
+        if (!contact.isTouching()) continue;
+
+        const fixtureA = contact.getFixtureA();
+        const fixtureB = contact.getFixtureB();
+        const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
+        if (fixtureA.getBody() !== body && fixtureB.getBody() !== body) continue;
+        if (!isWallLikeContact(otherFixture, id)) continue;
+
+        contact.getWorldManifold(sharedWorldManifold);
+        const nx = sharedWorldManifold.normal.x;
+        const ny = sharedWorldManifold.normal.y;
+
+        if (Math.abs(nx) > 0.5 && Math.abs(ny) < 0.45) {
+          slideVx *= 0.2;
+          if (vel.y >= 0) slideVy = Math.max(slideVy, 5);
+          adjusted = true;
+          continue;
+        }
+
+        if (ny > 0.55 && vel.y >= 0 && vel.y < 2) {
+          slideVy = Math.max(slideVy, 5);
+          slideVx *= 0.7;
+          adjusted = true;
+        }
+      }
+    }
+
+    if (adjusted) {
+      torso.setLinearVelocity(planck.Vec2(slideVx, slideVy));
+    }
+  }
+
+  for (const id of Object.keys(playerJumpGrace)) {
+    if (playerJumpGrace[id] > 0) playerJumpGrace[id]--;
+  }
 }
 
 function syncStateFromPhysics(G: ShooterState) {
@@ -516,6 +690,8 @@ function advanceWorld(G: ShooterState) {
   G.hitEvents = [];
   world.step(1 / 60);
   updatePlayerGroundedState();
+  updatePlayerWallContacts();
+  resolvePlayerSideStick();
   snapPlayersToGround();
   processPendingHits(G);
 
@@ -551,15 +727,18 @@ function resetRound(G: ShooterState) {
   bulletBodies = {};
   bulletBounceCounts = {};
   playerGrounded = {};
+  playerWallJumpUsed = {};
+  playerWallContact = {};
+  playerJumpGrace = {};
   G.bullets = [];
   G.hitEvents = [];
   initPlatforms(G);
 
   const spawns = [
-    spawnOnFloor(100),
-    spawnOnFloor(ARENA_W - 100),
-    spawnOnFloor(300),
-    spawnOnFloor(500),
+    spawnOnFloor(114),
+    spawnOnFloor(ARENA_W - 114),
+    spawnOnFloor(342),
+    spawnOnFloor(570),
   ];
 
   let index = 0;
@@ -583,12 +762,15 @@ export default defineGame<ShooterState>({
   maxPlayers: 4,
 
   setup: (ctx) => {
-    world = planck.World({ gravity: planck.Vec2(0, 30) });
+    world = planck.World({ gravity: planck.Vec2(0, GRAVITY) });
     playerBodies = {};
     platformBodies = {};
     bulletBodies = {};
     bulletBounceCounts = {};
     playerGrounded = {};
+    playerWallJumpUsed = {};
+    playerWallContact = {};
+    playerJumpGrace = {};
     pendingHits.length = 0;
     pendingPlatformDamages.length = 0;
     pendingBulletDestroys.clear();
@@ -619,10 +801,10 @@ export default defineGame<ShooterState>({
 
     const players: Record<string, PlayerState> = {};
     const spawns = [
-      spawnOnFloor(100),
-      spawnOnFloor(ARENA_W - 100),
-      spawnOnFloor(300),
-      spawnOnFloor(500),
+      spawnOnFloor(114),
+      spawnOnFloor(ARENA_W - 114),
+      spawnOnFloor(342),
+      spawnOnFloor(570),
     ];
 
     ctx.players.forEach((id, index) => {
@@ -682,15 +864,18 @@ export default defineGame<ShooterState>({
         p.facing = 1;
         torso.setLinearVelocity(planck.Vec2(MOVE_SPEED * speedMul, vel.y));
       } else if (data.action === "jump") {
-        if (grounded && !p.crouching) {
-          const mass = torso.getMass();
-          torso.setLinearVelocity(planck.Vec2(vel.x, 0));
-          torso.applyLinearImpulse(
-            planck.Vec2(0, -mass * JUMP_IMPULSE),
-            torso.getWorldCenter(),
-            true,
-          );
+        const wall = playerWallContact[ctx.playerId];
+        const standingJump = canPerformStandingJump(ctx.playerId, torso, p.crouching);
+
+        if (standingJump) {
+          applyVerticalJump(torso, ctx.playerId, { keepVx: vel.x });
           playerGrounded[ctx.playerId] = false;
+          playerWallJumpUsed[ctx.playerId] = false;
+        } else if (wall && !playerWallJumpUsed[ctx.playerId]) {
+          const awayX = wall.nx >= 0 ? 1 : -1;
+          applyVerticalJump(torso, ctx.playerId, { horizImpulse: WALL_JUMP_IMPULSE_X * awayX });
+          playerGrounded[ctx.playerId] = false;
+          playerWallJumpUsed[ctx.playerId] = true;
         }
       } else if (data.action === "crouch" || (crouching && !data.action)) {
         torso.setLinearVelocity(planck.Vec2(vel.x * 0.35, vel.y));
@@ -732,7 +917,7 @@ export default defineGame<ShooterState>({
 
       const baseRecoil = p.crouching ? 12 : 36;
       const sideways = Math.abs(Math.sin(aimAngle));
-      const groundedMul = onGround ? 1 + sideways * 1.15 : 1.65;
+      const groundedMul = onGround ? 1 + sideways * 1.15 : AIR_RECOIL_FORCE_MUL;
       const recoilForce = baseRecoil * groundedMul;
       const rx = -Math.cos(aimAngle) * recoilForce;
       const ry = -Math.sin(aimAngle) * recoilForce;
@@ -744,9 +929,13 @@ export default defineGame<ShooterState>({
         torso.applyLinearImpulse(planck.Vec2(rx * 1.4, ry * 1.4), torso.getWorldCenter(), true);
       } else {
         torso.setLinearVelocity(
-          planck.Vec2(tVel.x + rx * 0.18, tVel.y + ry * 0.18),
+          planck.Vec2(tVel.x + rx * AIR_RECOIL_VEL_MUL, tVel.y + ry * AIR_RECOIL_VEL_MUL),
         );
-        torso.applyLinearImpulse(planck.Vec2(rx * 0.75, ry * 0.75), torso.getWorldCenter(), true);
+        torso.applyLinearImpulse(
+          planck.Vec2(rx * AIR_RECOIL_IMPULSE_MUL, ry * AIR_RECOIL_IMPULSE_MUL),
+          torso.getWorldCenter(),
+          true,
+        );
       }
 
       const bulletId = G.nextBulletId++;
@@ -757,17 +946,20 @@ export default defineGame<ShooterState>({
       const bBody = world.createDynamicBody({
         position: planck.Vec2(startX, startY),
         bullet: true,
+        gravityScale: BULLET_GRAVITY_SCALE,
       });
-      bBody.createFixture(planck.Circle(0.1), {
+      bBody.createFixture(planck.Circle(0.07), {
         density: 5.0,
         restitution: 0.55,
         friction: 0.05,
         userData: { type: "bullet", id: bulletId, owner: ctx.playerId } satisfies FixtureUserData,
       });
 
-      const bulletSpeed = 40;
+      const bulletSpeed = BULLET_SPEED;
+      const spread = (Math.random() - 0.5) * 0.04;
+      const shotAngle = aimAngle + spread;
       bBody.setLinearVelocity(
-        planck.Vec2(Math.cos(aimAngle) * bulletSpeed, Math.sin(aimAngle) * bulletSpeed),
+        planck.Vec2(Math.cos(shotAngle) * bulletSpeed, Math.sin(shotAngle) * bulletSpeed),
       );
 
       bulletBodies[bulletId] = bBody;

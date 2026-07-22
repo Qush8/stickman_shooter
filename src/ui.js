@@ -1,12 +1,12 @@
 import '@pixi/unsafe-eval';
 import * as PIXI from 'pixi.js';
 
-const ARENA_W = 800;
-const ARENA_H = 600;
+const ARENA_W = 912;
+const ARENA_H = 500;
 const FLOOR_Y = ARENA_H;
 const SCALE = 30;
 const FEET_OFF = 32; // matches game.ts PLAYER_HALF_H * SCALE
-const FIT_PADDING = 0.88;
+const FIT_PADDING = 0.9;
 
 let viewScale = 1;
 let viewOffsetX = 0;
@@ -31,12 +31,15 @@ const STICK = {
 };
 
 const GUN = {
-  barrel: 22,
-  halfW: 3,
-  tipR: 3.5,
-  gripHalfW: 3,
-  gripLen: 11,
+  barrel: 23,
+  slideHalfH: 3.2,
+  gripLen: 10,
+  gripHalfW: 4,
+  tipR: 2.4,
 };
+
+const SHOOT_FACE_MS = 2000;
+const CORPSE_FALL_MS = 260;
 
 // PixiJS Setup — renderer fills container; gameContainer scales the fixed arena
 const gameContainerEl = document.getElementById('game-container');
@@ -94,12 +97,12 @@ gameContainer.addChild(particlesContainer);
 
 // Mirror game.ts PLATFORMS — fallback if state sync omits platforms briefly
 const STATIC_PLATFORMS = [
-  { id: 0, x: 55, y: 488, w: 118, h: 12 },
-  { id: 1, x: 205, y: 373, w: 118, h: 12 },
-  { id: 2, x: 355, y: 488, w: 118, h: 12 },
-  { id: 3, x: 505, y: 373, w: 118, h: 12 },
-  { id: 4, x: 355, y: 258, w: 118, h: 12 },
-  { id: 5, x: 205, y: 143, w: 118, h: 12 },
+  { id: 0, x: 63, y: 388, w: 118, h: 12 },
+  { id: 1, x: 234, y: 273, w: 118, h: 12 },
+  { id: 2, x: 405, y: 388, w: 118, h: 12 },
+  { id: 3, x: 576, y: 273, w: 118, h: 12 },
+  { id: 4, x: 405, y: 158, w: 118, h: 12 },
+  { id: 5, x: 234, y: 43, w: 118, h: 12 },
 ];
 
 const getPlatformsForRender = (G) => {
@@ -228,8 +231,7 @@ document.addEventListener("pointerdown", (e) => {
     if (me && me.health > 0) {
         const gun = getGunPose(me);
         me.aimAngle = Math.atan2(mouseY - gun.neckTop, mouseX - me.displayTorso.x);
-        me.faceExpr = "shoot";
-        me.faceTimer = 0.35;
+        markShootFace(me);
         window.parent.postMessage({ 
             t: "bordiko:move", 
             type: "shoot", 
@@ -320,6 +322,12 @@ window.addEventListener("message", (event) => {
                         lp.faceExpr = "hurt";
                         lp.faceTimer = 0.4;
                     }
+                    if (p.health <= 0 && lp.prevHealth > 0) {
+                        startDeathCorpse(lp);
+                    }
+                    if (p.health > 0) {
+                        lp.deathCorpse = null;
+                    }
                     lp.prevHealth = p.health;
 
                     lp.vx = p.torso.x - prevX;
@@ -370,10 +378,7 @@ window.addEventListener("message", (event) => {
                     localBullets.set(b.id, { ...b, prevBody: { ...b.body } });
                     createMuzzleFlash(b.body.x, b.body.y);
                     const shooter = localPlayers[b.owner];
-                    if (shooter) {
-                        shooter.faceExpr = "shoot";
-                        shooter.faceTimer = 0.35;
-                    }
+                    if (shooter) markShootFace(shooter);
                 } else {
                     const lb = localBullets.get(b.id);
                     lb.prevBody = lb.body ? { ...lb.body } : null;
@@ -515,39 +520,80 @@ const drawGunInHand = (g, gun, isMe) => {
     const { handX, handY, aim, muzzleX, muzzleY } = gun;
     const cos = Math.cos(aim);
     const sin = Math.sin(aim);
-    const px = -sin * GUN.halfW;
-    const py = cos * GUN.halfW;
-    const bx = cos * GUN.barrel;
-    const by = sin * GUN.barrel;
-    const bodyCol = isMe ? 0xff4400 : 0xff6622;
-    const gripCol = isMe ? 0x3a2215 : 0x4a3020;
-    const tipCol = 0xffee22;
+    const px = -sin;
+    const py = cos;
 
-    g.lineStyle(3, 0xffffff, 1, 0.5, true);
-    g.beginFill(bodyCol);
-    g.moveTo(handX + px, handY + py);
-    g.lineTo(handX + bx + px, handY + by + py);
-    g.lineTo(handX + bx - px, handY + by - py);
-    g.lineTo(handX - px, handY - py);
-    g.closePath();
+    const at = (along, across) => ({
+        x: handX + cos * along + px * across,
+        y: handY + sin * along + py * across,
+    });
+
+    const slideCol = isMe ? 0x3d3d3d : 0x4a4a4a;
+    const frameCol = 0x2a2a2a;
+    const gripCol = 0x1c1410;
+    const accentCol = 0xffe135;
+    const outlineCol = 0x111111;
+
+    const poly = (points) => {
+        if (!points.length) return;
+        g.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) g.lineTo(points[i].x, points[i].y);
+        g.closePath();
+    };
+
+    // Slide + barrel (pistol top)
+    g.lineStyle(1.5, outlineCol, 1, 0.5, true);
+    g.beginFill(slideCol);
+    poly([
+        at(-1, -GUN.slideHalfH),
+        at(GUN.barrel - 2, -GUN.slideHalfH),
+        at(GUN.barrel + 3, -2.5),
+        at(GUN.barrel + 3, 2.5),
+        at(GUN.barrel - 2, GUN.slideHalfH),
+        at(-1, GUN.slideHalfH),
+    ]);
     g.endFill();
 
-    const gx = -sin * 6;
-    const gy = cos * 6;
-    const gpx = cos * GUN.gripHalfW;
-    const gpy = sin * GUN.gripHalfW;
-    g.lineStyle(2.5, 0xffffff, 0.95, 0.5, true);
+    // Lower frame / receiver
+    g.beginFill(frameCol);
+    poly([
+        at(-4, 2),
+        at(10, 2),
+        at(14, 5),
+        at(8, 7),
+        at(-2, 6),
+    ]);
+    g.endFill();
+
+    // Grip handle
     g.beginFill(gripCol);
-    g.moveTo(handX + gx + gpx, handY + gy + gpy);
-    g.lineTo(handX + gx - gpx, handY + gy - gpy);
-    g.lineTo(handX + gx - gpx + cos * GUN.gripLen, handY + gy - gpy + sin * GUN.gripLen);
-    g.lineTo(handX + gx + gpx + cos * GUN.gripLen, handY + gy + gpy + sin * GUN.gripLen);
-    g.closePath();
+    poly([
+        at(-2, 5),
+        at(6, 6),
+        at(5, 6 + GUN.gripLen * 0.55),
+        at(-1, 6 + GUN.gripLen),
+        at(-6, 8),
+    ]);
     g.endFill();
 
-    g.lineStyle(2, 0xffffff, 1, 0.5, true);
-    g.beginFill(tipCol);
-    g.drawCircle(muzzleX, muzzleY, GUN.tipR);
+    // Trigger guard
+    g.lineStyle(2, outlineCol, 0.9, 0.5, true, PIXI.LINE_CAP.ROUND);
+    g.moveTo(at(2, 5).x, at(2, 5).y);
+    g.quadraticCurveTo(at(5, 10).x, at(5, 10).y, at(9, 6).x, at(9, 6).y);
+
+    // Front sight
+    g.beginFill(0x222222);
+    const sight = at(GUN.barrel - 4, -GUN.slideHalfH - 2.5);
+    g.drawRect(sight.x - 1.2, sight.y - 1.2, 2.4, 3.2);
+    g.endFill();
+
+    // Neon muzzle tip
+    g.lineStyle(3, accentCol, 1, 0.5, true, PIXI.LINE_CAP.ROUND);
+    g.moveTo(at(GUN.barrel, 0).x, at(GUN.barrel, 0).y);
+    g.lineTo(muzzleX, muzzleY);
+
+    g.beginFill(accentCol, 0.85);
+    g.drawCircle(muzzleX, muzzleY, GUN.tipR * 0.85);
     g.endFill();
 };
 
@@ -559,7 +605,110 @@ const stickPalette = (isMe) => ({
 const moodSeedFromId = (id) =>
     String(id).split("").reduce((n, c) => n + c.charCodeAt(0), 0);
 
+const markShootFace = (p) => {
+    if (!p) return;
+    p.shootFaceUntil = Date.now() + SHOOT_FACE_MS;
+    p.faceExpr = "angry";
+};
+
+const startDeathCorpse = (p) => {
+    if (p.deathCorpse || !p.displayTorso || !p.displayHead) return;
+    p.deathCorpse = {
+        startTorso: { ...p.displayTorso },
+        startHead: { ...p.displayHead },
+        startedAt: Date.now(),
+        bloodSpawned: false,
+        facing: p.facing || 1,
+    };
+};
+
+const getCorpsePose = (p) => {
+    const c = p.deathCorpse;
+    if (!c) return null;
+    const t = Math.min(1, (Date.now() - c.startedAt) / CORPSE_FALL_MS);
+    const ease = t * t * t;
+    const bloodX = c.startTorso.x;
+    const groundHeadY = FLOOR_Y - STICK.headR - 4;
+    const hx = c.startHead.x + c.facing * 6 * ease;
+    const hy = c.startHead.y + (groundHeadY - c.startHead.y) * ease;
+    return { hx, hy, bloodX, ease, facing: c.facing };
+};
+
+const drawDeadFace = (g, hx, hy, isMe, alpha = 1) => {
+    g.beginFill(isMe ? 0xb8dcff : 0xffffff, alpha);
+    g.drawCircle(hx, hy, STICK.headR - 1.5);
+    g.endFill();
+
+    const ink = 0x111111;
+    const eyeGap = 4.2;
+    const eyeY = hy - 1;
+    g.lineStyle(2.4, ink, alpha, 0.5, true, PIXI.LINE_CAP.ROUND);
+
+    g.moveTo(hx - eyeGap - 2.5, eyeY - 2.5);
+    g.lineTo(hx - eyeGap + 2.5, eyeY + 2.5);
+    g.moveTo(hx - eyeGap + 2.5, eyeY - 2.5);
+    g.lineTo(hx - eyeGap - 2.5, eyeY + 2.5);
+    g.moveTo(hx + eyeGap - 2.5, eyeY - 2.5);
+    g.lineTo(hx + eyeGap + 2.5, eyeY + 2.5);
+    g.moveTo(hx + eyeGap + 2.5, eyeY - 2.5);
+    g.lineTo(hx + eyeGap - 2.5, eyeY + 2.5);
+
+    g.moveTo(hx - 3.5, hy + 5);
+    g.quadraticCurveTo(hx, hy + 9.5, hx + 3.5, hy + 5);
+
+    g.beginFill(0xcc4444, alpha * 0.9);
+    g.drawEllipse(hx, hy + 7.8, 2.2, 2.8);
+    g.endFill();
+};
+
+const spawnDeathBlood = (p, bloodX) => {
+    if (!p.deathCorpse || p.deathCorpse.bloodSpawned) return;
+    p.deathCorpse.bloodSpawned = true;
+    createBloodSpray(bloodX, FLOOR_Y - 8);
+    createBloodSpray(bloodX - 14, FLOOR_Y - 5);
+    createBloodSpray(bloodX + 12, FLOOR_Y - 6);
+    for (let i = 0; i < 6; i++) {
+        spawnParticle(
+            bloodX + (Math.random() - 0.5) * 28,
+            FLOOR_Y - 4,
+            (Math.random() - 0.5) * 1.5,
+            -Math.random() * 0.8,
+            Math.random() > 0.5 ? 0x991818 : 0xcc3333,
+            1.2 + Math.random() * 1.8,
+            0.012,
+            0.08,
+            true,
+        );
+    }
+};
+
+const drawCorpse = (lineG, fillG, p, isMe) => {
+    const pose = getCorpsePose(p);
+    if (!pose) return;
+
+    const { hx, hy, bloodX, ease } = pose;
+    const alpha = 1 - ease * 0.08;
+
+    if (ease > 0.2) spawnDeathBlood(p, bloodX);
+
+    lineG.clear();
+    fillG.clear();
+
+    if (ease > 0.15) {
+        fillG.beginFill(0x991818, 0.5 * Math.min(1, (ease - 0.15) * 2.5));
+        fillG.drawEllipse(bloodX, FLOOR_Y - 3, 20 + ease * 10, 4 + ease * 2);
+        fillG.endFill();
+    }
+
+    drawDeadFace(fillG, hx, hy, isMe, alpha);
+};
+
 const tickFaceExpr = (p, dt) => {
+    if (p.shootFaceUntil && Date.now() < p.shootFaceUntil) {
+        p.faceExpr = "angry";
+        return;
+    }
+
     if (p.faceTimer > 0) {
         p.faceTimer -= dt * 0.06;
         if (p.faceTimer <= 0) {
@@ -670,6 +819,8 @@ const initPlayerRenderState = (p) => {
     if (p.vy == null) p.vy = 0;
     if (p.faceExpr == null) p.faceExpr = "serious";
     if (p.faceTimer == null) p.faceTimer = 0;
+    if (p.shootFaceUntil == null) p.shootFaceUntil = 0;
+    if (p.deathCorpse == null) p.deathCorpse = null;
     if (p.moodSeed == null) p.moodSeed = Math.floor(Math.random() * 9999);
 };
 
@@ -678,7 +829,6 @@ const updatePlayerMotionState = (p, action) => {
     p.grounded = !p.airborne;
     p.walking =
         p.grounded &&
-        !p.crouching &&
         (Math.abs(p.vx) > 0.4 || action === "left" || action === "right");
 
     if (Math.abs(p.vx) > 0.2) {
@@ -686,7 +836,8 @@ const updatePlayerMotionState = (p, action) => {
     }
 
     if (p.walking) {
-        p.walkPhase += 0.38 * Math.max(1, Math.abs(p.vx) * 0.18);
+        const speed = p.crouching ? 0.42 : 0.72;
+        p.walkPhase += speed * Math.max(1, Math.abs(p.vx) * 0.12);
     }
 };
 
@@ -728,10 +879,20 @@ const computeLegPositions = (p, pose) => {
         lBend = 1.1;
         rBend = 1.35;
     } else if (crouch) {
-        lFootX = tx - s - 3;
-        rFootX = tx + s + 3;
-        lBend = 1.25;
-        rBend = 1.25;
+        if (p.walking) {
+            const swing = Math.sin(p.walkPhase);
+            lFootX = tx - s - 3 + swing * STICK.stride * 0.42 * f;
+            lFootY = footY - Math.max(0, swing) * STICK.lift * 0.35;
+            rFootX = tx + s + 3 - swing * STICK.stride * 0.42 * f;
+            rFootY = footY - Math.max(0, -swing) * STICK.lift * 0.35;
+            lBend = 0.55 + Math.max(0, swing) * 0.5;
+            rBend = 0.55 + Math.max(0, -swing) * 0.5;
+        } else {
+            lFootX = tx - s - 3;
+            rFootX = tx + s + 3;
+            lBend = 1.25;
+            rBend = 1.25;
+        }
     } else if (p.walking) {
         const swing = Math.sin(p.walkPhase);
         lFootX = tx - s + swing * STICK.stride * f;
@@ -855,6 +1016,7 @@ app.ticker.add((dt) => {
 
         const smooth = Math.min(1, 0.35 * dt);
         for (const p of Object.values(localPlayers)) {
+            if (p.deathCorpse && (p.health <= 0 || !p.torso)) continue;
             if (!p.torso || !p.head) continue;
             initPlayerRenderState(p);
             p.displayTorso = lerpBody(p.displayTorso, p.torso, smooth);
@@ -877,12 +1039,12 @@ app.ticker.add((dt) => {
             }
 
             const g = new PIXI.Graphics();
-            g.lineStyle(2.5, 0xffffff, 0.95);
+            g.lineStyle(1.6, 0xffffff, 0.95);
             g.beginFill(0xffaa00, 1);
-            g.drawCircle(0, 0, 5.5);
+            g.drawCircle(0, 0, 3.5);
             g.endFill();
             g.beginFill(0xffff66, 0.85);
-            g.drawCircle(Math.cos(angle) * 2, Math.sin(angle) * 2, 2.5);
+            g.drawCircle(Math.cos(angle) * 1.2, Math.sin(angle) * 1.2, 1.5);
             g.endFill();
             g.position.set(b.body.x, b.body.y);
             bulletsContainer.addChild(g);
@@ -958,8 +1120,14 @@ app.ticker.add((dt) => {
             const isMe = latestState && id === latestState.playerId;
             
             if (p.health <= 0 || !p.torso) {
-                p.lineGraphics.visible = false;
-                p.fillGraphics.visible = false;
+                if (p.deathCorpse) {
+                    p.lineGraphics.visible = true;
+                    p.fillGraphics.visible = true;
+                    drawCorpse(p.lineGraphics, p.fillGraphics, p, isMe);
+                } else {
+                    p.lineGraphics.visible = false;
+                    p.fillGraphics.visible = false;
+                }
                 p.dom.style.display = 'none';
                 continue;
             } else {
