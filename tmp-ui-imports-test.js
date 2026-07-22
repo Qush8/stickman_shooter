@@ -1,12 +1,6 @@
 import '@pixi/unsafe-eval';
-import { Application } from '@pixi/app';
-import { Container } from '@pixi/display';
-import { Graphics, LINE_CAP } from '@pixi/graphics';
-import { Text } from '@pixi/text';
-import { BLEND_MODES } from '@pixi/constants';
-import { connectBordiko } from '@bordiko/sdk/ui';
-
-import { GUN_PISTOL_B64, GUN_SHOTGUN_B64, GUN_RIFLE_B64 } from './sfx-buffers.js';
+import { Application, Container, Graphics, BLEND_MODES, LINE_CAP } from 'pixi.js';
+// simulate game code size - append ui bundle without pixi
 import { MAPS } from './maps.ts';
 
 const ARENA_W = 912;
@@ -34,7 +28,7 @@ const STICK = {
   armLen: 28,
   stride: 11,
   lift: 6,
-  crouchDrop: 46,
+  crouchDrop: 18,
   kneeBend: 10,
 };
 
@@ -118,7 +112,7 @@ const CORPSE_FALL_MS = 260;
 
 // PixiJS Setup — renderer fills container; gameContainer scales the fixed arena
 const gameContainerEl = document.getElementById('game-container');
-const app = new Application({
+const app = new PIXI.Application({
     backgroundColor: 0x2c2c2c,
     antialias: true,
     resolution: Math.min(window.devicePixelRatio || 1, 2),
@@ -127,17 +121,13 @@ const app = new Application({
 app.view.style.display = 'block';
 app.view.style.width = '100%';
 app.view.style.height = '100%';
-app.view.tabIndex = 0;
-app.view.style.outline = 'none';
-gameContainerEl.tabIndex = 0;
-gameContainerEl.style.outline = 'none';
 gameContainerEl.appendChild(app.view);
 
-const gameContainer = new Container();
+const gameContainer = new PIXI.Container();
 app.stage.addChild(gameContainer);
 
 // Background Grid
-const gridGraphics = new Graphics();
+const gridGraphics = new PIXI.Graphics();
 gridGraphics.beginFill(0x242424);
 gridGraphics.drawRect(0, 0, ARENA_W, ARENA_H);
 gridGraphics.endFill();
@@ -155,7 +145,7 @@ for (let i = 0; i < ARENA_H; i += 50) {
 gameContainer.addChild(gridGraphics);
 
 // Floor — solid fill only (no path line)
-const floorGraphics = new Graphics();
+const floorGraphics = new PIXI.Graphics();
 floorGraphics.beginFill(0x3d4654);
 floorGraphics.drawRect(0, FLOOR_Y - 10, ARENA_W, 10);
 floorGraphics.endFill();
@@ -191,12 +181,12 @@ const applyMapTheme = (mapId) => {
 };
 
 applyMapTheme('default');
-const platformsContainer = new Container();
-const pickupsContainer = new Container();
-const bulletsContainer = new Container();
-const particlesContainer = new Container();
-const playersContainer = new Container();
-const laserContainer = new Container();
+const platformsContainer = new PIXI.Container();
+const pickupsContainer = new PIXI.Container();
+const bulletsContainer = new PIXI.Container();
+const particlesContainer = new PIXI.Container();
+const playersContainer = new PIXI.Container();
+const laserContainer = new PIXI.Container();
 
 gameContainer.addChild(platformsContainer);
 gameContainer.addChild(pickupsContainer);
@@ -204,123 +194,6 @@ gameContainer.addChild(playersContainer);
 gameContainer.addChild(bulletsContainer);
 gameContainer.addChild(laserContainer);
 gameContainer.addChild(particlesContainer);
-
-const overlayContainer = new Container();
-app.stage.addChild(overlayContainer);
-
-const START_COUNTDOWN_MS = 3000;
-const START_GO_HOLD_MS = 450;
-
-let countdownText = null;
-let localCountdownStartAt = null;
-let countdownAnim = { label: "", progress: 1 };
-
-const focusGameInput = () => {
-    try {
-        gameContainerEl.focus({ preventScroll: true });
-    } catch {
-        gameContainerEl.focus();
-    }
-    try {
-        app.view.focus({ preventScroll: true });
-    } catch {
-        app.view.focus();
-    }
-};
-
-const beginStartCountdown = () => {
-    if (localCountdownStartAt != null) return;
-    localCountdownStartAt = Date.now();
-    Sfx.init();
-    focusGameInput();
-};
-
-const isStartCountdownComplete = () =>
-    localCountdownStartAt != null &&
-    Date.now() - localCountdownStartAt >= START_COUNTDOWN_MS;
-
-const isPreMatchCountdown = () =>
-    localCountdownStartAt != null && !isStartCountdownComplete();
-
-const isStartCountdownVisible = () => {
-    if (localCountdownStartAt == null) return false;
-    return Date.now() - localCountdownStartAt < START_COUNTDOWN_MS + START_GO_HOLD_MS;
-};
-
-const ensureOverlayTexts = () => {
-    if (!countdownText) {
-        countdownText = new Text("", {
-            fontFamily: "Arial Black, Arial, sans-serif",
-            fontSize: 96,
-            fill: 0xffee55,
-            align: "center",
-            stroke: 0x000000,
-            strokeThickness: 8,
-        });
-        countdownText.anchor.set(0.5);
-        countdownText.visible = false;
-        overlayContainer.addChild(countdownText);
-    }
-};
-
-const updateOverlayLayout = () => {
-    ensureOverlayTexts();
-    const res = app.renderer.resolution || 1;
-    const w = app.renderer.width / res;
-    const h = app.renderer.height / res;
-    overlayContainer.position.set(w / 2, h / 2);
-};
-
-const isGameplayInputEnabled = (G) =>
-    isStartCountdownComplete() && G?.roundPhase === "playing";
-
-const isIdleTickPhase = (G) => G?.roundPhase === "intermission";
-
-/** Production host may omit yourTurn; treat legal moves as permission to act. */
-const canActOnState = (state) => {
-    if (!state || state.ended) return false;
-    if (state.yourTurn === false && !(state.legalMoves?.length > 0)) return false;
-    return true;
-};
-
-const updateStartOverlay = () => {
-    ensureOverlayTexts();
-    updateOverlayLayout();
-
-    if (!isStartCountdownVisible()) {
-        countdownText.visible = false;
-        gameContainer.alpha = 1;
-        return;
-    }
-
-    countdownText.visible = true;
-    gameContainer.alpha = 0.9;
-};
-
-const tickCountdownOverlay = (_G, dt) => {
-    if (!countdownText || !isStartCountdownVisible()) return;
-
-    const elapsed = Date.now() - localCountdownStartAt;
-    const remaining = START_COUNTDOWN_MS - elapsed;
-    const label = remaining > 0 ? String(Math.ceil(remaining / 1000)) : "GO!";
-
-    if (label !== countdownAnim.label) {
-        countdownAnim.label = label;
-        countdownAnim.progress = 0;
-        if (label === "GO!") {
-            Sfx.playRoundWin();
-            focusGameInput();
-        }
-    }
-
-    countdownAnim.progress = Math.min(1, countdownAnim.progress + 0.045 * dt);
-    const t = countdownAnim.progress;
-    const scale = 1.35 - t * 0.75;
-    countdownText.text = label;
-    countdownText.scale.set(scale);
-    countdownText.alpha = Math.max(0, 1 - t * 0.85);
-    countdownText.rotation = (1 - t) * 0.08 * (label === "GO!" ? 1 : -1);
-};
 
 // Platforms drawn each frame from game state (HP fill + border)
 
@@ -336,7 +209,7 @@ const drawPlatforms = (platforms) => {
     for (const plat of platforms) {
         if (plat.broken) continue;
 
-        const g = new Graphics();
+        const g = new PIXI.Graphics();
         const inset = PLATFORM_BORDER;
         const hpRatio = Math.max(0, Math.min(1, plat.health / (plat.maxHealth || 500)));
         const innerW = Math.max(0, plat.w - inset * 2);
@@ -504,21 +377,37 @@ const drawWeaponPickupIcon = (g, weaponId, cx, cy, s = 1) => {
     }
 };
 
-const drawWeaponDrop = (container, pickup, drawX, drawY, falling, fallRot) => {
+const drawWeaponDropBadge = (g, pickup, drawX, drawY) => {
     const wId = pickup.weaponId || "winchester";
+    const cols = WEAPON_PICKUP_COLORS[wId] ?? WEAPON_PICKUP_COLORS.winchester;
+    const pulse = 0.85 + Math.sin(Date.now() / 320 + pickup.id) * 0.15;
 
-    const shadow = new Graphics();
-    shadow.beginFill(0x000000, 0.16);
-    shadow.drawEllipse(0, 13, falling ? 11 : 13, 3);
-    shadow.endFill();
-    container.addChild(shadow);
+    g.beginFill(0x000000, 0.22);
+    g.drawEllipse(drawX, drawY + 18, 14, 4);
+    g.endFill();
 
-    const icon = new Graphics();
-    icon.rotation = falling ? fallRot : Math.sin(Date.now() / 900 + pickup.id) * 0.05;
-    drawWeaponPickupIcon(icon, wId, 0, 0, 1.08);
-    container.addChild(icon);
+    g.lineStyle(3, cols.glow, 0.35 * pulse);
+    g.drawCircle(drawX, drawY, 20 * pulse);
+    g.lineStyle(2, 0xffe566, 0.55 * pulse);
+    g.drawCircle(drawX, drawY, 16);
 
-    container.position.set(drawX, drawY);
+    g.beginFill(0x1a1a2e, 0.85);
+    g.drawCircle(drawX, drawY, 13);
+    g.endFill();
+    g.beginFill(cols.glow, 0.18);
+    g.drawCircle(drawX, drawY - 2, 11);
+    g.endFill();
+
+    drawWeaponPickupIcon(g, wId, drawX, drawY, 0.95);
+
+    const sparkT = Date.now() / 400 + pickup.id;
+    g.beginFill(0xffffff, 0.7);
+    g.drawCircle(
+        drawX + Math.cos(sparkT) * 14,
+        drawY + Math.sin(sparkT * 1.3) * 14 - 4,
+        1.5,
+    );
+    g.endFill();
 };
 
 const drawPickups = (pickups, platforms) => {
@@ -542,7 +431,6 @@ const drawPickups = (pickups, platforms) => {
                 goalY: goal,
                 wasFalling: pickup.y < goal - 0.5,
                 landFx: false,
-                fallRot: (pickup.id % 7) * 0.4,
             };
         }
 
@@ -553,16 +441,13 @@ const drawPickups = (pickups, platforms) => {
         if (pickup.y < meta.simY - 2) {
             meta.simY = pickup.y;
             meta.landFx = false;
-            meta.fallRot = (pickup.id % 7) * 0.4;
         }
 
         const falling = meta.simY < meta.goalY - 0.5;
         if (falling) {
             meta.simY = Math.min(meta.goalY, meta.simY + PICKUP_FALL_PX_SEC * dtSec);
-            meta.fallRot += dtSec * 5.5;
         } else {
             meta.simY += (meta.goalY - meta.simY) * Math.min(1, dtSec * 12);
-            meta.fallRot *= 0.92;
         }
 
         const landed = meta.wasFalling && !falling && meta.simY >= meta.goalY - 0.5;
@@ -576,9 +461,9 @@ const drawPickups = (pickups, platforms) => {
         const onFloor = meta.simY >= FLOOR_PICKUP_Y - 1;
         const bob = falling || onFloor ? 0 : Math.sin(Date.now() / 280 + pickup.id) * 1.5;
         const drawY = meta.simY + bob;
+        const g = new PIXI.Graphics();
 
         if (pickup.kind === "health") {
-            const g = new Graphics();
             const pulse = 0.9 + Math.sin(Date.now() / 350 + pickup.id) * 0.1;
             g.beginFill(0x000000, 0.18);
             g.drawEllipse(pickup.x, drawY + 16, 10, 3);
@@ -596,12 +481,11 @@ const drawPickups = (pickups, platforms) => {
             g.lineTo(pickup.x + 5, drawY);
             g.moveTo(pickup.x, drawY - 5);
             g.lineTo(pickup.x, drawY + 5);
-            pickupsContainer.addChild(g);
         } else {
-            const drop = new Container();
-            drawWeaponDrop(drop, pickup, pickup.x, drawY, falling, meta.fallRot);
-            pickupsContainer.addChild(drop);
+            drawWeaponDropBadge(g, pickup, pickup.x, drawY);
         }
+
+        pickupsContainer.addChild(g);
     }
 };
 
@@ -640,7 +524,6 @@ const fitCanvas = () => {
 
     gameContainer.scale.set(viewScale);
     gameContainer.position.set(viewOffsetX, viewOffsetY);
-    updateOverlayLayout();
 };
 
 if (typeof ResizeObserver !== 'undefined') {
@@ -877,42 +760,6 @@ const Sfx = (() => {
         }
     };
 
-    const playHeadshot = () => {
-        const ac = ensure();
-        if (!ac) return;
-        const t = ac.currentTime;
-        const dur = 0.13;
-        const sr = ac.sampleRate;
-        const len = Math.floor(sr * dur);
-        const buf = ac.createBuffer(1, len, sr);
-        const d = buf.getChannelData(0);
-
-        for (let i = 0; i < len; i++) {
-            const sec = i / sr;
-            const env = Math.exp(-sec / 0.048);
-            const crack = sec < 0.0035 ? (Math.random() * 2 - 1) * 2.4 : 0;
-            const punchHz = 55 + 420 * Math.exp(-sec * 16);
-            const punch = Math.sin(2 * Math.PI * punchHz * sec);
-            const wet = (Math.random() * 2 - 1) * Math.exp(-sec / 0.012) * 0.22;
-            d[i] = Math.tanh(env * (crack * 0.55 + punch * 0.82 + wet));
-        }
-
-        const src = ac.createBufferSource();
-        src.buffer = buf;
-        const bp = ac.createBiquadFilter();
-        bp.type = "bandpass";
-        bp.frequency.value = 420;
-        bp.Q.value = 0.55;
-        const g = ac.createGain();
-        g.gain.setValueAtTime(0.68, t);
-        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-        src.connect(bp);
-        bp.connect(g);
-        g.connect(master);
-        src.start(t);
-        src.stop(t + dur + 0.01);
-    };
-
     const playDeath = () => {
         tone(180, "sawtooth", 0.25, 0.22, 55);
         tone(120, "sine", 0.4, 0.2, 40);
@@ -1002,19 +849,11 @@ const Sfx = (() => {
         noise(0.14, 0.07, 2800);
     };
 
-    return { init, playShoot, playBulletHit, playHeadshot, playDeath, playFootstep, playJump, playPickupLand, playRoundWin, playMatchWin };
+    return { init, playShoot, playBulletHit, playDeath, playFootstep, playJump, playPickupLand, playRoundWin, playMatchWin };
 })();
 
-document.addEventListener("pointerdown", () => {
-    Sfx.init();
-    focusGameInput();
-}, { once: true, capture: true });
-window.addEventListener("keydown", () => {
-    Sfx.init();
-    focusGameInput();
-}, { once: true, capture: true });
-gameContainerEl.addEventListener("pointerenter", focusGameInput);
-gameContainerEl.addEventListener("pointerdown", focusGameInput, { capture: true });
+document.addEventListener("pointerdown", () => Sfx.init(), { once: true });
+window.addEventListener("keydown", () => Sfx.init(), { once: true });
 
 // State
 let latestState = null;
@@ -1025,136 +864,6 @@ let prevPlatformBroken = {};
 let prevRoundPhase = null;
 let prevLastRoundWinner = null;
 let prevMatchEnded = false;
-
-const bordikoHost = connectBordiko();
-const hostMove = bordikoHost.move.bind(bordikoHost);
-bordikoHost.move = (type, payload) => {
-    console.log("[stickman-brawler] -> host move", type, payload);
-    hostMove(type, payload);
-};
-
-let hostStateCount = 0;
-let hostReadyPulse = null;
-
-const signalHostReady = () => {
-    try {
-        window.parent.postMessage({ t: "bordiko:ready" }, "*");
-    } catch (err) {
-        console.warn("[stickman-brawler] bordiko:ready postMessage failed", err);
-    }
-};
-
-const startHostReadyPulse = () => {
-    signalHostReady();
-    if (hostReadyPulse) return;
-    hostReadyPulse = setInterval(() => {
-        if (hostStateCount > 0) {
-            clearInterval(hostReadyPulse);
-            hostReadyPulse = null;
-            return;
-        }
-        signalHostReady();
-    }, 750);
-};
-
-window.addEventListener(
-    "message",
-    (event) => {
-        const msg = event.data;
-        if (msg && msg.t === "bordiko:state" && msg.state) {
-            console.log("[stickman-brawler] <- host raw state", {
-                moveCount: msg.state.moveCount,
-                playerId: msg.state.playerId,
-                yourTurn: msg.state.yourTurn,
-                legalMoves: msg.state.legalMoves?.length ?? 0,
-            });
-        }
-    },
-    true,
-);
-
-/** Match a client payload to a legal move from the host (production validates against enumerate). */
-const resolveLegalPayload = (type, payload) => {
-    const legal = latestState?.legalMoves;
-    if (!legal?.length) return null;
-
-    if (type === "move") {
-        const action = payload?.action ?? null;
-        const clientCrouching = !!payload?.crouching;
-        const match = legal.find(
-            (m) =>
-                m.type === "move" &&
-                (m.payload?.action ?? null) === action &&
-                Boolean(m.payload?.crouching) === clientCrouching,
-        );
-        if (!match) return null;
-        return { ...match.payload };
-    }
-
-    if (type === "shoot") {
-        const match = legal.find((m) => m.type === "shoot");
-        if (!match) return null;
-        return { ...(match.payload ?? {}) };
-    }
-
-    if (type === "switchWeapon") {
-        const match = legal.find(
-            (m) =>
-                m.type === "switchWeapon" &&
-                JSON.stringify(m.payload ?? null) === JSON.stringify(payload ?? null),
-        );
-        return match ? match.payload : null;
-    }
-
-    return payload ?? null;
-};
-
-const proposeMove = (type, payload) => {
-    if (!latestState || latestState.ended) return;
-    const G = latestState.G;
-    const legal = latestState.legalMoves;
-
-    const isIdleMove =
-        type === "move" &&
-        (payload?.action ?? null) === null &&
-        !payload?.crouching;
-
-    if (isIdleTickPhase(G) || (isPreMatchCountdown() && isIdleMove)) {
-        if (!isIdleMove) return;
-    } else if (!isGameplayInputEnabled(G)) {
-        return;
-    } else if (!canActOnState(latestState)) {
-        console.warn("[stickman-brawler] move blocked (not your turn)", {
-            type,
-            yourTurn: latestState.yourTurn,
-            legalMoves: legal?.length ?? 0,
-        });
-        return;
-    }
-
-    if (type === "shoot" && legal?.some((m) => m.type === "shoot")) {
-        bordikoHost.move("shoot", {
-            aimAngle: payload?.aimAngle ?? 0,
-            facing: payload?.facing ?? 1,
-        });
-        return;
-    }
-
-    const resolved = resolveLegalPayload(type, payload);
-    if (resolved) {
-        bordikoHost.move(type, resolved);
-        return;
-    }
-    if (!legal?.length) {
-        bordikoHost.move(type, payload ?? {});
-        return;
-    }
-    console.warn("[stickman-brawler] move rejected by legalMoves", {
-        type,
-        payload,
-        legalCount: legal.length,
-    });
-};
 
 // Input
 const activeKeys = new Set();
@@ -1179,7 +888,6 @@ window.addEventListener("mousemove", (e) => {
 
 document.addEventListener("pointerdown", (e) => {
     if (!latestState) return;
-    if (!isGameplayInputEnabled(latestState.G)) return;
     pointerHeld = true;
     tryShoot();
 });
@@ -1190,18 +898,20 @@ document.addEventListener("pointerup", () => {
 
 const tryShoot = () => {
     if (!latestState) return;
-    if (!isGameplayInputEnabled(latestState.G)) return;
-    if (!canActOnState(latestState)) return;
     const me = localPlayers[latestState.playerId];
     if (!me || me.health <= 0) return;
 
     const gun = getGunPose(me);
     me.aimAngle = Math.atan2(mouseY - gun.neckTop, mouseX - me.displayTorso.x);
     markShootFace(me);
-    proposeMove("shoot", {
-        aimAngle: me.aimAngle || 0,
-        facing: me.facing || 1,
-    });
+    window.parent.postMessage({
+        t: "bordiko:move",
+        type: "shoot",
+        payload: {
+            aimAngle: me.aimAngle || 0,
+            facing: me.facing || 1,
+        },
+    }, "*");
     lastShootSent = Date.now();
     if (me && me.currentWeapon) {
         if (me.currentWeapon === "katana") {
@@ -1218,14 +928,22 @@ const sendSwitchWeapon = (weaponId) => {
     const me = latestState ? localPlayers[latestState.playerId] : null;
     const owned = me?.ownedWeapons ?? ["winchester"];
     if (!owned.includes(weaponId)) return;
-    proposeMove("switchWeapon", { weaponId });
+    window.parent.postMessage({
+        t: "bordiko:move",
+        type: "switchWeapon",
+        payload: { weaponId },
+    }, "*");
 };
 
 const sendCycleWeapon = () => {
     const me = latestState ? localPlayers[latestState.playerId] : null;
     const owned = me?.ownedWeapons ?? ["winchester"];
     if (owned.length <= 1) return;
-    proposeMove("switchWeapon", { cycle: true });
+    window.parent.postMessage({
+        t: "bordiko:move",
+        type: "switchWeapon",
+        payload: { cycle: true },
+    }, "*");
 };
 
 const getOrderedOwnedWeapons = (playerId) => {
@@ -1239,16 +957,19 @@ window.addEventListener("keydown", (e) => {
     if (e.key) activeKeys.add(e.key.toLowerCase());
     if (isJumpKey(e.code) && !e.repeat) {
         jumpQueued = true;
-        if (latestState && isGameplayInputEnabled(latestState.G)) {
+        if (latestState) {
             const me = localPlayers[latestState.playerId];
             if (me && me.health > 0) {
                 Sfx.playJump();
-                proposeMove("move", {
-                    action: "jump",
-                    aimAngle: me.aimAngle ?? 0,
-                    facing: me.facing ?? 1,
-                    crouching: false,
-                });
+                window.parent.postMessage({
+                    t: "bordiko:move",
+                    type: "move",
+                    payload: {
+                        action: "jump",
+                        aimAngle: me.aimAngle ?? 0,
+                        crouching: false,
+                    },
+                }, "*");
                 jumpQueued = false;
             }
         }
@@ -1266,7 +987,7 @@ window.addEventListener("keydown", (e) => {
         Digit6: 5,
         Digit7: 6,
     };
-    if (digitIdx[e.code] != null && !e.repeat && latestState && isGameplayInputEnabled(latestState.G)) {
+    if (digitIdx[e.code] != null && !e.repeat && latestState) {
         const owned = getOrderedOwnedWeapons(latestState.playerId);
         const weaponId = owned[digitIdx[e.code]];
         if (weaponId) sendSwitchWeapon(weaponId);
@@ -1288,28 +1009,12 @@ function isKeyPressed(...k) {
 let prevPickupIds = new Set();
 
 // Network Sync
-const handleGameState = (state) => {
-        hostStateCount += 1;
-        console.log("[stickman-brawler] onGameState", {
-            n: hostStateCount,
-            moveCount: state?.moveCount,
-            playerId: state?.playerId,
-            yourTurn: state?.yourTurn,
-            legalMoves: state?.legalMoves?.length ?? 0,
-            ended: state?.ended,
-            roundPhase: state?.G?.roundPhase,
-            players: state?.G?.players ? Object.keys(state.G.players).length : 0,
-        });
-
-        latestState = state;
+window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (msg && msg.t === "bordiko:state") {
+        latestState = msg.state;
         fitCanvas();
         const G = latestState.G;
-
-        if (G && localCountdownStartAt == null) {
-            beginStartCountdown();
-        }
-
-        updateStartOverlay();
 
         drawPlatforms(getPlatformsForRender(G));
         drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
@@ -1330,17 +1035,6 @@ const handleGameState = (state) => {
                 G.lastRoundWinner !== prevLastRoundWinner
             ) {
                 Sfx.playRoundWin();
-            }
-            if (G.roundPhase === "intermission" && prevRoundPhase === "playing") {
-                finalizeAllDeathCorpses();
-            }
-            if (
-                G.roundPhase === "playing" &&
-                latestState.playerId &&
-                countAliveOpponents(G, latestState.playerId) === 0 &&
-                Object.values(G.players).some((pl) => pl.health <= 0)
-            ) {
-                finalizeAllDeathCorpses();
             }
             if (G.roundPhase === "playing") {
                 prevLastRoundWinner = null;
@@ -1363,7 +1057,6 @@ const handleGameState = (state) => {
                         prevHealth: p.health,
                         walkPhase: 0,
                         facing: 1,
-                        walkDir: 1,
                         vx: 0,
                         vy: 0,
                         grounded: true,
@@ -1388,7 +1081,8 @@ const handleGameState = (state) => {
                     const prevFireTick = lp.lastFireTick ?? 0;
 
                     if (p.health < lp.prevHealth) {
-                        lp.faceTimer = Math.max(lp.faceTimer ?? 0, 0.35);
+                        lp.faceExpr = "hurt";
+                        lp.faceTimer = 0.4;
                     }
                     if (p.health <= 0 && lp.prevHealth > 0) {
                         startDeathCorpse(lp);
@@ -1438,23 +1132,8 @@ const handleGameState = (state) => {
         if (G && G.hitEvents) {
             for (const hit of G.hitEvents) {
                 if (hit.damage > 0) {
-                    const targetPlayer = localPlayers[hit.targetId];
-                    const hitX = hit.isHeadshot && targetPlayer?.displayHead
-                        ? targetPlayer.displayHead.x
-                        : hit.x;
-                    const hitY = hit.isHeadshot && targetPlayer?.displayHead
-                        ? targetPlayer.displayHead.y
-                        : hit.y;
-                    createPlayerHitEffect(hitX, hitY, hit.isHeadshot);
-                    if (targetPlayer) {
-                        markBulletHitFace(targetPlayer, hit.isHeadshot);
-                    }
-                    if (hit.isHeadshot) {
-                        createHeadshotMarker(hitX, hitY);
-                        Sfx.playHeadshot();
-                    } else {
-                        Sfx.playBulletHit(true);
-                    }
+                    createPlayerHitEffect(hit.x, hit.y);
+                    Sfx.playBulletHit(true);
                 } else if (!pickupCollected) {
                     createWallHit(hit.x, hit.y);
                     Sfx.playBulletHit(false);
@@ -1503,17 +1182,19 @@ const handleGameState = (state) => {
                 }
             }
         }
-};
+    }
+});
 
+window.parent.postMessage({ t: "bordiko:ready" }, "*");
 
 // Particles & hit effects
 function spawnParticle(x, y, vx, vy, color, size, lifeDecay, gravityMul = 0.5, isBlood = false, additive = true) {
-    const g = new Graphics();
+    const g = new PIXI.Graphics();
     g.beginFill(color);
     g.drawCircle(0, 0, size);
     g.endFill();
     g.position.set(x, y);
-    if (!isBlood && additive) g.blendMode = BLEND_MODES.ADD;
+    if (!isBlood && additive) g.blendMode = PIXI.BLEND_MODES.ADD;
     particlesContainer.addChild(g);
     particles.push({
         mesh: g,
@@ -1685,7 +1366,7 @@ function createWallHit(x, y, dirX = 0, dirY = -1) {
     const tx = -ny;
     const ty = nx;
 
-    const ring = new Graphics();
+    const ring = new PIXI.Graphics();
     ring.position.set(x, y);
     particlesContainer.addChild(ring);
     hitRings.push({ g: ring, life: 1, maxR: 13, color: 0xffbb66 });
@@ -1740,96 +1421,26 @@ function createSparkHit(x, y, intensity = 1) {
     }
 }
 
-function createBloodSpray(x, y, isHeadshot = false) {
-    const count = isHeadshot ? 28 : 2;
-    for (let i = 0; i < count; i++) {
-        const a = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * (isHeadshot ? 1.8 : 0.5);
-        const s = (isHeadshot ? 2.2 : 0.8) + Math.random() * (isHeadshot ? 4.5 : 1.8);
+function createBloodSpray(x, y) {
+    for (let i = 0; i < 2; i++) {
+        const a = (Math.PI * 2 * i) / 2 + (Math.random() - 0.5) * 0.5;
+        const s = 0.8 + Math.random() * 1.8;
         spawnParticle(
-            x + (Math.random() - 0.5) * (isHeadshot ? 6 : 0),
-            y + (Math.random() - 0.5) * (isHeadshot ? 4 : 0),
+            x,
+            y,
             Math.cos(a) * s,
-            Math.sin(a) * s - (isHeadshot ? 1.1 : 0.35),
-            Math.random() > 0.35 ? 0xcc2222 : 0x880808,
-            (isHeadshot ? 1.1 : 0.55) + Math.random() * (isHeadshot ? 1.4 : 0.5),
-            isHeadshot ? 0.018 : 0.035,
-            isHeadshot ? 0.32 : 0.16,
+            Math.sin(a) * s - 0.35,
+            Math.random() > 0.5 ? 0xcc3333 : 0x991818,
+            0.55 + Math.random() * 0.5,
+            0.035,
+            0.16,
             true,
         );
     }
 }
 
-function createHeadshotBloodBurst(x, y) {
-    createBloodSpray(x, y, true);
-
-    for (let i = 0; i < 14; i++) {
-        const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.4;
-        const s = 1.8 + Math.random() * 3.2;
-        spawnParticle(
-            x + (Math.random() - 0.5) * 10,
-            y - 2,
-            Math.cos(a) * s * 0.55,
-            Math.sin(a) * s - 1.4,
-            Math.random() > 0.4 ? 0xdd1111 : 0x661010,
-            0.9 + Math.random() * 1.1,
-            0.02,
-            0.38,
-            true,
-        );
-    }
-
-    for (const eyeOffset of [-5, 5]) {
-        for (let i = 0; i < 6; i++) {
-            const a = (Math.random() - 0.5) * Math.PI * 0.9;
-            const s = 1.2 + Math.random() * 2.4;
-            spawnParticle(
-                x + eyeOffset,
-                y - 1,
-                Math.cos(a) * s,
-                Math.sin(a) * s - 0.6,
-                0xaa0a0a,
-                0.55 + Math.random() * 0.75,
-                0.025,
-                0.28,
-                true,
-            );
-        }
-    }
-
-    spawnParticle(x, y, 0, 0, 0xff4444, 5, 0.06, 0.05, true, false);
-}
-
-function createPlayerHitEffect(x, y, isHeadshot = false) {
-    if (isHeadshot) {
-        createHeadshotBloodBurst(x, y);
-        return;
-    }
-    createBloodSpray(x, y, false);
-}
-
-function createHeadshotMarker(x, y) {
-    const txt = new Text('HS', {
-        fontFamily: 'Arial Black, Impact, sans-serif',
-        fontSize: 9,
-        fontWeight: '900',
-        fill: 0xffeedd,
-        stroke: 0x660011,
-        strokeThickness: 2,
-    });
-    txt.anchor.set(0.5, 0.5);
-    txt.position.set(x, y - 12);
-
-    particlesContainer.addChild(txt);
-    particles.push({
-        mesh: txt,
-        vx: 0,
-        vy: -0.55,
-        life: 1,
-        lifeDecay: 0.028,
-        gravityMul: 0,
-        isBlood: true,
-        isText: false,
-    });
+function createPlayerHitEffect(x, y) {
+    createBloodSpray(x, y);
 }
 
 function createHitFlash(x, y) {
@@ -1842,7 +1453,7 @@ function createHitFlash(x, y) {
 const hitRings = [];
 
 function createHitBurst(x, y) {
-    const ring = new Graphics();
+    const ring = new PIXI.Graphics();
     ring.position.set(x, y);
     particlesContainer.addChild(ring);
     hitRings.push({ g: ring, life: 1, maxR: 14 });
@@ -1859,10 +1470,10 @@ const getStickPose = (p) => {
     const drop = crouch ? STICK.crouchDrop : 0;
     const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
     const footY = ty + FEET_OFF - standLift;
-    const hipY = ty + FEET_OFF * 0.18 + drop * 0.28 - standLift * 0.4;
-    const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.38;
+    const hipY = ty + FEET_OFF * 0.18 + drop * 0.12 - standLift * 0.4;
+    const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.2;
     const hx = p.displayHead.x;
-    const hy = crouch ? p.displayHead.y + drop * 0.58 : p.displayHead.y;
+    const hy = crouch ? p.displayHead.y + drop * 0.4 : p.displayHead.y;
     return { tx, ty, hx, hy, neckTop, hipY, footY, crouch, drop };
 };
 
@@ -2012,10 +1623,10 @@ const drawWeaponInHand = (g, gun, isMe) => {
     if (weaponId === "katana") {
         const trailAlpha = gun.katanaTrailAlpha ?? 0;
         if (trailAlpha > 0.05) {
-            g.lineStyle(5, 0xc8e8ff, trailAlpha * 0.55, 0.5, true, LINE_CAP.ROUND);
+            g.lineStyle(5, 0xc8e8ff, trailAlpha * 0.55, 0.5, true, PIXI.LINE_CAP.ROUND);
             g.moveTo(handX - cos * 8, handY - sin * 8);
             g.lineTo(muzzleX + cos * 12, muzzleY + sin * 12);
-            g.lineStyle(2.5, 0xffffff, trailAlpha * 0.35, 0.5, true, LINE_CAP.ROUND);
+            g.lineStyle(2.5, 0xffffff, trailAlpha * 0.35, 0.5, true, PIXI.LINE_CAP.ROUND);
             g.moveTo(handX, handY);
             g.lineTo(muzzleX + cos * 6, muzzleY + sin * 6);
         }
@@ -2077,7 +1688,7 @@ const drawWeaponInHand = (g, gun, isMe) => {
         g.moveTo(mountX - px * f * 3, mountY - py * f * 3);
         g.lineTo(mountX + cos * 8, mountY + sin * 8);
 
-        g.lineStyle(3, accentCol, 0.9, 0.5, true, LINE_CAP.ROUND);
+        g.lineStyle(3, accentCol, 0.9, 0.5, true, PIXI.LINE_CAP.ROUND);
         g.moveTo(at(mountX, mountY, len - 2, 0).x, at(mountX, mountY, len - 2, 0).y);
         g.lineTo(muzzleX, muzzleY);
         g.beginFill(accentCol, 0.9);
@@ -2199,7 +1810,7 @@ const drawWeaponInHand = (g, gun, isMe) => {
     }
 
     const tipSize = weaponId === "sniper" ? 3.2 : weaponId === "auto" ? 2.2 : GUN.tipR * 0.85;
-    g.lineStyle(2 + (weaponId === "sniper" ? 1 : 0), accentCol, 1, 0.5, true, LINE_CAP.ROUND);
+    g.lineStyle(2 + (weaponId === "sniper" ? 1 : 0), accentCol, 1, 0.5, true, PIXI.LINE_CAP.ROUND);
     g.moveTo(atHand(barrelLen, 0).x, atHand(barrelLen, 0).y);
     g.lineTo(muzzleX, muzzleY);
     g.beginFill(accentCol, 0.85);
@@ -2209,10 +1820,10 @@ const drawWeaponInHand = (g, gun, isMe) => {
 
 const drawSniperLaser = (g, gun) => {
     g.clear();
-    g.lineStyle(1.5, 0xff2233, 0.75, 0.5, true, LINE_CAP.ROUND);
+    g.lineStyle(1.5, 0xff2233, 0.75, 0.5, true, PIXI.LINE_CAP.ROUND);
     g.moveTo(gun.muzzleX, gun.muzzleY);
     g.lineTo(mouseX, mouseY);
-    g.lineStyle(1, 0xffaaaa, 0.35, 0.5, true, LINE_CAP.ROUND);
+    g.lineStyle(1, 0xffaaaa, 0.35, 0.5, true, PIXI.LINE_CAP.ROUND);
     g.moveTo(gun.muzzleX, gun.muzzleY);
     g.lineTo(mouseX, mouseY);
 };
@@ -2241,12 +1852,6 @@ const formatRoundWinner = (G, names) => {
 const moodSeedFromId = (id) =>
     String(id).split("").reduce((n, c) => n + c.charCodeAt(0), 0);
 
-const markBulletHitFace = (p, isHeadshot = false) => {
-    if (!p) return;
-    p.faceExpr = "dazed";
-    p.faceTimer = isHeadshot ? 0.95 : 0.6;
-};
-
 const markShootFace = (p) => {
     if (!p) return;
     p.shootFaceUntil = Date.now() + SHOOT_FACE_MS;
@@ -2260,36 +1865,14 @@ const startDeathCorpse = (p) => {
         startHead: { ...p.displayHead },
         startedAt: Date.now(),
         bloodSpawned: false,
-        finished: false,
         facing: p.facing || 1,
     };
-};
-
-const finalizeDeathCorpse = (p) => {
-    if (!p.deathCorpse || p.deathCorpse.finished) return;
-    p.deathCorpse.finished = true;
-    if (!p.deathCorpse.bloodSpawned) {
-        spawnDeathBlood(p, p.deathCorpse.startTorso.x);
-    }
-};
-
-const finalizeAllDeathCorpses = () => {
-    for (const p of Object.values(localPlayers)) {
-        finalizeDeathCorpse(p);
-    }
-};
-
-const countAliveOpponents = (G, myId) => {
-    if (!G?.players) return 0;
-    return Object.entries(G.players).filter(([id, pl]) => id !== myId && pl.health > 0).length;
 };
 
 const getCorpsePose = (p) => {
     const c = p.deathCorpse;
     if (!c) return null;
-    const t = c.finished
-        ? 1
-        : Math.min(1, (Date.now() - c.startedAt) / CORPSE_FALL_MS);
+    const t = Math.min(1, (Date.now() - c.startedAt) / CORPSE_FALL_MS);
     const ease = t * t * t;
     const bloodX = c.startTorso.x;
     const groundHeadY = FLOOR_Y - STICK.headR - 4;
@@ -2306,7 +1889,7 @@ const drawDeadFace = (g, hx, hy, isMe, alpha = 1) => {
     const ink = 0x111111;
     const eyeGap = 4.2;
     const eyeY = hy - 1;
-    g.lineStyle(2.4, ink, alpha, 0.5, true, LINE_CAP.ROUND);
+    g.lineStyle(2.4, ink, alpha, 0.5, true, PIXI.LINE_CAP.ROUND);
 
     g.moveTo(hx - eyeGap - 2.5, eyeY - 2.5);
     g.lineTo(hx - eyeGap + 2.5, eyeY + 2.5);
@@ -2418,17 +2001,6 @@ const drawFace = (g, hx, hy, facing, expr, isMe) => {
         return;
     }
 
-    if (expr === "dazed") {
-        g.moveTo(hx - eyeGap - 3.2, eyeY + 0.5);
-        g.lineTo(hx - eyeGap + 3.2, eyeY - 0.5);
-        g.moveTo(hx + eyeGap - 3.2, eyeY - 0.5);
-        g.lineTo(hx + eyeGap + 3.2, eyeY + 0.5);
-        g.moveTo(hx - 4.2, hy + 5.2);
-        g.quadraticCurveTo(hx - 2.2, hy + 7.4, hx, hy + 5.1);
-        g.quadraticCurveTo(hx + 2.2, hy + 2.8, hx + 4.2, hy + 5.2);
-        return;
-    }
-
     if (expr === "hurt") {
         g.moveTo(hx - eyeGap - 2.5, eyeY - 2.5);
         g.lineTo(hx - eyeGap + 2.5, eyeY + 2.5);
@@ -2490,7 +2062,6 @@ const initPlayerRenderState = (p) => {
     if (!p.displayHead) p.displayHead = { ...p.head };
     if (p.walkPhase == null) p.walkPhase = 0;
     if (p.facing == null) p.facing = 1;
-    if (p.walkDir == null) p.walkDir = p.facing;
     if (p.vx == null) p.vx = 0;
     if (p.vy == null) p.vy = 0;
     if (p.faceExpr == null) p.faceExpr = "serious";
@@ -2511,11 +2082,9 @@ const updatePlayerMotionState = (p, action) => {
         p.grounded &&
         (Math.abs(p.vx) > 0.4 || action === "left" || action === "right");
 
-    if (action === "left") p.facing = -1;
-    else if (action === "right") p.facing = 1;
-    else if (Math.abs(p.vx) > 0.2) p.facing = p.vx >= 0 ? 1 : -1;
-
-    p.walkDir = p.facing || 1;
+    if (Math.abs(p.vx) > 0.2) {
+        p.facing = p.vx >= 0 ? 1 : -1;
+    }
 
     if (p.walking) {
         const speed = p.crouching ? 0.21 : 0.36;
@@ -2543,8 +2112,8 @@ const computeKnee = (hipX, hipY, footX, footY, facing, bendAmt = 1) => {
 };
 
 const computeLegPositions = (p, pose) => {
-    const { tx, hipY, footY, crouch, drop } = pose;
-    const f = -(p.walkDir ?? p.facing ?? 1);
+    const { tx, hipY, footY, crouch } = pose;
+    const f = p.facing || 1;
     const s = STICK.footSpread;
     let lFootX = tx - s;
     let lFootY = footY;
@@ -2570,12 +2139,10 @@ const computeLegPositions = (p, pose) => {
             lBend = 0.55 + Math.max(0, swing) * 0.5;
             rBend = 0.55 + Math.max(0, -swing) * 0.5;
         } else {
-            lFootX = tx - s - 2;
-            rFootX = tx + s + 2;
-            lFootY = footY + drop * 0.08;
-            rFootY = footY + drop * 0.08;
-            lBend = 1.55;
-            rBend = 1.55;
+            lFootX = tx - s - 1;
+            rFootX = tx + s + 1;
+            lBend = 1.25;
+            rBend = 1.25;
         }
     } else if (p.walking) {
         const swing = Math.sin(p.walkPhase);
@@ -2661,20 +2228,14 @@ let lastMoveSent = 0;
 const SEND_MOVE_MS = 16;
 let laserGraphics = null;
 
-app.ticker.add(() => {
+app.ticker.add((dt) => {
     try {
-        const dt = app.ticker.deltaTime;
         if (!latestState) return;
 
         const G = latestState.G;
         if (G?.currentMapId) applyMapTheme(G.currentMapId);
         drawPlatforms(getPlatformsForRender(G));
         drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
-
-        updateStartOverlay();
-        tickCountdownOverlay(G, dt);
-
-        const gameplayActive = isGameplayInputEnabled(G);
 
         let action = null;
         const crouching =
@@ -2686,7 +2247,7 @@ app.ticker.add(() => {
         if (me && G?.players?.[latestState.playerId]) {
             me.currentWeapon = G.players[latestState.playerId].currentWeapon || "winchester";
         }
-        if (me && me.health > 0 && me.torso && gameplayActive) {
+        if (me && me.health > 0 && me.torso) {
             if (isKeyPressed("KeyA", "a", "A", "ა", "ArrowLeft")) action = "left";
             else if (isKeyPressed("KeyD", "d", "D", "დ", "ArrowRight")) action = "right";
             else if (crouching) action = "crouch";
@@ -2709,7 +2270,6 @@ app.ticker.add(() => {
         const now = Date.now();
         if (
             pointerHeld &&
-            gameplayActive &&
             me &&
             me.health > 0 &&
             me.currentWeapon === "auto" &&
@@ -2718,9 +2278,9 @@ app.ticker.add(() => {
             tryShoot();
         }
 
-        if (me && me.health > 0 && me.currentWeapon === "sniper" && gameplayActive) {
+        if (me && me.health > 0 && me.currentWeapon === "sniper") {
             if (!laserGraphics) {
-                laserGraphics = new Graphics();
+                laserGraphics = new PIXI.Graphics();
                 laserContainer.addChild(laserGraphics);
             }
             drawSniperLaser(laserGraphics, getGunPose(me));
@@ -2729,23 +2289,17 @@ app.ticker.add(() => {
         }
 
         if (now - lastMoveSent >= SEND_MOVE_MS) {
-            if (isPreMatchCountdown() || isIdleTickPhase(G)) {
-                proposeMove("move", {
-                    action: null,
-                    aimAngle: me?.aimAngle ?? 0,
-                    facing: me?.facing ?? 1,
-                    crouching: false,
-                });
-                lastMoveSent = now;
-            } else if (gameplayActive && canActOnState(latestState)) {
-                proposeMove("move", {
+            window.parent.postMessage({
+                t: "bordiko:move",
+                type: "move",
+                payload: {
                     action,
                     aimAngle: me?.aimAngle ?? 0,
                     facing: me?.facing ?? 1,
                     crouching,
-                });
-                lastMoveSent = now;
-            }
+                },
+            }, "*");
+            lastMoveSent = now;
         }
 
         if (recoilShake > 0.05) {
@@ -2760,25 +2314,16 @@ app.ticker.add(() => {
         }
 
         const smooth = Math.min(1, 0.28 * dt);
-        const roundIdle = isIdleTickPhase(G);
         for (const [id, p] of Object.entries(localPlayers)) {
             if (p.deathCorpse && (p.health <= 0 || !p.torso)) continue;
             if (!p.torso || !p.head) continue;
             initPlayerRenderState(p);
-            if (roundIdle) {
-                p.walking = false;
-                p.airborne = false;
-                p.grounded = true;
-                p.vx = 0;
-                p.vy = 0;
-                continue;
-            }
             tickWeaponRecoil(p, dt);
             tickKatanaSwing(p);
             tickKatanaEquip(p);
             p.displayTorso = lerpBody(p.displayTorso, p.torso, smooth);
             p.displayHead = lerpBody(p.displayHead, p.head, smooth);
-            updatePlayerMotionState(p, p === me && gameplayActive ? action : null);
+            updatePlayerMotionState(p, p === me ? action : null);
             tickFaceExpr(p, dt);
             if (p === me) {
                 p.crouching = crouching && p.grounded;
@@ -2801,7 +2346,7 @@ app.ticker.add(() => {
                 angle = Math.atan2(b.body.y - b.prevBody.y, b.body.x - b.prevBody.x);
             }
 
-            const g = new Graphics();
+            const g = new PIXI.Graphics();
             const kind = b.kind || "bullet";
             if (kind === "rocket") {
                 g.beginFill(0xff4422, 1);
@@ -2858,12 +2403,7 @@ app.ticker.add(() => {
                 particles.splice(i, 1);
             } else {
                 pt.mesh.alpha = pt.life;
-                if (!pt.isText) {
-                    pt.mesh.scale.set(0.6 + pt.life * 0.8);
-                } else {
-                    // Start large and slightly scale down
-                    pt.mesh.scale.set(1.0 + (pt.life * 0.3));
-                }
+                pt.mesh.scale.set(0.6 + pt.life * 0.8);
             }
         }
 
@@ -2888,8 +2428,8 @@ app.ticker.add(() => {
         // Update Players
         for (const [id, p] of Object.entries(localPlayers)) {
             if (!p.lineGraphics) {
-                p.lineGraphics = new Graphics();
-                p.fillGraphics = new Graphics();
+                p.lineGraphics = new PIXI.Graphics();
+                p.fillGraphics = new PIXI.Graphics();
                 playersContainer.addChild(p.fillGraphics);
                 playersContainer.addChild(p.lineGraphics);
             }
@@ -3032,19 +2572,3 @@ app.ticker.add(() => {
         console.error("Error in ticker:", e);
     }
 });
-
-/** Explicit global bindings for Bordiko production host (survives esbuild --minify). */
-const installBordikoGlobals = () => {
-    const root = typeof globalThis !== "undefined" ? globalThis : window;
-    root.bordikoHost = bordikoHost;
-    root.bordikoProposeMove = proposeMove;
-    root.onGameState = handleGameState;
-    root.onUpdate = handleGameState;
-    root.render = () => {};
-    root.bordikoReady = signalHostReady;
-    root.__stickmanBrawlerUI = { version: "0.1.7-bridge" };
-};
-
-installBordikoGlobals();
-bordikoHost.onState(handleGameState);
-startHostReadyPulse();

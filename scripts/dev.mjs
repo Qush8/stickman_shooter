@@ -169,7 +169,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
   const HARNESS = existsSync(localHarness)
     ? readFileSync(localHarness, "utf8")
     : readFileSync(join(bordikoCliDir, "harness.html"), "utf8");
-  const SANDBOX_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: data:; font-src data: https:; connect-src 'none'; base-uri 'none'; form-action 'none'";
+  const SANDBOX_CSP = "default-src 'none'; script-src 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src https: data:; font-src data: https:; connect-src 'none'; base-uri 'none'; form-action 'none'";
   const send = (res, code, type, body, headers = {}) => { res.writeHead(code, { "content-type": type, "cache-control": "no-store", ...headers }); res.end(body); };
 
   newMatch({});

@@ -147,6 +147,7 @@ export interface BodyState {
 
 export type GameMode = "ffa" | "teams2v2";
 export type RoundPhase = "playing" | "intermission";
+export type MatchPhase = "active";
 export type TeamId = 0 | 1;
 
 export interface GameConfig {
@@ -182,6 +183,7 @@ export interface HitEvent {
   y: number;
   targetId: string;
   damage: number;
+  isHeadshot?: boolean;
 }
 
 export interface PlatformState {
@@ -244,6 +246,7 @@ export interface ShooterState {
   roundPhase: RoundPhase;
   intermissionTicksLeft: number;
   lastRoundWinner: string | null;
+  matchPhase: MatchPhase;
 }
 
 export const ROUNDS_TO_WIN = 3;
@@ -254,14 +257,17 @@ const PICKUP_FALL_SPEED = 8;
 const SCALE = 30;
 const MAX_HEALTH = 1000;
 const HEADSHOT_HEALTH_FRACTION = 0.5;
-const HEAD_VISUAL_RADIUS_PX = 16;
-const HEAD_HIT_RADIUS_PX = HEAD_VISUAL_RADIUS_PX + 4;
+const HEAD_VISUAL_RADIUS_PX = 14;
+const HEAD_HIT_RADIUS_PX = HEAD_VISUAL_RADIUS_PX + 2;
 const BULLET_DAMAGE = 125;
 const MAX_BULLETS_PER_PLAYER = 3;
 const PLAYER_HALF_W = 0.48;
 const PLAYER_HALF_H = 1.06;
 const HEAD_OFFSET = 36;
 const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
+/** Fixed Planck timestep — one move advances one physics tick at 60Hz. */
+const PHYSICS_HZ = 60;
+const PHYSICS_DT = 1 / PHYSICS_HZ;
 const MOVE_SPEED = 15;
 const JUMP_IMPULSE = 40;
 const GRAVITY = 97.5;
@@ -276,7 +282,8 @@ const GROUNDED_VEL_Y = 12;
 const GROUNDED_GAP = 0.5;
 const STAND_LIFT = 0.14;
 const MAX_BULLET_BOUNCES = 2;
-const PLATFORM_MAX_HEALTH = BULLET_DAMAGE * 4;
+const PLATFORM_HITS_TO_BREAK = 4;
+const PLATFORM_MAX_HEALTH = WEAPONS.winchester.damage * PLATFORM_HITS_TO_BREAK;
 const PLATFORM_BORDER_PX = 2;
 const CRATE_MAX_HEALTH = 500;
 const CRATE_W = 36;
@@ -291,7 +298,7 @@ const KATANA_SWING_HIT_SAMPLES = [0.28, 0.36, 0.44, 0.52, 0.6, 0.68];
 
 const STICK_BODY_LEN_PX = 44;
 const STICK_ARM_LEN_PX = 28;
-const STICK_CROUCH_DROP_PX = 18;
+const STICK_CROUCH_DROP_PX = 46;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
 
@@ -953,7 +960,7 @@ function applyPlatformRiderDelta(G: ShooterState, plat: PlatformState, dx: numbe
 }
 
 function advancePlatformMotion(G: ShooterState) {
-  const dt = 1 / 60;
+  const dt = PHYSICS_DT;
 
   for (const plat of G.platforms) {
     if (plat.broken || plat.kind !== "elevator" || plat.vx == null) continue;
@@ -1735,23 +1742,9 @@ function isHeadshotHit(targetId: string, hitX: number, hitY: number): boolean {
   const bodies = playerBodies[targetId];
   if (!bodies) return false;
   const hPos = bodies.head.getPosition();
-  const tPos = bodies.torso.getPosition();
   const hx = hPos.x * SCALE;
   const hy = hPos.y * SCALE;
-  const ty = tPos.y * SCALE;
-  const headR = HEAD_HIT_RADIUS_PX;
-  const halfW = PLAYER_HALF_W * SCALE;
-
-  if (Math.hypot(hitX - hx, hitY - hy) <= headR) return true;
-
-  // Side torso contacts at head height (matches on-screen stickman head band).
-  const inHeadVerticalBand = hitY >= hy - headR && hitY <= hy + headR + 8;
-  const inReach = Math.abs(hitX - hx) <= headR + halfW + 4;
-  if (inHeadVerticalBand && inReach) return true;
-
-  // Neck / upper chest when the shot visually targets the head but registers on torso.
-  const neckY = ty - STICK_BODY_LEN_PX * 0.42;
-  return hitY <= neckY && Math.abs(hitX - hx) <= headR + halfW + 6;
+  return Math.hypot(hitX - hx, hitY - hy) <= HEAD_HIT_RADIUS_PX;
 }
 
 function bulletHitsHeadZone(targetId: string, bulletBody: planck.Body): boolean {
@@ -1768,7 +1761,7 @@ function bulletHitsHeadZone(targetId: string, bulletBody: planck.Body): boolean 
   const speed = Math.hypot(vel.x, vel.y);
   if (speed < 0.01) return false;
 
-  const backPx = 14;
+  const backPx = 8;
   const px = bx - (vel.x / speed) * backPx;
   const py = by - (vel.y / speed) * backPx;
 
@@ -1784,14 +1777,19 @@ function resolveBulletPlayerDamage(
   bulletBody: planck.Body,
   contactPx: { x: number; y: number } | null,
   bulletDamage: number,
-): number {
+): { damage: number; isHeadshot: boolean } {
   const headshot =
     hitPart === "head" ||
     bulletHitsHeadZone(targetId, bulletBody) ||
     (contactPx != null && isHeadshotHit(targetId, contactPx.x, contactPx.y));
 
-  if (headshot) return Math.floor(MAX_HEALTH * HEADSHOT_HEALTH_FRACTION);
-  return bulletDamage;
+  if (headshot) {
+    return {
+      damage: Math.floor(MAX_HEALTH * HEADSHOT_HEALTH_FRACTION),
+      isHeadshot: true,
+    };
+  }
+  return { damage: bulletDamage, isHeadshot: false };
 }
 
 function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact) {
@@ -1823,7 +1821,7 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
     const contactPoint = getContactHitPointPx(contact);
     const bulletPxX = bulletPos.x * SCALE;
     const bulletPxY = bulletPos.y * SCALE;
-    const damage = resolveBulletPlayerDamage(
+    const { damage, isHeadshot } = resolveBulletPlayerDamage(
       otherData.id,
       otherData.type,
       bulletBody,
@@ -1835,6 +1833,7 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
       y: contactPoint?.y ?? bulletPxY,
       targetId: otherData.id,
       damage,
+      isHeadshot,
     });
     return;
   }
@@ -1908,11 +1907,12 @@ function advanceWorld(G: ShooterState, random: RandomAPI) {
   setCurrentG(G);
   G.hitEvents = [];
   G.worldTick += 1;
+
   if (G.roundPhase === "playing") {
     runSpawnCycle(G, random);
     advancePlatformMotion(G);
     updatePickupDrops(G);
-    world.step(1 / 60);
+    world.step(PHYSICS_DT);
     updatePlayerGroundedState();
     updatePlayerWallContacts();
     resolvePlayerSideStick();
@@ -2177,6 +2177,7 @@ export default defineGame<ShooterState>({
       roundPhase: "playing",
       intermissionTicksLeft: 0,
       lastRoundWinner: null,
+      matchPhase: "active",
     };
     initPlatforms(G);
     syncStateFromPhysics(G);
@@ -2299,12 +2300,17 @@ export default defineGame<ShooterState>({
 
     const p = G.players[playerId];
     if (!p || p.health <= 0) return [];
+    const moveOpts = (action: string | null) => [
+      { type: "move" as const, payload: { action, crouching: false } as any },
+      { type: "move" as const, payload: { action, crouching: true } as any },
+    ];
     return [
-      { type: "move", payload: { action: "left", aimAngle: p.aimAngle, crouching: p.crouching } as any },
-      { type: "move", payload: { action: "right", aimAngle: p.aimAngle, crouching: p.crouching } as any },
-      { type: "move", payload: { action: "jump", aimAngle: p.aimAngle, crouching: p.crouching } as any },
-      { type: "move", payload: { action: "crouch", aimAngle: p.aimAngle, crouching: true } as any },
-      { type: "shoot", payload: { aimAngle: p.aimAngle } as any },
+      ...moveOpts(null),
+      ...moveOpts("left"),
+      ...moveOpts("right"),
+      ...moveOpts("jump"),
+      { type: "move", payload: { action: "crouch", crouching: true } as any },
+      { type: "shoot", payload: {} as any },
       ...(p.ownedWeapons.length > 1
         ? [{ type: "switchWeapon" as const, payload: { cycle: true } as any }]
         : []),
@@ -2338,7 +2344,7 @@ export const testUtils = {
     bulletBody: planck.Body,
     contactPx: { x: number; y: number } | null,
     bulletDamage: number,
-  ) => resolveBulletPlayerDamage(targetId, hitPart, bulletBody, contactPx, bulletDamage),
+  ) => resolveBulletPlayerDamage(targetId, hitPart, bulletBody, contactPx, bulletDamage).damage,
   isHeadshotHit: (targetId: string, hitX: number, hitY: number) =>
     isHeadshotHit(targetId, hitX, hitY),
   bulletHitsHeadZone: (targetId: string, bulletBody: planck.Body) =>

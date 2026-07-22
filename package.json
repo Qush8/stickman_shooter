@@ -1,6 +1,6 @@
 {
   "name": "my-shooter-game",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "type": "module",
   "private": true,
   "bordiko": {
@@ -14,7 +14,7 @@
     "board": "custom"
   },
   "scripts": {
-    "build:ui": "node scripts/embed-sfx.mjs && esbuild src/ui.js --bundle --outfile=dist/ui.bundle.js && node build-ui.cjs",
+    "build:ui": "node scripts/embed-sfx.mjs && esbuild src/ui.js --bundle --format=iife --minify --keep-names --outfile=dist/ui.bundle.js && node build-ui.cjs",
     "dev": "node scripts/dev.mjs",
     "build": "npm run build:ui && bordiko build",
     "prepublish:game": "npm run build",
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@bordiko/cli": "^0.1.0",
+    "@types/node": "^26.1.1",
     "esbuild": "^0.28.1"
   }
 }
