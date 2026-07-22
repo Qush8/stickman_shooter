@@ -1,6 +1,6 @@
 {
   "name": "my-shooter-game",
-  "version": "0.1.6",
+  "version": "0.1.9",
   "type": "module",
   "private": true,
   "bordiko": {
@@ -11,7 +11,11 @@
     "categories": [
       "action"
     ],
-    "board": "custom"
+    "board": "custom",
+    "realtime": {
+      "tick": true,
+      "tickRate": 30
+    }
   },
   "scripts": {
     "build:ui": "node scripts/embed-sfx.mjs && esbuild src/ui.js --bundle --format=iife --minify --keep-names --outfile=dist/ui.bundle.js && node build-ui.cjs",

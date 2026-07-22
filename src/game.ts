@@ -154,6 +154,15 @@ export interface GameConfig {
   mode?: GameMode;
 }
 
+export interface PlayerInput {
+  action: string | null;
+  jumping: boolean;
+  aimAngle: number;
+  facing: number;
+  crouching: boolean;
+  shooting: boolean;
+}
+
 export interface PlayerState {
   health: number;
   aimAngle: number;
@@ -165,6 +174,7 @@ export interface PlayerState {
   torso: BodyState;
   head: BodyState;
   team?: TeamId;
+  input?: PlayerInput;
 }
 
 export interface BulletState {
@@ -410,14 +420,6 @@ function startNextRound(G: ShooterState) {
   G.roundPhase = "playing";
   G.intermissionTicksLeft = 0;
   resetRound(G);
-}
-
-function tickIntermission(G: ShooterState) {
-  if (G.roundPhase !== "intermission") return;
-  G.intermissionTicksLeft -= 1;
-  if (G.intermissionTicksLeft <= 0) {
-    startNextRound(G);
-  }
 }
 
 function buildMatchResult(G: ShooterState): GameResult | void {
@@ -1029,6 +1031,7 @@ function applyVerticalJump(
   playerId: string,
   opts: { keepVx?: number; horizImpulse?: number } = {},
 ) {
+  torso.setAwake(true);
   const mass = torso.getMass();
   const horiz = opts.horizImpulse ?? 0;
   if (horiz !== 0) {
@@ -1903,6 +1906,53 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
   }
 }
 
+function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI) {
+  const p = G.players[playerId];
+  const bodies = playerBodies[playerId];
+  if (!p || !bodies || p.health <= 0 || !p.input) return;
+
+  const data = p.input;
+  const torso = bodies.torso;
+  torso.setAwake(true);
+  const vel = torso.getLinearVelocity();
+  const crouching = data.crouching === true || data.action === "crouch";
+  p.crouching = crouching && isPlayerGrounded(playerId, torso);
+  const speedMul = p.crouching ? 0.45 : 1;
+
+  if (data.action === "left") {
+    torso.setLinearVelocity(planck.Vec2(-MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
+  } else if (data.action === "right") {
+    torso.setLinearVelocity(planck.Vec2(MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
+  } else if (data.action === "crouch" || (crouching && !data.action)) {
+    torso.setLinearVelocity(planck.Vec2(torso.getLinearVelocity().x * 0.35, torso.getLinearVelocity().y));
+  } else {
+    torso.setLinearVelocity(planck.Vec2(0, torso.getLinearVelocity().y));
+  }
+
+  if (data.jumping) {
+    const wall = playerWallContact[playerId];
+    const standingJump = canPerformStandingJump(playerId, torso, p.crouching);
+
+    console.log("Jump intent:", data.jumping, "Grounded:", standingJump, "Wall:", !!wall);
+
+    if (standingJump) {
+      applyVerticalJump(torso, playerId, { keepVx: torso.getLinearVelocity().x });
+      playerGrounded[playerId] = false;
+      playerWallJumpUsed[playerId] = false;
+    } else if (wall && !playerWallJumpUsed[playerId]) {
+      const awayX = wall.nx >= 0 ? 1 : -1;
+      applyVerticalJump(torso, playerId, { horizImpulse: WALL_JUMP_IMPULSE_X * awayX });
+      playerGrounded[playerId] = false;
+      playerWallJumpUsed[playerId] = true;
+    }
+    data.jumping = false;
+  }
+
+  if (data.shooting) {
+    fireWeapon(G, playerId, data.aimAngle, data.facing, random);
+  }
+}
+
 function advanceWorld(G: ShooterState, random: RandomAPI) {
   setCurrentG(G);
   G.hitEvents = [];
@@ -2075,6 +2125,26 @@ export default defineGame<ShooterState>({
 
   initialActive: (G) => Object.keys(G.players),
 
+  // @ts-ignore - tick is a real-time feature not yet in the types
+  tick: (G: ShooterState, dt: number, ctx: any) => {
+    setCurrentG(G);
+    const steps = Math.round(dt / (1000 / PHYSICS_HZ));
+
+    for (let i = 0; i < steps; i++) {
+      if (G.roundPhase === "intermission") {
+        G.intermissionTicksLeft -= 1;
+        if (G.intermissionTicksLeft <= 0) {
+          startNextRound(G);
+        }
+      } else {
+        for (const playerId of Object.keys(G.players)) {
+          applyMovementInput(G, playerId, ctx.random);
+        }
+        advanceWorld(G, ctx.random);
+      }
+    }
+  },
+
   setup: (ctx) => {
     const gameMode = parseGameConfig(ctx.config);
     if (gameMode === "teams2v2" && ctx.numPlayers !== 4) {
@@ -2186,69 +2256,24 @@ export default defineGame<ShooterState>({
   },
 
   moves: {
-    move: (G, payload, ctx) => {
+    input: (G, payload, ctx) => {
       setCurrentG(G);
-      if (G.roundPhase === "intermission") {
-        tickIntermission(G);
-        return;
-      }
-
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
 
-      const data = payload as {
-        action?: string | null;
-        aimAngle?: number;
-        facing?: number;
-        crouching?: boolean;
+      const data = payload as unknown as PlayerInput;
+      p.input = {
+        action: data.action ?? null,
+        jumping: (p.input?.jumping || !!data.jumping),
+        aimAngle: typeof data.aimAngle === "number" ? data.aimAngle : p.aimAngle,
+        facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
+        crouching: !!data.crouching,
+        shooting: !!data.shooting,
       };
-      const bodies = playerBodies[ctx.playerId];
-      if (!bodies) return INVALID_MOVE;
-
-      if (typeof data.aimAngle === "number") p.aimAngle = data.aimAngle;
-      if (typeof data.facing === "number") p.facing = data.facing >= 0 ? 1 : -1;
-
-      const torso = bodies.torso;
-      const vel = torso.getLinearVelocity();
-      const crouching = data.crouching === true || data.action === "crouch";
-      p.crouching = crouching && isPlayerGrounded(ctx.playerId, torso);
-      const speedMul = p.crouching ? 0.45 : 1;
-      const grounded = isPlayerGrounded(ctx.playerId, torso);
-
-      if (data.action === "left") {
-        p.facing = -1;
-        torso.setLinearVelocity(planck.Vec2(-MOVE_SPEED * speedMul, vel.y));
-      } else if (data.action === "right") {
-        p.facing = 1;
-        torso.setLinearVelocity(planck.Vec2(MOVE_SPEED * speedMul, vel.y));
-      } else if (data.action === "jump") {
-        const wall = playerWallContact[ctx.playerId];
-        const standingJump = canPerformStandingJump(ctx.playerId, torso, p.crouching);
-
-        if (standingJump) {
-          applyVerticalJump(torso, ctx.playerId, { keepVx: vel.x });
-          playerGrounded[ctx.playerId] = false;
-          playerWallJumpUsed[ctx.playerId] = false;
-        } else if (wall && !playerWallJumpUsed[ctx.playerId]) {
-          const awayX = wall.nx >= 0 ? 1 : -1;
-          applyVerticalJump(torso, ctx.playerId, { horizImpulse: WALL_JUMP_IMPULSE_X * awayX });
-          playerGrounded[ctx.playerId] = false;
-          playerWallJumpUsed[ctx.playerId] = true;
-        }
-      } else if (data.action === "crouch" || (crouching && !data.action)) {
-        torso.setLinearVelocity(planck.Vec2(vel.x * 0.35, vel.y));
-      } else {
-        torso.setLinearVelocity(planck.Vec2(0, vel.y));
-      }
-
-      advanceWorld(G, ctx.random);
     },
     switchWeapon: (G, payload, ctx) => {
       setCurrentG(G);
-      if (G.roundPhase === "intermission") {
-        tickIntermission(G);
-        return;
-      }
+      if (G.roundPhase === "intermission") return;
 
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
@@ -2263,65 +2288,9 @@ export default defineGame<ShooterState>({
       } else {
         return INVALID_MOVE;
       }
-
-      advanceWorld(G, ctx.random);
-    },
-    shoot: (G, payload, ctx) => {
-      setCurrentG(G);
-      if (G.roundPhase === "intermission") {
-        tickIntermission(G);
-        return;
-      }
-
-      const p = G.players[ctx.playerId];
-      if (!p || p.health <= 0) return INVALID_MOVE;
-
-      const data = payload as { aimAngle?: number; facing?: number };
-      const aimAngle = typeof data?.aimAngle === "number" ? data.aimAngle : p.aimAngle;
-      p.aimAngle = aimAngle;
-      const facing =
-        typeof data?.facing === "number"
-          ? data.facing >= 0
-            ? 1
-            : -1
-          : p.facing ?? (Math.cos(aimAngle) >= 0 ? 1 : -1);
-      p.facing = facing;
-
-      if (!fireWeapon(G, ctx.playerId, aimAngle, facing, ctx.random)) return INVALID_MOVE;
-
-      advanceWorld(G, ctx.random);
     },
   },
   endIf: (G) => buildMatchResult(G),
-  enumerate: (G, playerId) => {
-    if (G.roundPhase === "intermission") {
-      return [{ type: "move", payload: { action: null, aimAngle: 0, crouching: false } as any }];
-    }
-
-    const p = G.players[playerId];
-    if (!p || p.health <= 0) return [];
-    const moveOpts = (action: string | null) => [
-      { type: "move" as const, payload: { action, crouching: false } as any },
-      { type: "move" as const, payload: { action, crouching: true } as any },
-    ];
-    return [
-      ...moveOpts(null),
-      ...moveOpts("left"),
-      ...moveOpts("right"),
-      ...moveOpts("jump"),
-      { type: "move", payload: { action: "crouch", crouching: true } as any },
-      { type: "shoot", payload: {} as any },
-      ...(p.ownedWeapons.length > 1
-        ? [{ type: "switchWeapon" as const, payload: { cycle: true } as any }]
-        : []),
-      ...p.ownedWeapons
-        .filter((weaponId) => weaponId !== p.currentWeapon)
-        .map((weaponId) => ({
-          type: "switchWeapon" as const,
-          payload: { weaponId } as any,
-        })),
-    ];
-  },
 });
 
 export const testUtils = {
@@ -2333,7 +2302,6 @@ export const testUtils = {
     p.health = 0;
     destroyPlayerPhysics(id);
   },
-  tickIntermission: (G: ShooterState) => tickIntermission(G),
   startNextRound: (G: ShooterState) => startNextRound(G),
   platformBodyCount: () => Object.keys(platformBodies).length,
   canDamage: (G: ShooterState, attackerId: string, targetId: string) =>

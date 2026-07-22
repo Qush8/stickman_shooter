@@ -277,12 +277,6 @@ const isGameplayInputEnabled = (G) =>
 const isIdleTickPhase = (G) => G?.roundPhase === "intermission";
 
 /** Production host may omit yourTurn; treat legal moves as permission to act. */
-const canActOnState = (state) => {
-    if (!state || state.ended) return false;
-    if (state.yourTurn === false && !(state.legalMoves?.length > 0)) return false;
-    return true;
-};
-
 const updateStartOverlay = () => {
     ensureOverlayTexts();
     updateOverlayLayout();
@@ -1065,95 +1059,21 @@ window.addEventListener(
             console.log("[stickman-brawler] <- host raw state", {
                 moveCount: msg.state.moveCount,
                 playerId: msg.state.playerId,
-                yourTurn: msg.state.yourTurn,
-                legalMoves: msg.state.legalMoves?.length ?? 0,
             });
         }
     },
     true,
 );
 
-/** Match a client payload to a legal move from the host (production validates against enumerate). */
-const resolveLegalPayload = (type, payload) => {
-    const legal = latestState?.legalMoves;
-    if (!legal?.length) return null;
-
-    if (type === "move") {
-        const action = payload?.action ?? null;
-        const clientCrouching = !!payload?.crouching;
-        const match = legal.find(
-            (m) =>
-                m.type === "move" &&
-                (m.payload?.action ?? null) === action &&
-                Boolean(m.payload?.crouching) === clientCrouching,
-        );
-        if (!match) return null;
-        return { ...match.payload };
-    }
-
-    if (type === "shoot") {
-        const match = legal.find((m) => m.type === "shoot");
-        if (!match) return null;
-        return { ...(match.payload ?? {}) };
-    }
-
-    if (type === "switchWeapon") {
-        const match = legal.find(
-            (m) =>
-                m.type === "switchWeapon" &&
-                JSON.stringify(m.payload ?? null) === JSON.stringify(payload ?? null),
-        );
-        return match ? match.payload : null;
-    }
-
-    return payload ?? null;
-};
-
 const proposeMove = (type, payload) => {
     if (!latestState || latestState.ended) return;
     const G = latestState.G;
-    const legal = latestState.legalMoves;
 
-    const isIdleMove =
-        type === "move" &&
-        (payload?.action ?? null) === null &&
-        !payload?.crouching;
-
-    if (isIdleTickPhase(G) || (isPreMatchCountdown() && isIdleMove)) {
-        if (!isIdleMove) return;
-    } else if (!isGameplayInputEnabled(G)) {
-        return;
-    } else if (!canActOnState(latestState)) {
-        console.warn("[stickman-brawler] move blocked (not your turn)", {
-            type,
-            yourTurn: latestState.yourTurn,
-            legalMoves: legal?.length ?? 0,
-        });
+    if (!isGameplayInputEnabled(G) && !isIdleTickPhase(G) && !isPreMatchCountdown()) {
         return;
     }
 
-    if (type === "shoot" && legal?.some((m) => m.type === "shoot")) {
-        bordikoHost.move("shoot", {
-            aimAngle: payload?.aimAngle ?? 0,
-            facing: payload?.facing ?? 1,
-        });
-        return;
-    }
-
-    const resolved = resolveLegalPayload(type, payload);
-    if (resolved) {
-        bordikoHost.move(type, resolved);
-        return;
-    }
-    if (!legal?.length) {
-        bordikoHost.move(type, payload ?? {});
-        return;
-    }
-    console.warn("[stickman-brawler] move rejected by legalMoves", {
-        type,
-        payload,
-        legalCount: legal.length,
-    });
+    bordikoHost.move(type, payload ?? {});
 };
 
 // Input
@@ -1162,8 +1082,6 @@ let mouseX = 0;
 let mouseY = 0;
 let jumpQueued = false;
 let pointerHeld = false;
-let lastShootSent = 0;
-const AUTO_FIRE_MS = 125;
 
 const isJumpKey = (code) =>
   code === "Space" || code === "KeyW" || code === "ArrowUp";
@@ -1181,38 +1099,11 @@ document.addEventListener("pointerdown", (e) => {
     if (!latestState) return;
     if (!isGameplayInputEnabled(latestState.G)) return;
     pointerHeld = true;
-    tryShoot();
 });
 
 document.addEventListener("pointerup", () => {
     pointerHeld = false;
 });
-
-const tryShoot = () => {
-    if (!latestState) return;
-    if (!isGameplayInputEnabled(latestState.G)) return;
-    if (!canActOnState(latestState)) return;
-    const me = localPlayers[latestState.playerId];
-    if (!me || me.health <= 0) return;
-
-    const gun = getGunPose(me);
-    me.aimAngle = Math.atan2(mouseY - gun.neckTop, mouseX - me.displayTorso.x);
-    markShootFace(me);
-    proposeMove("shoot", {
-        aimAngle: me.aimAngle || 0,
-        facing: me.facing || 1,
-    });
-    lastShootSent = Date.now();
-    if (me && me.currentWeapon) {
-        if (me.currentWeapon === "katana") {
-            startKatanaSwing(me);
-            Sfx.playShoot("katana");
-            triggerRecoilShake("katana");
-        } else {
-            triggerWeaponRecoil(me, me.currentWeapon);
-        }
-    }
-};
 
 const sendSwitchWeapon = (weaponId) => {
     const me = latestState ? localPlayers[latestState.playerId] : null;
@@ -1239,19 +1130,6 @@ window.addEventListener("keydown", (e) => {
     if (e.key) activeKeys.add(e.key.toLowerCase());
     if (isJumpKey(e.code) && !e.repeat) {
         jumpQueued = true;
-        if (latestState && isGameplayInputEnabled(latestState.G)) {
-            const me = localPlayers[latestState.playerId];
-            if (me && me.health > 0) {
-                Sfx.playJump();
-                proposeMove("move", {
-                    action: "jump",
-                    aimAngle: me.aimAngle ?? 0,
-                    facing: me.facing ?? 1,
-                    crouching: false,
-                });
-                jumpQueued = false;
-            }
-        }
     }
     if (e.code === "Space" || e.code === "KeyW" || e.code === "KeyS") {
         e.preventDefault();
@@ -1478,12 +1356,18 @@ const handleGameState = (state) => {
                         createWallHit(lb.body.x, lb.body.y, -dx, -dy);
                         Sfx.playBulletHit(false);
                     }
+                    if (lb.g) {
+                        bulletsContainer.removeChild(lb.g);
+                        lb.g.destroy();
+                    }
                     localBullets.delete(id);
                 }
             }
             for (const b of G.bullets) {
                 if (!localBullets.has(b.id)) {
-                    localBullets.set(b.id, { ...b, prevBody: { ...b.body } });
+                    const g = new Graphics();
+                    bulletsContainer.addChild(g);
+                    localBullets.set(b.id, { ...b, prevBody: { ...b.body }, displayBody: { ...b.body }, g });
                     const wId = b.weaponId || localPlayers[b.owner]?.currentWeapon || "winchester";
                     createMuzzleFlash(b.body.x, b.body.y, wId);
                     Sfx.playShoot(wId);
@@ -1497,6 +1381,10 @@ const handleGameState = (state) => {
                     }
                 } else {
                     const lb = localBullets.get(b.id);
+                    if (lb.body) {
+                        lb.vx = b.body.x - lb.body.x;
+                        lb.vy = b.body.y - lb.body.y;
+                    }
                     lb.prevBody = lb.body ? { ...lb.body } : null;
                     lb.body = b.body;
                     lb.kind = b.kind;
@@ -2658,8 +2546,10 @@ const drawStickmanFills = (g, p, isMe) => {
 
 // Main Loop
 let lastMoveSent = 0;
+let lastSentInput = null;
 const SEND_MOVE_MS = 16;
 let laserGraphics = null;
+let pendingJump = false;
 
 app.ticker.add(() => {
     try {
@@ -2686,13 +2576,14 @@ app.ticker.add(() => {
         if (me && G?.players?.[latestState.playerId]) {
             me.currentWeapon = G.players[latestState.playerId].currentWeapon || "winchester";
         }
+        
         if (me && me.health > 0 && me.torso && gameplayActive) {
             if (isKeyPressed("KeyA", "a", "A", "ა", "ArrowLeft")) action = "left";
             else if (isKeyPressed("KeyD", "d", "D", "დ", "ArrowRight")) action = "right";
             else if (crouching) action = "crouch";
 
             if (jumpQueued) {
-                action = "jump";
+                pendingJump = true;
                 jumpQueued = false;
                 Sfx.playJump();
             }
@@ -2704,19 +2595,10 @@ app.ticker.add(() => {
             else if (action === "right") me.facing = 1;
         } else {
             jumpQueued = false;
+            pendingJump = false;
         }
 
         const now = Date.now();
-        if (
-            pointerHeld &&
-            gameplayActive &&
-            me &&
-            me.health > 0 &&
-            me.currentWeapon === "auto" &&
-            now - lastShootSent >= AUTO_FIRE_MS
-        ) {
-            tryShoot();
-        }
 
         if (me && me.health > 0 && me.currentWeapon === "sniper" && gameplayActive) {
             if (!laserGraphics) {
@@ -2730,20 +2612,52 @@ app.ticker.add(() => {
 
         if (now - lastMoveSent >= SEND_MOVE_MS) {
             if (isPreMatchCountdown() || isIdleTickPhase(G)) {
-                proposeMove("move", {
+                const input = {
                     action: null,
+                    jumping: false,
                     aimAngle: me?.aimAngle ?? 0,
                     facing: me?.facing ?? 1,
                     crouching: false,
-                });
+                    shooting: false,
+                };
+                
+                if (!lastSentInput || 
+                    lastSentInput.action !== input.action || 
+                    lastSentInput.jumping !== input.jumping || 
+                    lastSentInput.facing !== input.facing || 
+                    lastSentInput.crouching !== input.crouching || 
+                    lastSentInput.shooting !== input.shooting || 
+                    Math.abs(lastSentInput.aimAngle - input.aimAngle) > 0.05
+                ) {
+                    proposeMove("input", input);
+                    lastSentInput = { ...input };
+                }
+                
+                pendingJump = false;
                 lastMoveSent = now;
-            } else if (gameplayActive && canActOnState(latestState)) {
-                proposeMove("move", {
+            } else if (gameplayActive) {
+                const input = {
                     action,
+                    jumping: pendingJump,
                     aimAngle: me?.aimAngle ?? 0,
                     facing: me?.facing ?? 1,
                     crouching,
-                });
+                    shooting: pointerHeld,
+                };
+                
+                if (!lastSentInput || 
+                    lastSentInput.action !== input.action || 
+                    lastSentInput.jumping !== input.jumping || 
+                    lastSentInput.facing !== input.facing || 
+                    lastSentInput.crouching !== input.crouching || 
+                    lastSentInput.shooting !== input.shooting || 
+                    Math.abs(lastSentInput.aimAngle - input.aimAngle) > 0.05
+                ) {
+                    proposeMove("input", input);
+                    lastSentInput = { ...input };
+                }
+                
+                pendingJump = false;
                 lastMoveSent = now;
             }
         }
@@ -2792,16 +2706,23 @@ app.ticker.add(() => {
         }
 
         // Update Bullets
-        bulletsContainer.removeChildren();
         for (const [, b] of localBullets.entries()) {
-            if (!b.body) continue;
+            if (!b.body || !b.g) continue;
 
-            let angle = b.body.angle || 0;
-            if (b.prevBody) {
-                angle = Math.atan2(b.body.y - b.prevBody.y, b.body.x - b.prevBody.x);
+            if (!b.displayBody) {
+                b.displayBody = { ...b.body };
             }
 
-            const g = new Graphics();
+            // Smoothly Lerp towards the authoritative server position
+            b.displayBody = lerpBody(b.displayBody, b.body, Math.min(1, 0.45 * dt));
+
+            let angle = b.displayBody.angle || 0;
+            if (b.prevBody) {
+                angle = Math.atan2(b.displayBody.y - b.prevBody.y, b.displayBody.x - b.prevBody.x);
+            }
+
+            const g = b.g;
+            g.clear();
             const kind = b.kind || "bullet";
             if (kind === "rocket") {
                 g.beginFill(0xff4422, 1);
@@ -2827,13 +2748,12 @@ app.ticker.add(() => {
                 g.drawCircle(Math.cos(angle) * 1.2, Math.sin(angle) * 1.2, 1.5);
                 g.endFill();
             }
-            g.position.set(b.body.x, b.body.y);
-            bulletsContainer.addChild(g);
+            g.position.set(b.displayBody.x, b.displayBody.y);
 
             if (Math.random() < 0.35) {
                 spawnParticle(
-                    b.body.x - Math.cos(angle) * 8,
-                    b.body.y - Math.sin(angle) * 8,
+                    b.displayBody.x - Math.cos(angle) * 8,
+                    b.displayBody.y - Math.sin(angle) * 8,
                     -Math.cos(angle) * 2,
                     -Math.sin(angle) * 2,
                     0xffaa55,

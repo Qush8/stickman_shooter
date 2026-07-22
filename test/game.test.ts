@@ -20,13 +20,37 @@ const assertMoveOk = (r: { ok: boolean; error?: string }) => {
 };
 
 const advanceTicks = (m: MatchState<ShooterState>, ticks: number) => {
-  let state = m;
+  let state = { ...m };
   for (let i = 0; i < ticks; i++) {
-    state = applyMove(game, state, {
-      type: "move",
+    (game as any).tick!(state.G, 1000 / 60, {
       playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
+      numPlayers: 2,
+      random: {
+        float: () => 0.5,
+        integer: (min: number, max: number) => Math.floor(0.5 * (max - min + 1)) + min,
+        shuffle: (arr: any[]) => arr,
+        bool: () => true,
+        pick: (arr: any[]) => arr[0],
+      },
+      events: {
+        endGame: (result: any) => {
+          state.ended = true;
+          state.result = result;
+        },
+        endPhase: () => {},
+        endTurn: () => {},
+        setActivePlayers: () => {},
+      },
+      config: {},
+    } as any);
+
+    if (game.endIf) {
+      const result = game.endIf(state.G, {} as any);
+      if (result) {
+        state.ended = true;
+        state.result = result;
+      }
+    }
   }
   return state;
 };
@@ -42,29 +66,54 @@ test("a player spawns with correct health and weapon", () => {
 });
 
 test("move updates player position via physics sync", () => {
-  let m = bootMatch( { players: ["p1", "p2"], seed: "t2" });
+  let m = bootMatch({ players: ["p1", "p2"], seed: "t2" });
 
   const startX = m.G.players["p1"].torso.x;
   const r = applyMove(game, m, {
-    type: "move",
+    type: "input",
     playerId: "p1",
-    payload: { action: "right", aimAngle: 0, crouching: false },
+    payload: { action: "right", aimAngle: 0, crouching: false, shooting: false },
   });
   assertMoveOk(r);
 
   m = r.state;
+  m = advanceTicks(m, 1);
   assert.ok(m.G.players["p1"].torso.x >= startX);
 });
 
-test("shoot spawns a bullet for winchester", () => {
-  let m = bootMatch( { players: ["p1", "p2"], seed: "t3" });
+test("jump updates player position upwards", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "t2_jump" });
 
-  assert.equal(m.G.bullets.length, 0);
+  // Let them fall to the ground first
+  m = advanceTicks(m, 30);
 
-  const r = applyMove(game, m, { type: "shoot", playerId: "p1", payload: { aimAngle: 0 } });
+  const startY = m.G.players["p1"].torso.y;
+  const r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, jumping: true, aimAngle: 0, crouching: false, shooting: false },
+  });
   assertMoveOk(r);
 
   m = r.state;
+  m = advanceTicks(m, 5); // 5 ticks is enough to move up
+  assert.ok(m.G.players["p1"].torso.y < startY - 10, `Player should have moved up (negative Y). Start Y: ${startY}, End Y: ${m.G.players["p1"].torso.y}`);
+});
+
+test("shoot spawns a bullet for winchester", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "t3" });
+
+  assert.equal(m.G.bullets.length, 0);
+
+  const r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: true },
+  });
+  assertMoveOk(r);
+
+  m = r.state;
+  m = advanceTicks(m, 1);
   assert.equal(m.G.bullets.length, 1);
   assert.equal(m.G.bullets[0].owner, "p1");
   assert.equal(m.G.bullets[0].weaponId, "winchester");
@@ -107,10 +156,15 @@ test("shotgun spawns multiple pellets", () => {
     payload: { weaponId: "winchester_shotgun" },
   }).state;
 
-  const r = applyMove(game, m, { type: "shoot", playerId: "p1", payload: { aimAngle: 0 } });
+  const r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: true },
+  });
   assertMoveOk(r);
 
   m = r.state;
+  m = advanceTicks(m, 1);
   assert.equal(m.G.bullets.length, 6);
   assert.ok(m.G.bullets.every((b) => b.kind === "pellet"));
 });
@@ -121,13 +175,7 @@ test("elevator platform x changes over ticks", () => {
   assert.ok(elevator);
   const startX = elevator!.x;
 
-  for (let i = 0; i < 5; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = advanceTicks(m, 5);
 
   const moved = m.G.platforms.find((p) => p.id === 1);
   assert.ok(moved);
@@ -264,13 +312,7 @@ test("unsupported weapon in mid-air keeps falling", () => {
   });
   const yBefore = m.G.pickups[0]!.y;
 
-  for (let i = 0; i < 40; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = advanceTicks(m, 40);
 
   const pickup = m.G.pickups.find((p) => p.id === 103);
   assert.ok(pickup);
@@ -318,13 +360,7 @@ test("spawned weapon falls onto platform over time", () => {
     onPlatformId: plat.id,
   });
 
-  for (let i = 0; i < 20; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = advanceTicks(m, 20);
 
   const pickup = m.G.pickups.find((p) => p.id === 105);
   assert.ok(pickup);
@@ -377,13 +413,7 @@ test("orphaned pickup falls when linked platform is already broken", () => {
     onPlatformId: plat.id,
   });
 
-  for (let i = 0; i < 25; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = advanceTicks(m, 25);
 
   const pickup = m.G.pickups.find((p) => p.id === 106);
   assert.ok(pickup);
@@ -402,13 +432,7 @@ test("player collects weapon pickup on floor", () => {
     y: 480,
   });
 
-  for (let i = 0; i < 8; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = advanceTicks(m, 8);
 
   assert.equal(m.G.pickups.find((p) => p.id === 200), undefined);
   assert.equal(m.G.players["p1"].currentWeapon, "sniper");
@@ -445,10 +469,11 @@ test("player collects weapon after platform break fall with physics body", () =>
     const px = m.G.players["p1"].torso.x;
     const action = Math.abs(px - pickX) < 10 ? null : px < pickX ? "right" : "left";
     m = applyMove(game, m, {
-      type: "move",
+      type: "input",
       playerId: "p1",
-      payload: { action, aimAngle: 0, crouching: false },
+      payload: { action, aimAngle: 0, crouching: false, shooting: false },
     }).state;
+    m = advanceTicks(m, 1);
     if (!m.G.pickups.find((p) => p.id === 201)) break;
   }
 
@@ -473,10 +498,11 @@ test("p2 can move and collect while not currentPlayer in simultaneous mode", () 
 
   for (let i = 0; i < 12; i++) {
     m = applyMove(game, m, {
-      type: "move",
+      type: "input",
       playerId: "p2",
-      payload: { action: null, aimAngle: 0, crouching: false },
+      payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
     }).state;
+    m = advanceTicks(m, 1);
   }
 
   assert.equal(m.G.pickups.find((p) => p.id === 202), undefined);
@@ -494,13 +520,12 @@ test("katana damages nearby opponent during slash", () => {
     payload: { weaponId: "katana" },
   }).state;
 
-  for (let i = 0; i < 85; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: "right", aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: "right", aimAngle: 0, crouching: false, shooting: false },
+  }).state;
+  m = advanceTicks(m, 85);
 
   const p1 = m.G.players["p1"].torso;
   const p2 = m.G.players["p2"].torso;
@@ -508,13 +533,14 @@ test("katana damages nearby opponent during slash", () => {
   const hpBefore = m.G.players["p2"].health;
 
   const r = applyMove(game, m, {
-    type: "shoot",
+    type: "input",
     playerId: "p1",
-    payload: { aimAngle, facing: 1 },
+    payload: { action: null, aimAngle, facing: 1, crouching: false, shooting: true },
   });
   assertMoveOk(r);
 
   m = r.state;
+  m = advanceTicks(m, 1);
   assert.ok(m.G.players["p2"].health < hpBefore);
 });
 
@@ -538,13 +564,12 @@ test("side torso contact at chest height is not a headshot", () => {
 
 test("shooting aimed at head deals 500 damage", () => {
   let m = bootMatch( { players: ["p1", "p2"], seed: "t3" });
-  for (let i = 0; i < 85; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: "right", aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: "right", aimAngle: 0, crouching: false, shooting: false },
+  }).state;
+  m = advanceTicks(m, 85);
 
   const p1 = m.G.players["p1"];
   const p2 = m.G.players["p2"];
@@ -552,18 +577,14 @@ test("shooting aimed at head deals 500 damage", () => {
   const hpBefore = p2.health;
 
   m = applyMove(game, m, {
-    type: "shoot",
+    type: "input",
     playerId: "p1",
-    payload: { aimAngle: aimHead, facing: 1 },
+    payload: { action: null, aimAngle: aimHead, facing: 1, crouching: false, shooting: true },
   }).state;
 
   for (let i = 0; i < 120; i++) {
     const before = m.G.players["p2"].health;
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p2",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
+    m = advanceTicks(m, 1);
     if (m.G.players["p2"].health < before) {
       assert.equal(before - m.G.players["p2"].health, 500);
       return;
@@ -577,12 +598,13 @@ test("FFA awards round win when opponent is eliminated", () => {
   let m = bootMatch( { players: ["p1", "p2"], seed: "round-ffa" });
   testUtils.killPlayer(m.G, "p2");
   const r = applyMove(game, m, {
-    type: "move",
+    type: "input",
     playerId: "p1",
-    payload: { action: null, aimAngle: 0, crouching: false },
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
   });
   assertMoveOk(r);
   m = r.state;
+  m = advanceTicks(m, 1);
   assert.equal(m.G.scores["p1"], 1);
   assert.equal(m.G.roundPhase, "intermission");
   assert.equal(m.G.lastRoundWinner, "p1");
@@ -593,17 +615,19 @@ test("map rotates after intermission", () => {
   assert.equal(m.G.currentMapId, "default");
   testUtils.killPlayer(m.G, "p2");
   m = applyMove(game, m, {
-    type: "move",
+    type: "input",
     playerId: "p1",
-    payload: { action: null, aimAngle: 0, crouching: false },
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
   }).state;
+  m = advanceTicks(m, 1);
 
   while (m.G.roundPhase === "intermission") {
     m = applyMove(game, m, {
-      type: "move",
+      type: "input",
       playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
+      payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
     }).state;
+    m = advanceTicks(m, 1);
   }
 
   assert.equal(m.G.currentMapId, "towers");
@@ -618,19 +642,21 @@ test("match ends after 3 round wins (best of 5)", () => {
   for (let i = 0; i < ROUNDS_TO_WIN; i++) {
     testUtils.killPlayer(m.G, "p2");
     m = applyMove(game, m, {
-      type: "move",
+      type: "input",
       playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
+      payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
     }).state;
+    m = advanceTicks(m, 1);
 
     if (m.ended) break;
 
     while (m.G.roundPhase === "intermission") {
       m = applyMove(game, m, {
-        type: "move",
+        type: "input",
         playerId: "p1",
-        payload: { action: null, aimAngle: 0, crouching: false },
+        payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
       }).state;
+      m = advanceTicks(m, 1);
       if (m.ended) break;
     }
   }
@@ -662,10 +688,11 @@ test("2v2 awards team win when opposing team is eliminated", () => {
   testUtils.killPlayer(m.G, "p3");
   testUtils.killPlayer(m.G, "p4");
   m = applyMove(game, m, {
-    type: "move",
+    type: "input",
     playerId: "p1",
-    payload: { action: null, aimAngle: 0, crouching: false },
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
   }).state;
+  m = advanceTicks(m, 1);
   assert.equal(m.G.scores["0"], 1);
   assert.equal(m.G.lastRoundWinner, "0");
   assert.equal(m.G.roundPhase, "intermission");
@@ -682,13 +709,7 @@ test("resetRound removes old platform physics bodies", () => {
   let m = bootMatch( { players: ["p1", "p2"], seed: "plat-ghost" });
   testUtils.breakPlatform(m.G, m.G.platforms[0].id);
 
-  for (let i = 0; i < 500; i++) {
-    m = applyMove(game, m, {
-      type: "move",
-      playerId: "p1",
-      payload: { action: null, aimAngle: 0, crouching: false },
-    }).state;
-  }
+  m = advanceTicks(m, 500);
 
   const beforeReset = testUtils.platformBodyCount();
   assert.ok(beforeReset > 0);
@@ -704,11 +725,12 @@ test("match starts active without lobby wait", () => {
   const m = createMatch(game, { players: ["p1", "p2"], seed: "lobby" });
   assert.equal(m.G.matchPhase, "active");
 
-  const moved = applyMove(game, m, {
-    type: "move",
+  let moved = applyMove(game, m, {
+    type: "input",
     playerId: "p1",
-    payload: { action: "right", crouching: false },
+    payload: { action: "right", aimAngle: 0, facing: 1, crouching: false, shooting: false },
   });
   assert.ok(moved.ok);
-  assert.notEqual(moved.state.G.players.p1.torso.x, m.G.players.p1.torso.x);
+  const nextState = advanceTicks(moved.state, 1);
+  assert.notEqual(nextState.G.players.p1.torso.x, m.G.players.p1.torso.x);
 });

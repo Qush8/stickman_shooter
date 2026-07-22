@@ -65,6 +65,40 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
       const was = prev?.find((s) => s.id === id);
       return { id, name: "Player " + (i + 1), bot: was ? was.bot : i !== 0 };
     });
+  let tickTimer = null;
+  const startTick = () => {
+    if (tickTimer) clearInterval(tickTimer);
+    if (meta.realtime?.tick && def.tick) {
+      const rate = meta.realtime.tickRate || 30;
+      const ms = 1000 / rate;
+      let tickCount = 0;
+      tickTimer = setInterval(() => {
+        if (!state || state.ended) return;
+        tickCount++;
+        const rng = new Rng(seedFromString(`${SEED}:tick:${tickCount}`));
+        const ctx = {
+          playerId: state.flow.currentPlayer,
+          random: {
+            float: () => rng.next(),
+            int: (min, max) => Math.floor(rng.next() * (max - min + 1)) + min,
+            bool: (p = 0.5) => rng.next() < p,
+            pick: (arr) => arr[Math.floor(rng.next() * arr.length)],
+            shuffle: (arr) => arr.slice().sort(() => rng.next() - 0.5),
+          },
+          events: {
+            endGame: (result) => { state.ended = true; state.result = result; },
+          },
+        };
+        def.tick(state.G, ms, ctx);
+        if (def.endIf) {
+          const res = def.endIf(state.G, state.flow);
+          if (res) { state.ended = true; state.result = res; }
+        }
+        broadcast();
+      }, ms);
+    }
+  };
+
   const newMatch = ({ reseed } = {}) => {
     if (gameMode === "teams2v2") seatCount = 4;
     seatCount = clampSeats(seatCount);
@@ -76,6 +110,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
       config: { mode: gameMode },
     });
     history = [];
+    startTick();
   };
   const actorSet = () => (state.flow.active?.length ? state.flow.active.slice() : [state.flow.currentPlayer]);
 
@@ -158,7 +193,14 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
   // ---- hot reload ----
   let reloadTimer = null;
   const reload = async () => {
-    try { def = await loadDef(); newMatch({}); notice("Reloaded — match restarted.", "reload"); broadcast(); if (auto) scheduleBots(); }
+    try { 
+      if (tickTimer) clearInterval(tickTimer);
+      def = await loadDef(); 
+      newMatch({}); 
+      notice("Reloaded — match restarted.", "reload"); 
+      broadcast(); 
+      if (auto) scheduleBots(); 
+    }
     catch (e) { notice("Reload failed: " + (e?.message ?? e), "error"); }
   };
   try { const w = fsWatch(join(projectDir, "src"), { recursive: true }, () => { clearTimeout(reloadTimer); reloadTimer = setTimeout(reload, 160); }); w.on("error", () => {}); }
