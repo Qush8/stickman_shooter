@@ -7,11 +7,7 @@
     "gameId": "stickman-brawler",
     "displayName": "Stickman Brawler",
     "minPlayers": 2,
-    "maxPlayers": 4,
-    "categories": [
-      "action"
-    ],
-    "board": "custom",
+    "maxPlayers": 2,
     "realtime": {
       "tick": true,
       "tickRate": 30

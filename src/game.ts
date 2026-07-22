@@ -2121,7 +2121,7 @@ export default defineGame<ShooterState>({
     categories: ["action"],
   },
   minPlayers: 2,
-  maxPlayers: 4,
+  maxPlayers: 2,
 
   initialActive: (G) => Object.keys(G.players),
 
