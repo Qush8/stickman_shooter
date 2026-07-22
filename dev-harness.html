@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bordiko sandbox</title>
+<style>
+  :root {
+    --bg: #16141f; --panel: #211d2e; --panel-2: #2a2540; --line: #3a3450;
+    --text: #ece9f5; --muted: #a49dbd; --brand: #7c60f5; --brand-2: #b3a2f7;
+    --teal: #17c0a4; --yellow: #ffc53d; --orange: #ff6a3d; --red: #ff6b6b;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
+  body { display: flex; flex-direction: column; overflow: hidden; }
+
+  .bar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .title { font-weight: 700; font-size: 15px; }
+  .title .badge { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--brand-2); background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; margin-left: 8px; }
+  .grow { margin-left: auto; }
+  .ctl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  button, .btn { font-family: var(--sans); font-weight: 600; font-size: 13px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 6px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--brand); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--brand); border-color: var(--brand); }
+  button.on { background: var(--teal); border-color: var(--teal); color: #06231c; }
+  label.chk { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  input[type=number] { width: 52px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px 7px; font-family: var(--mono); }
+
+  .seats { display: flex; gap: 6px; flex-wrap: wrap; }
+  .seat { display: flex; align-items: center; gap: 7px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 4px 6px 4px 10px; }
+  .seat.me { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand); }
+  .seat .snm { font-weight: 600; cursor: pointer; }
+  .seat .dot { width: 7px; height: 7px; border-radius: 50%; background: transparent; }
+  .seat.act .dot { background: var(--yellow); box-shadow: 0 0 0 3px rgba(255,197,61,.18); }
+  .seat .role { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; color: var(--muted); cursor: pointer; }
+  .seat .role.bot { color: var(--brand-2); border-color: var(--brand); }
+  .seat .role.you { color: var(--teal); border-color: var(--teal); }
+
+  .wrap { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .play { min-width: 0; position: relative; display: flex; flex-direction: column; }
+  .play iframe { flex: 1; width: 100%; border: 0; background: #0e0c16; }
+  .noui { padding: 22px; overflow: auto; }
+  .noui h3 { margin: 0 0 4px; }
+  .noui .hint { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
+  .mv-group { margin-bottom: 16px; }
+  .mv-type { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 7px; }
+  .mv-btns { display: flex; flex-wrap: wrap; gap: 7px; }
+  .mv-btns button { font-family: var(--mono); font-size: 12px; }
+  .waiting { color: var(--muted); padding: 8px 0; }
+  .ended { color: var(--yellow); font-weight: 700; }
+
+  .inspect { display: none !important; }
+  .insp-tabs { display: flex; gap: 2px; padding: 8px 8px 0; }
+  .insp-tab { background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted); padding: 6px 10px; font-weight: 600; }
+  .insp-tab.active { color: var(--text); border-bottom-color: var(--brand); }
+  .insp-body { flex: 1; overflow: auto; padding: 12px 14px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-family: var(--mono); font-size: 12px; margin-bottom: 14px; }
+  .kv .k { color: var(--muted); }
+  pre.json { margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; white-space: pre; color: #d7d2ea; }
+  .log-row { font-family: var(--mono); font-size: 11.5px; padding: 3px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
+  .log-row b { color: var(--brand-2); }
+  .log-empty { color: var(--muted); font-size: 12px; }
+
+  .notice { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); max-width: 90%; padding: 9px 16px; border-radius: 10px; font-size: 13px; font-weight: 600; box-shadow: 0 8px 24px rgba(0,0,0,.4); opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .notice.show { opacity: 1; }
+  .notice.info { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); }
+  .notice.reload { background: #123a30; border: 1px solid var(--teal); color: #bff3e6; }
+  .notice.error { background: #3a1620; border: 1px solid var(--red); color: #ffc9d0; }
+
+  @media (max-width: 820px) {
+    .wrap { grid-template-columns: 1fr; }
+    .inspect { display: none !important; }
+  }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <span class="title" id="title">Bordiko sandbox <span class="badge">dev</span></span>
+    <div class="seats" id="seats"></div>
+    <div class="grow"></div>
+    <div class="ctl">
+      <label class="chk"><input type="checkbox" id="auto"> auto-play bots</label>
+      <button id="step">Step bot</button>
+      <label class="chk">seats <input type="number" id="seatcount" min="2" max="10"></label>
+      <button id="reset">Reset</button>
+      <button id="reseed">New deal</button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <section class="play" id="play"></section>
+    <aside class="inspect">
+      <div class="insp-tabs" id="tabs">
+        <button class="insp-tab active" data-tab="state">State</button>
+        <button class="insp-tab" data-tab="legal">Legal moves</button>
+        <button class="insp-tab" data-tab="log">Log</button>
+      </div>
+      <div class="insp-body" id="inspbody"></div>
+    </aside>
+  </div>
+
+  <div class="notice" id="notice"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let seat = "p1";
+let es = null;
+let last = null;          // last state envelope
+let tab = "state";
+let iframe = null;
+
+function connect(s) {
+  seat = s;
+  if (es) es.close();
+  es = new EventSource("/events?seat=" + encodeURIComponent(s));
+  es.addEventListener("state", (e) => onState(JSON.parse(e.data)));
+  es.addEventListener("notice", (e) => onNotice(JSON.parse(e.data)));
+}
+
+async function action(body) {
+  const r = await fetch("/action?seat=" + encodeURIComponent(seat), {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+async function sendMove(type, payload) {
+  const res = await action({ kind: "move", type, payload });
+  if (!res.ok) onNotice({ kind: "error", msg: res.error || "illegal move" });
+}
+
+/* ------------------------------ render -------------------------------- */
+
+function onState(d) {
+  const first = !last;
+  last = d;
+  $("title").innerHTML = `${d.meta.displayName} <span class="badge">${d.meta.hasUI ? "custom UI" : "dev"}</span>`;
+  renderSeats(d);
+  $("auto").checked = d.auto;
+  const sc = $("seatcount");
+  if (document.activeElement !== sc) { sc.value = d.seats.length; sc.min = d.meta.minPlayers; sc.max = d.meta.maxPlayers; }
+  renderPlay(d, first);
+  renderInspector(d);
+  if (d.meta.hasUI) postToIframe();
+}
+
+function renderSeats(d) {
+  const el = $("seats");
+  el.innerHTML = "";
+  for (const s of d.seats) {
+    const acting = d.actor.includes(s.id);
+    const wrap = document.createElement("div");
+    wrap.className = "seat" + (s.id === seat ? " me" : "") + (acting ? " act" : "");
+    wrap.innerHTML = `<span class="dot"></span><span class="snm">${s.name}</span>` +
+      `<span class="role ${s.bot ? "bot" : "you"}">${s.bot ? "bot" : "you"}</span>`;
+    wrap.querySelector(".snm").onclick = () => connect(s.id);       // sit here
+    wrap.querySelector(".role").onclick = () => action({ kind: "setBot", seat: s.id, bot: !s.bot });
+    el.appendChild(wrap);
+  }
+}
+
+function renderPlay(d, first) {
+  const play = $("play");
+  if (d.meta.hasUI) {
+    if (!iframe) {
+      play.innerHTML = "";
+      iframe = document.createElement("iframe");
+      iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.src = "/ui";
+      play.appendChild(iframe);
+    }
+    return;
+  }
+  iframe = null;
+  // Generic controls: a button per legal move for the seat you're sitting in.
+  let html = `<div class="noui"><h3>${d.seat} — ${nameOf(d, d.seat)}</h3>`;
+  if (d.view.ended) {
+    html += `<p class="ended">Game over — ${resultText(d.view.result)}</p>`;
+  } else if (!d.yourTurn) {
+    const who = d.actor.map((a) => nameOf(d, a)).join(", ");
+    html += `<p class="hint">Not this seat's turn. Waiting on: <b>${who}</b>. Switch seats above, or let bots play.</p>`;
+  } else {
+    html += `<p class="hint">Your turn — pick a move (this is the zero-UI fallback; ship a board schema or ui.html for a real board).</p>`;
+    const groups = {};
+    for (const m of d.legalMoves) (groups[m.type] ||= []).push(m);
+    for (const [type, moves] of Object.entries(groups)) {
+      html += `<div class="mv-group"><div class="mv-type">${type} · ${moves.length}</div><div class="mv-btns">`;
+      moves.forEach((m, i) => {
+        html += `<button data-type="${type}" data-i="${i}">${payloadLabel(m.payload)}</button>`;
+      });
+      html += `</div></div>`;
+    }
+    if (!d.legalMoves.length) html += `<p class="waiting">No legal moves enumerated for this seat.</p>`;
+  }
+  html += `</div>`;
+  play.innerHTML = html;
+  play.querySelectorAll("button[data-type]").forEach((b) => {
+    b.onclick = () => {
+      const type = b.dataset.type;
+      const m = d.legalMoves.filter((x) => x.type === type)[+b.dataset.i];
+      sendMove(type, m.payload);
+    };
+  });
+}
+
+function renderInspector(d) {
+  const body = $("inspbody");
+  if (tab === "state") {
+    body.innerHTML =
+      `<div class="kv">` +
+      row("phase", d.view.phase ?? "—") + row("turn", d.view.turn) +
+      row("current", nameOf(d, d.view.currentPlayer)) +
+      row("active", d.actor.map((a) => nameOf(d, a)).join(", ")) +
+      row("moves", d.view.moveCount) + row("ended", String(d.view.ended)) +
+      (d.view.ended ? row("result", resultText(d.view.result)) : "") +
+      `</div><pre class="json">${escapeHtml(JSON.stringify(d.view.G, null, 2))}</pre>`;
+  } else if (tab === "legal") {
+    body.innerHTML = `<pre class="json">${escapeHtml(JSON.stringify(d.legalMoves, null, 2))}</pre>`;
+  } else {
+    if (!d.history.length) { body.innerHTML = `<p class="log-empty">No moves yet.</p>`; return; }
+    body.innerHTML = d.history.slice().reverse().map((h) =>
+      `<div class="log-row"><b>${h.n}. ${nameOf(d, h.seat)}</b> ${h.type} ${h.payload != null ? escapeHtml(JSON.stringify(h.payload)) : ""}` +
+      (h.events && h.events.length ? ` <span style="opacity:.6">↳ ${h.events.map((e) => e.type).join(", ")}</span>` : "") +
+      `</div>`).join("");
+  }
+}
+
+/* ---------------------------- iframe bridge --------------------------- */
+
+function postToIframe() {
+  if (!iframe || !iframe.contentWindow || !last) return;
+  const v = last.view;
+  iframe.contentWindow.postMessage({
+    t: "bordiko:state",
+    state: {
+      G: v.G, legalMoves: last.legalMoves, yourTurn: last.yourTurn, names: last.names,
+      playOrder: v.playOrder, currentPlayer: v.currentPlayer, ended: v.ended, result: v.result,
+      moveCount: v.moveCount, playerId: last.seat, lang: "en",
+    },
+  }, "*");
+}
+
+window.addEventListener("message", (ev) => {
+  if (!iframe || ev.source !== iframe.contentWindow) return;
+  const m = ev.data || {};
+  if (m.t === "bordiko:ready") postToIframe();
+  else if (m.t === "bordiko:move" && typeof m.type === "string") sendMove(m.type, m.payload);
+  // bordiko:chat / bordiko:emote are ignored in the sandbox
+});
+
+/* ------------------------------ helpers ------------------------------- */
+
+function nameOf(d, id) { return d.names?.[id] ?? id; }
+function row(k, v) { return `<span class="k">${k}</span><span>${escapeHtml(String(v))}</span>`; }
+function resultText(r) {
+  if (!r) return "—";
+  if (r.draw) return "draw" + (r.reason ? " — " + r.reason : "");
+  const w = r.winner ? [r.winner] : r.winners || [];
+  return (w.length ? "winner: " + w.join(", ") : "over") + (r.reason ? " — " + r.reason : "");
+}
+function payloadLabel(p) {
+  if (p == null) return "▶";
+  const s = JSON.stringify(p);
+  return s.length > 40 ? s.slice(0, 39) + "…" : s;
+}
+function escapeHtml(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+let noticeTimer = null;
+function onNotice(n) {
+  const el = $("notice");
+  el.textContent = n.msg;
+  el.className = "notice show " + (n.kind || "info");
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { el.className = "notice " + (n.kind || "info"); }, 2600);
+}
+
+/* ------------------------------ controls ------------------------------ */
+
+$("auto").onchange = (e) => action({ kind: "auto", on: e.target.checked });
+$("step").onclick = () => action({ kind: "step" });
+$("reset").onclick = () => action({ kind: "reset" });
+$("reseed").onclick = () => action({ kind: "reset", reseed: true });
+$("seatcount").onchange = (e) => action({ kind: "seats", count: +e.target.value });
+$("tabs").querySelectorAll(".insp-tab").forEach((b) => {
+  b.onclick = () => {
+    tab = b.dataset.tab;
+    $("tabs").querySelectorAll(".insp-tab").forEach((x) => x.classList.toggle("active", x === b));
+    if (last) renderInspector(last);
+  };
+});
+
+connect(seat);
+</script>
+</body>
+</html>

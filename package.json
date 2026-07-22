@@ -8,19 +8,26 @@
     "displayName": "My Shooter Game",
     "minPlayers": 2,
     "maxPlayers": 4,
-    "categories": ["action"],
+    "categories": [
+      "action"
+    ],
     "board": "custom"
   },
   "scripts": {
-    "dev": "bordiko dev",
+    "build:ui": "esbuild src/ui.js --bundle --outfile=dist/ui.bundle.js && node build-ui.cjs",
+    "dev": "node scripts/dev.mjs",
     "build": "bordiko build",
     "publish:game": "bordiko publish",
     "test": "node --test \"test/*.test.ts\""
   },
   "dependencies": {
-    "@bordiko/sdk": "^0.1.0"
+    "@bordiko/sdk": "^0.1.0",
+    "@pixi/unsafe-eval": "^7.4.3",
+    "pixi.js": "^7.4.3",
+    "planck": "^1.4.2"
   },
   "devDependencies": {
-    "@bordiko/cli": "^0.1.0"
+    "@bordiko/cli": "^0.1.0",
+    "esbuild": "^0.28.1"
   }
 }
