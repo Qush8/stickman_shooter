@@ -42,7 +42,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   auto: {
     damage: 80,
     spread: 0.06,
-    speed: 54,
+    speed: 48,
     maxActive: 6,
     fireRateTicks: 8,
     kind: "bullet",
@@ -66,7 +66,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   bazooka: {
     damage: 350,
     spread: 0.01,
-    speed: 37,
+    speed: 33,
     maxActive: 2,
     fireRateTicks: 45,
     kind: "rocket",
@@ -80,7 +80,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   grenade: {
     damage: 280,
     spread: 0.08,
-    speed: 34,
+    speed: 30,
     maxActive: 2,
     fireRateTicks: 36,
     kind: "grenade",
@@ -94,7 +94,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   winchester: {
     damage: 250,
     spread: 0.02,
-    speed: 60,
+    speed: 54,
     maxActive: 3,
     fireRateTicks: 28,
     kind: "bullet",
@@ -106,7 +106,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   winchester_shotgun: {
     damage: 60,
     spread: 0.22,
-    speed: 46,
+    speed: 41,
     maxActive: 12,
     fireRateTicks: 36,
     pelletCount: 6,
@@ -120,7 +120,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   sniper: {
     damage: 500,
     spread: 0,
-    speed: 84,
+    speed: 75,
     maxActive: 2,
     fireRateTicks: 75,
     kind: "bullet",
@@ -240,7 +240,7 @@ const MOVE_SPEED = 15;
 const JUMP_IMPULSE = 40;
 const GRAVITY = 97.5;
 const WALL_JUMP_IMPULSE_X = 11;
-const BULLET_SPEED = 51;
+const BULLET_SPEED = 40;
 const BULLET_GRAVITY_SCALE = 0.62;
 const AIR_RECOIL_FORCE_MUL = 2.5;
 const AIR_RECOIL_VEL_MUL = 0.45;
