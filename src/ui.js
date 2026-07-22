@@ -1,5 +1,6 @@
 import '@pixi/unsafe-eval';
 import * as PIXI from 'pixi.js';
+import { GUN_PISTOL_B64, GUN_SHOTGUN_B64, GUN_RIFLE_B64 } from './sfx-buffers.js';
 
 const ARENA_W = 912;
 const ARENA_H = 500;
@@ -20,9 +21,9 @@ const STICK = {
   outlineW: 12,
   limbFillW: 11,
   bodyLen: 44,
-  hipSpread: 10,
+  hipSpread: 4,
   footW: 16,
-  footSpread: 11,
+  footSpread: 5,
   armLen: 28,
   stride: 11,
   lift: 6,
@@ -37,6 +38,73 @@ const GUN = {
   gripHalfW: 4,
   tipR: 2.4,
 };
+
+const WEAPON_ORDER = [
+  "auto",
+  "katana",
+  "bazooka",
+  "grenade",
+  "winchester",
+  "winchester_shotgun",
+  "sniper",
+];
+
+const WEAPON_LABELS = {
+  auto: "ავტომატი",
+  katana: "სამურაის ხმალი",
+  bazooka: "ბაზუკა",
+  grenade: "ლიმონკა",
+  winchester: "ვინჩესტერი",
+  winchester_shotgun: "ვინჩესტერი საფანტი",
+  sniper: "სნაიპერი",
+};
+
+const WEAPON_BARREL = {
+  auto: 36,
+  katana: 42,
+  bazooka: 52,
+  grenade: 14,
+  winchester: 30,
+  winchester_shotgun: 24,
+  sniper: 48,
+};
+
+const WEAPON_MUZZLE = {
+  auto: 0.45,
+  katana: 0.15,
+  bazooka: 0.9,
+  grenade: 0.45,
+  winchester: 0.45,
+  winchester_shotgun: 0.65,
+  sniper: 0.55,
+};
+
+const WEAPON_RECOIL_SHAKE = {
+  auto: 0.6,
+  katana: 0.3,
+  bazooka: 4,
+  grenade: 0.9,
+  winchester: 0.75,
+  winchester_shotgun: 1.5,
+  sniper: 2,
+};
+
+const WEAPON_VISUAL_RECOIL = {
+  auto: { arm: 6, torso: 2, aim: 0.035 },
+  katana: { arm: 4, torso: 2, aim: 0.02 },
+  bazooka: { arm: 28, torso: 14, aim: 0.08 },
+  grenade: { arm: 10, torso: 4, aim: 0.04 },
+  winchester: { arm: 8, torso: 3, aim: 0.05 },
+  winchester_shotgun: { arm: 16, torso: 7, aim: 0.065 },
+  sniper: { arm: 18, torso: 8, aim: 0.07 },
+};
+
+const KATANA_SWING_MS = 200;
+const KATANA_EQUIP_MS = 300;
+
+let recoilShake = 0;
+let recoilShakeX = 0;
+let recoilShakeY = 0;
 
 const SHOOT_FACE_MS = 2000;
 const CORPSE_FALL_MS = 260;
@@ -84,13 +152,17 @@ gameContainer.addChild(floorGraphics);
 
 // Containers
 const platformsContainer = new PIXI.Container();
+const pickupsContainer = new PIXI.Container();
 const bulletsContainer = new PIXI.Container();
 const particlesContainer = new PIXI.Container();
 const playersContainer = new PIXI.Container();
+const laserContainer = new PIXI.Container();
 
 gameContainer.addChild(platformsContainer);
+gameContainer.addChild(pickupsContainer);
 gameContainer.addChild(playersContainer);
 gameContainer.addChild(bulletsContainer);
+gameContainer.addChild(laserContainer);
 gameContainer.addChild(particlesContainer);
 
 // Platforms drawn each frame from game state (HP fill + border)
@@ -128,20 +200,21 @@ const drawPlatforms = (platforms) => {
         const innerW = Math.max(0, plat.w - inset * 2);
         const innerH = Math.max(1, plat.h - inset * 2);
         const fillW = innerW * hpRatio;
+        const isElevator = plat.kind === "elevator";
 
-        g.beginFill(0x24384f, 0.95);
+        g.beginFill(isElevator ? 0x1a3355 : 0x24384f, 0.95);
         g.drawRect(plat.x, plat.y, plat.w, plat.h);
         g.endFill();
 
         const hpColor =
-            hpRatio > 0.55 ? 0x3ecf6e : hpRatio > 0.28 ? 0xe6b422 : 0xe04545;
+            hpRatio > 0.55 ? (isElevator ? 0x44aaff : 0x3ecf6e) : hpRatio > 0.28 ? 0xe6b422 : 0xe04545;
         if (fillW > 0) {
             g.beginFill(hpColor, 1);
             g.drawRect(plat.x + inset, plat.y + inset, fillW, innerH);
             g.endFill();
         }
 
-        g.lineStyle(2, 0xf0f6ff, 1, 0.5, true);
+        g.lineStyle(2, isElevator ? 0x88ccff : 0xf0f6ff, 1, 0.5, true);
         g.drawRect(plat.x, plat.y, plat.w, plat.h);
 
         platformsContainer.addChild(g);
@@ -149,6 +222,264 @@ const drawPlatforms = (platforms) => {
 };
 
 drawPlatforms(getPlatformsForRender(null));
+
+const localPickupMeta = {};
+const FLOOR_PICKUP_Y = 480;
+const PICKUP_FALL_PX_SEC = 420;
+
+const pickupSupportedAt = (x, y, platforms) => {
+    if (y >= FLOOR_PICKUP_Y - 1) return true;
+    for (const plat of platforms) {
+        if (plat.broken) continue;
+        if (x < plat.x - 12 || x > plat.x + plat.w + 12) continue;
+        const surfaceY = plat.y - 20;
+        if (y >= surfaceY - 1 && y <= surfaceY + 4) return true;
+    }
+    return false;
+};
+
+const pickupFallGoal = (pickup, platforms) => {
+    if (pickup.fallToFloor) return FLOOR_PICKUP_Y;
+    if (pickup.targetY != null) return pickup.targetY;
+    let bestPlatY = 500;
+    for (const plat of platforms) {
+        if (plat.broken) continue;
+        if (pickup.x < plat.x - 12 || pickup.x > plat.x + plat.w + 12) continue;
+        const surfaceY = plat.y - 20;
+        if (surfaceY <= pickup.y + 0.5) continue;
+        if (plat.y < bestPlatY) bestPlatY = plat.y;
+    }
+    return bestPlatY - 20;
+};
+
+const WEAPON_PICKUP_COLORS = {
+  auto: { glow: 0x88aaff, accent: 0x5566cc, core: 0x334466 },
+  katana: { glow: 0xaaddff, accent: 0x66aacc, core: 0xddeeff },
+  bazooka: { glow: 0x88cc66, accent: 0x446633, core: 0x3d5c32 },
+  grenade: { glow: 0xaacc44, accent: 0x556b2f, core: 0x778844 },
+  winchester: { glow: 0xffcc66, accent: 0x886644, core: 0x555555 },
+  winchester_shotgun: { glow: 0xffaa55, accent: 0x5a4028, core: 0x6b4a2a },
+  sniper: { glow: 0xccccff, accent: 0x444466, core: 0x333344 },
+};
+
+const drawWeaponPickupIcon = (g, weaponId, cx, cy, s = 1) => {
+    const cols = WEAPON_PICKUP_COLORS[weaponId] ?? WEAPON_PICKUP_COLORS.winchester;
+    const outline = 0x111111;
+    g.lineStyle(1.4, outline, 0.85);
+
+    switch (weaponId) {
+        case "auto":
+            g.beginFill(cols.core);
+            g.drawRoundedRect(cx - 15 * s, cy - 3.5 * s, 22 * s, 7 * s, 1.5 * s);
+            g.endFill();
+            g.beginFill(cols.accent);
+            g.drawRect(cx + 4 * s, cy - 2 * s, 10 * s, 4 * s);
+            g.endFill();
+            g.beginFill(0x1a1a1a);
+            g.drawRoundedRect(cx - 3 * s, cy + 2 * s, 6 * s, 8 * s, 1 * s);
+            g.endFill();
+            g.beginFill(0xff4422, 0.9);
+            g.drawCircle(cx + 12 * s, cy, 1.8 * s);
+            g.endFill();
+            break;
+        case "katana":
+            g.beginFill(cols.core);
+            g.drawPolygon([
+                cx - 12 * s, cy - 1 * s,
+                cx + 14 * s, cy - 2 * s,
+                cx + 16 * s, cy,
+                cx + 14 * s, cy + 2 * s,
+                cx - 12 * s, cy + 1 * s,
+            ]);
+            g.endFill();
+            g.beginFill(0x3a2818);
+            g.drawRoundedRect(cx - 17 * s, cy - 3 * s, 7 * s, 6 * s, 1 * s);
+            g.endFill();
+            g.lineStyle(1.5, 0xffffff, 0.5);
+            g.moveTo(cx - 8 * s, cy - 0.5 * s);
+            g.lineTo(cx + 12 * s, cy - 1.5 * s);
+            break;
+        case "bazooka":
+            g.beginFill(cols.core);
+            g.drawRoundedRect(cx - 16 * s, cy - 5.5 * s, 26 * s, 11 * s, 2 * s);
+            g.endFill();
+            g.beginFill(cols.accent);
+            g.drawRoundedRect(cx - 20 * s, cy - 6.5 * s, 7 * s, 13 * s, 1.5 * s);
+            g.endFill();
+            g.beginFill(0x111111);
+            g.drawCircle(cx + 12 * s, cy, 3.5 * s);
+            g.endFill();
+            g.beginFill(0xff6622, 0.85);
+            g.drawCircle(cx + 12 * s, cy, 2 * s);
+            g.endFill();
+            break;
+        case "grenade":
+            g.beginFill(cols.core);
+            g.drawCircle(cx, cy + 1 * s, 7 * s);
+            g.endFill();
+            g.beginFill(cols.accent, 0.7);
+            g.drawCircle(cx - 2 * s, cy - 1 * s, 2.5 * s);
+            g.endFill();
+            g.lineStyle(2, 0xcccc66, 1);
+            g.moveTo(cx, cy - 6 * s);
+            g.lineTo(cx - 2 * s, cy - 11 * s);
+            g.lineTo(cx + 2 * s, cy - 11 * s);
+            g.lineTo(cx, cy - 6 * s);
+            break;
+        case "winchester_shotgun":
+            g.beginFill(cols.core);
+            g.drawRoundedRect(cx - 14 * s, cy - 4.5 * s, 18 * s, 9 * s, 1.5 * s);
+            g.endFill();
+            g.beginFill(cols.accent);
+            g.drawRect(cx - 16 * s, cy - 2 * s, 6 * s, 5 * s);
+            g.endFill();
+            g.lineStyle(2.5, 0x2a2018, 0.9);
+            g.moveTo(cx - 5 * s, cy - 4.5 * s);
+            g.lineTo(cx + 5 * s, cy - 4.5 * s);
+            break;
+        case "sniper":
+            g.beginFill(cols.core);
+            g.drawRoundedRect(cx - 16 * s, cy - 2.5 * s, 28 * s, 5 * s, 1 * s);
+            g.endFill();
+            g.beginFill(0x111111);
+            g.drawRoundedRect(cx - 4 * s, cy - 6.5 * s, 9 * s, 4 * s, 1 * s);
+            g.endFill();
+            g.beginFill(cols.accent, 0.8);
+            g.drawRect(cx + 8 * s, cy - 1.5 * s, 8 * s, 3 * s);
+            g.endFill();
+            break;
+        default:
+            g.beginFill(cols.core);
+            g.drawRoundedRect(cx - 13 * s, cy - 3.5 * s, 20 * s, 7 * s, 1.5 * s);
+            g.endFill();
+            g.beginFill(cols.accent);
+            g.drawRect(cx - 4 * s, cy + 2 * s, 5 * s, 7 * s);
+            g.endFill();
+            g.lineStyle(2, cols.glow, 0.7);
+            g.moveTo(cx - 2 * s, cy + 2 * s);
+            g.lineTo(cx + 1 * s, cy + 9 * s);
+            break;
+    }
+};
+
+const drawWeaponDropBadge = (g, pickup, drawX, drawY) => {
+    const wId = pickup.weaponId || "winchester";
+    const cols = WEAPON_PICKUP_COLORS[wId] ?? WEAPON_PICKUP_COLORS.winchester;
+    const pulse = 0.85 + Math.sin(Date.now() / 320 + pickup.id) * 0.15;
+
+    g.beginFill(0x000000, 0.22);
+    g.drawEllipse(drawX, drawY + 18, 14, 4);
+    g.endFill();
+
+    g.lineStyle(3, cols.glow, 0.35 * pulse);
+    g.drawCircle(drawX, drawY, 20 * pulse);
+    g.lineStyle(2, 0xffe566, 0.55 * pulse);
+    g.drawCircle(drawX, drawY, 16);
+
+    g.beginFill(0x1a1a2e, 0.85);
+    g.drawCircle(drawX, drawY, 13);
+    g.endFill();
+    g.beginFill(cols.glow, 0.18);
+    g.drawCircle(drawX, drawY - 2, 11);
+    g.endFill();
+
+    drawWeaponPickupIcon(g, wId, drawX, drawY, 0.95);
+
+    const sparkT = Date.now() / 400 + pickup.id;
+    g.beginFill(0xffffff, 0.7);
+    g.drawCircle(
+        drawX + Math.cos(sparkT) * 14,
+        drawY + Math.sin(sparkT * 1.3) * 14 - 4,
+        1.5,
+    );
+    g.endFill();
+};
+
+const drawPickups = (pickups, platforms) => {
+    pickupsContainer.removeChildren();
+    if (!pickups?.length) return;
+
+    const plats = platforms?.length ? platforms : STATIC_PLATFORMS;
+    const liveIds = new Set(pickups.map((p) => p.id));
+    for (const id of Object.keys(localPickupMeta)) {
+        if (!liveIds.has(Number(id))) delete localPickupMeta[id];
+    }
+
+    const dtSec = Math.min(0.05, (app.ticker.deltaMS || 16) / 1000);
+
+    for (const pickup of pickups) {
+        if (!localPickupMeta[pickup.id]) {
+            localPickupMeta[pickup.id] = {
+                spawnedAt: Date.now(),
+                wasFalling: false,
+                simY: pickup.y,
+                lastServerY: pickup.y,
+            };
+        }
+
+        const meta = localPickupMeta[pickup.id];
+        const onFloor = pickup.y >= FLOOR_PICKUP_Y - 1;
+        const onPlatform = !onFloor && pickupSupportedAt(pickup.x, pickup.y, plats);
+
+        const goal = pickupFallGoal(pickup, plats);
+        const serverLead = 20;
+
+        if (onFloor || onPlatform) {
+            meta.simY = pickup.y;
+            meta.settled = true;
+            meta.lastServerY = pickup.y;
+        } else {
+            meta.settled = false;
+            if (Math.abs(pickup.y - meta.lastServerY) > 3) {
+                meta.simY = pickup.y;
+            }
+            meta.lastServerY = pickup.y;
+
+            const maxSimY = Math.min(goal, pickup.y + serverLead);
+            meta.simY = Math.max(pickup.y, Math.min(maxSimY, meta.simY));
+            if (meta.simY < maxSimY - 0.5) {
+                meta.simY = Math.min(maxSimY, meta.simY + PICKUP_FALL_PX_SEC * dtSec);
+            }
+        }
+
+        const falling = !meta.settled && meta.simY < pickupFallGoal(pickup, plats) - 0.5;
+        const landed = meta.wasFalling && !falling;
+        if (landed && !meta.landFx) {
+            meta.landFx = true;
+            createSparkHit(pickup.x, meta.simY, 0.5);
+            if (pickup.kind === "weapon") Sfx.playPickupLand();
+        }
+        meta.wasFalling = falling;
+
+        const bob = falling || onFloor ? 0 : Math.sin(Date.now() / 280 + pickup.id) * 1.5;
+        const drawY = meta.simY + bob;
+        const g = new PIXI.Graphics();
+
+        if (pickup.kind === "health") {
+            const pulse = 0.9 + Math.sin(Date.now() / 350 + pickup.id) * 0.1;
+            g.beginFill(0x000000, 0.18);
+            g.drawEllipse(pickup.x, drawY + 16, 10, 3);
+            g.endFill();
+            g.lineStyle(2, 0x66ff99, 0.5 * pulse);
+            g.drawCircle(pickup.x, drawY, 14 * pulse);
+            g.beginFill(0x22cc55, 0.95);
+            g.drawCircle(pickup.x, drawY, 11);
+            g.endFill();
+            g.beginFill(0x44ff88, 0.45);
+            g.drawCircle(pickup.x - 3, drawY - 3, 4);
+            g.endFill();
+            g.lineStyle(2.5, 0xffffff, 0.95);
+            g.moveTo(pickup.x - 5, drawY);
+            g.lineTo(pickup.x + 5, drawY);
+            g.moveTo(pickup.x, drawY - 5);
+            g.lineTo(pickup.x, drawY + 5);
+        } else {
+            drawWeaponDropBadge(g, pickup, pickup.x, drawY);
+        }
+
+        pickupsContainer.addChild(g);
+    }
+};
 
 // Fit arena inside #game-container (responsive in Bordiko iframe)
 const getContainerRect = () => gameContainerEl.getBoundingClientRect();
@@ -200,6 +531,258 @@ const fitUntilStable = () => {
 };
 fitUntilStable();
 
+// --- Procedural SFX (Web Audio API, no external files) ---
+const Sfx = (() => {
+    let ctx = null;
+    let master = null;
+    let lastFootstepAt = 0;
+    let gunSamples = null;
+    let gunSamplesLoading = null;
+
+    const ensure = () => {
+        if (!ctx) {
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) return null;
+            ctx = new AC();
+            master = ctx.createGain();
+            master.gain.value = 0.42;
+            master.connect(ctx.destination);
+        }
+        if (ctx.state === "suspended") ctx.resume();
+        return ctx;
+    };
+
+    const init = () => {
+        ensure();
+        loadGunSamples();
+    };
+
+    const decodeB64Wav = (b64) => {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes.buffer;
+    };
+
+    const loadGunSamples = () => {
+        const ac = ensure();
+        if (!ac) return Promise.resolve(null);
+        if (gunSamples) return Promise.resolve(gunSamples);
+        if (gunSamplesLoading) return gunSamplesLoading;
+        gunSamplesLoading = Promise.all([
+            ac.decodeAudioData(decodeB64Wav(GUN_PISTOL_B64)),
+            ac.decodeAudioData(decodeB64Wav(GUN_SHOTGUN_B64)),
+            ac.decodeAudioData(decodeB64Wav(GUN_RIFLE_B64)),
+        ])
+            .then(([pistol, shotgun, rifle]) => {
+                gunSamples = { pistol, shotgun, rifle };
+                return gunSamples;
+            })
+            .catch(() => null);
+        return gunSamplesLoading;
+    };
+
+    const playSample = (buffer, { rate = 1, vol = 0.7 } = {}) => {
+        const ac = ensure();
+        if (!ac || !buffer) return;
+        const t = ac.currentTime;
+        const src = ac.createBufferSource();
+        src.buffer = buffer;
+        src.playbackRate.value = rate;
+        const g = ac.createGain();
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + buffer.duration / Math.max(rate, 0.01) + 0.02);
+        src.connect(g);
+        g.connect(master);
+        src.start(t);
+    };
+
+    const tone = (freq, type, dur, vol, freqEnd = null) => {
+        const ac = ensure();
+        if (!ac) return;
+        const t = ac.currentTime;
+        const osc = ac.createOscillator();
+        const g = ac.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, t);
+        if (freqEnd != null) osc.frequency.exponentialRampToValueAtTime(Math.max(20, freqEnd), t + dur);
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        osc.connect(g);
+        g.connect(master);
+        osc.start(t);
+        osc.stop(t + dur + 0.02);
+    };
+
+    const noise = (dur, vol, filterFreq = 800) => {
+        const ac = ensure();
+        if (!ac) return;
+        const t = ac.currentTime;
+        const bufferSize = Math.floor(ac.sampleRate * dur);
+        const buffer = ac.createBuffer(1, bufferSize, ac.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+        const src = ac.createBufferSource();
+        src.buffer = buffer;
+        const filter = ac.createBiquadFilter();
+        filter.type = "bandpass";
+        filter.frequency.value = filterFreq;
+        filter.Q.value = 0.6;
+        const g = ac.createGain();
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        src.connect(filter);
+        filter.connect(g);
+        g.connect(master);
+        src.start(t);
+        src.stop(t + dur + 0.02);
+    };
+
+    const playGunshotFallback = ({
+        duration = 0.24,
+        crackDecay = 0.045,
+        tailDecay = 0.11,
+        thumpHz = 62,
+        thumpVol = 0.55,
+        crackVol = 0.95,
+        tailVol = 0.28,
+        vol = 0.52,
+        highpass = 420,
+        lowpass = 5200,
+    } = {}) => {
+        const ac = ensure();
+        if (!ac) return;
+        const t = ac.currentTime;
+        const sr = ac.sampleRate;
+        const len = Math.floor(sr * duration);
+        const buffer = ac.createBuffer(1, len, sr);
+        const data = buffer.getChannelData(0);
+
+        for (let i = 0; i < len; i++) {
+            const sec = i / sr;
+            const click = sec < 0.004 ? 1.35 : 0;
+            const crackEnv = Math.exp(-sec / crackDecay);
+            const tailEnv = Math.exp(-sec / tailDecay);
+            const thumpEnv = Math.exp(-sec / 0.038);
+            const n = Math.random() * 2 - 1;
+            const thump = Math.sin(2 * Math.PI * thumpHz * sec * (1 - sec * 1.8)) * thumpEnv;
+            data[i] =
+                vol *
+                (click * 0.9 +
+                    n * crackVol * crackEnv +
+                    thump * thumpVol +
+                    n * tailVol * tailEnv);
+        }
+
+        const src = ac.createBufferSource();
+        src.buffer = buffer;
+        const hp = ac.createBiquadFilter();
+        hp.type = "highpass";
+        hp.frequency.value = highpass;
+        const lp = ac.createBiquadFilter();
+        lp.type = "lowpass";
+        lp.frequency.value = lowpass;
+        lp.Q.value = 0.65;
+        const g = ac.createGain();
+        g.gain.setValueAtTime(1, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + duration + 0.04);
+        src.connect(hp);
+        hp.connect(lp);
+        lp.connect(g);
+        g.connect(master);
+        src.start(t);
+        src.stop(t + duration + 0.05);
+    };
+
+    const playShoot = (weaponId = "winchester") => {
+        if (weaponId === "katana") {
+            noise(0.07, 0.12, 2400);
+            tone(520, "sine", 0.08, 0.1, 820);
+            return;
+        }
+
+        loadGunSamples().then((samples) => {
+            if (!samples) {
+                playGunshotFallback({ vol: 0.5 });
+                return;
+            }
+
+            switch (weaponId) {
+                case "auto":
+                    playSample(samples.pistol, { rate: 1.12, vol: 0.58 });
+                    break;
+                case "bazooka":
+                    playSample(samples.shotgun, { rate: 0.52, vol: 0.82 });
+                    playGunshotFallback({
+                        duration: 0.35,
+                        crackDecay: 0.08,
+                        tailDecay: 0.22,
+                        thumpHz: 36,
+                        thumpVol: 0.9,
+                        crackVol: 0.5,
+                        tailVol: 0.45,
+                        vol: 0.35,
+                        highpass: 90,
+                        lowpass: 1800,
+                    });
+                    break;
+                case "grenade":
+                    playSample(samples.pistol, { rate: 0.95, vol: 0.28 });
+                    break;
+                case "winchester_shotgun":
+                    playSample(samples.shotgun, { rate: 1, vol: 0.78 });
+                    break;
+                case "sniper":
+                    playSample(samples.rifle, { rate: 1, vol: 0.74 });
+                    break;
+                default:
+                    playSample(samples.pistol, { rate: 1, vol: 0.68 });
+                    break;
+            }
+        });
+    };
+
+    const playBulletHit = (isPlayer = false) => {
+        if (isPlayer) {
+            noise(0.05, 0.18, 400);
+            tone(220, "sine", 0.08, 0.14, 120);
+        } else {
+            noise(0.04, 0.14, 1800);
+            tone(890, "triangle", 0.03, 0.09, 420);
+        }
+    };
+
+    const playDeath = () => {
+        tone(180, "sawtooth", 0.25, 0.22, 55);
+        tone(120, "sine", 0.4, 0.2, 40);
+        noise(0.15, 0.12, 300);
+    };
+
+    const playFootstep = () => {
+        const now = Date.now();
+        if (now - lastFootstepAt < 220) return;
+        lastFootstepAt = now;
+        noise(0.03, 0.07, 350);
+        tone(90 + Math.random() * 30, "sine", 0.025, 0.05, 60);
+    };
+
+    const playJump = () => {
+        noise(0.035, 0.1, 500);
+        tone(140, "sine", 0.07, 0.12, 320);
+        tone(220, "triangle", 0.05, 0.06, 380);
+    };
+
+    const playPickupLand = () => {
+        tone(660, "sine", 0.06, 0.08, 880);
+        tone(440, "triangle", 0.08, 0.06, 550);
+    };
+
+    return { init, playShoot, playBulletHit, playDeath, playFootstep, playJump, playPickupLand };
+})();
+
+document.addEventListener("pointerdown", () => Sfx.init(), { once: true });
+window.addEventListener("keydown", () => Sfx.init(), { once: true });
+
 // State
 let latestState = null;
 let localPlayers = {};
@@ -212,6 +795,9 @@ const activeKeys = new Set();
 let mouseX = 0;
 let mouseY = 0;
 let jumpQueued = false;
+let pointerHeld = false;
+let lastShootSent = 0;
+const AUTO_FIRE_MS = 125;
 
 const isJumpKey = (code) =>
   code === "Space" || code === "KeyW" || code === "ArrowUp";
@@ -227,21 +813,69 @@ window.addEventListener("mousemove", (e) => {
 
 document.addEventListener("pointerdown", (e) => {
     if (!latestState) return;
-    const me = localPlayers[latestState.playerId];
-    if (me && me.health > 0) {
-        const gun = getGunPose(me);
-        me.aimAngle = Math.atan2(mouseY - gun.neckTop, mouseX - me.displayTorso.x);
-        markShootFace(me);
-        window.parent.postMessage({ 
-            t: "bordiko:move", 
-            type: "shoot", 
-            payload: { 
-                aimAngle: me.aimAngle || 0,
-                facing: me.facing || 1,
-            } 
-        }, "*");
-    }
+    pointerHeld = true;
+    tryShoot();
 });
+
+document.addEventListener("pointerup", () => {
+    pointerHeld = false;
+});
+
+const tryShoot = () => {
+    if (!latestState) return;
+    const me = localPlayers[latestState.playerId];
+    if (!me || me.health <= 0) return;
+
+    const gun = getGunPose(me);
+    me.aimAngle = Math.atan2(mouseY - gun.neckTop, mouseX - me.displayTorso.x);
+    markShootFace(me);
+    window.parent.postMessage({
+        t: "bordiko:move",
+        type: "shoot",
+        payload: {
+            aimAngle: me.aimAngle || 0,
+            facing: me.facing || 1,
+        },
+    }, "*");
+    lastShootSent = Date.now();
+    if (me && me.currentWeapon) {
+        if (me.currentWeapon === "katana") {
+            startKatanaSwing(me);
+            Sfx.playShoot("katana");
+            triggerRecoilShake("katana");
+        } else {
+            triggerWeaponRecoil(me, me.currentWeapon);
+        }
+    }
+};
+
+const sendSwitchWeapon = (weaponId) => {
+    const me = latestState ? localPlayers[latestState.playerId] : null;
+    const owned = me?.ownedWeapons ?? ["winchester"];
+    if (!owned.includes(weaponId)) return;
+    window.parent.postMessage({
+        t: "bordiko:move",
+        type: "switchWeapon",
+        payload: { weaponId },
+    }, "*");
+};
+
+const sendCycleWeapon = () => {
+    const me = latestState ? localPlayers[latestState.playerId] : null;
+    const owned = me?.ownedWeapons ?? ["winchester"];
+    if (owned.length <= 1) return;
+    window.parent.postMessage({
+        t: "bordiko:move",
+        type: "switchWeapon",
+        payload: { cycle: true },
+    }, "*");
+};
+
+const getOrderedOwnedWeapons = (playerId) => {
+    const owned = latestState?.G?.players?.[playerId]?.ownedWeapons;
+    const list = owned?.length ? owned : ["winchester"];
+    return WEAPON_ORDER.filter((id) => list.includes(id));
+};
 
 window.addEventListener("keydown", (e) => {
     activeKeys.add(e.code);
@@ -251,6 +885,7 @@ window.addEventListener("keydown", (e) => {
         if (latestState) {
             const me = localPlayers[latestState.playerId];
             if (me && me.health > 0) {
+                Sfx.playJump();
                 window.parent.postMessage({
                     t: "bordiko:move",
                     type: "move",
@@ -267,6 +902,24 @@ window.addEventListener("keydown", (e) => {
     if (e.code === "Space" || e.code === "KeyW" || e.code === "KeyS") {
         e.preventDefault();
     }
+
+    const digitIdx = {
+        Digit1: 0,
+        Digit2: 1,
+        Digit3: 2,
+        Digit4: 3,
+        Digit5: 4,
+        Digit6: 5,
+        Digit7: 6,
+    };
+    if (digitIdx[e.code] != null && !e.repeat && latestState) {
+        const owned = getOrderedOwnedWeapons(latestState.playerId);
+        const weaponId = owned[digitIdx[e.code]];
+        if (weaponId) sendSwitchWeapon(weaponId);
+    }
+    if (e.code === "KeyQ" && !e.repeat) {
+        sendCycleWeapon();
+    }
 });
 
 window.addEventListener("keyup", (e) => {
@@ -278,6 +931,8 @@ function isKeyPressed(...k) {
     return k.some(key => activeKeys.has(key));
 }
 
+let prevPickupIds = new Set();
+
 // Network Sync
 window.addEventListener("message", (event) => {
     const msg = event.data;
@@ -287,6 +942,11 @@ window.addEventListener("message", (event) => {
         const G = latestState.G;
 
         drawPlatforms(getPlatformsForRender(G));
+        drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
+
+        const curPickupIds = new Set((G?.pickups ?? []).map((p) => p.id));
+        const pickupCollected = [...prevPickupIds].some((id) => !curPickupIds.has(id));
+        prevPickupIds = curPickupIds;
 
         if (G && G.players) {
             const liveIds = new Set(Object.keys(G.players));
@@ -309,14 +969,22 @@ window.addEventListener("message", (event) => {
                         walking: false,
                         airborne: false,
                         crouching: !!p.crouching,
+                        currentWeapon: p.currentWeapon || "winchester",
+                        ownedWeapons: p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"],
                         faceExpr: "serious",
                         faceTimer: 0,
                         moodSeed: moodSeedFromId(id),
+                        weaponRecoil: { arm: 0, torso: 0, aimKick: 0 },
+                        katanaSwing: 0,
+                        katanaEquip: 1,
+                        lastFireTick: p.lastFireTick ?? 0,
                     };
                 } else {
                     const lp = localPlayers[id];
                     const prevX = lp.torso?.x ?? p.torso.x;
                     const prevY = lp.torso?.y ?? p.torso.y;
+                    const prevWeapon = lp.currentWeapon;
+                    const prevFireTick = lp.lastFireTick ?? 0;
 
                     if (p.health < lp.prevHealth) {
                         lp.faceExpr = "hurt";
@@ -324,6 +992,7 @@ window.addEventListener("message", (event) => {
                     }
                     if (p.health <= 0 && lp.prevHealth > 0) {
                         startDeathCorpse(lp);
+                        Sfx.playDeath();
                     }
                     if (p.health > 0) {
                         lp.deathCorpse = null;
@@ -334,8 +1003,21 @@ window.addEventListener("message", (event) => {
                     lp.vy = p.torso.y - prevY;
                     lp.health = p.health;
                     lp.crouching = !!p.crouching;
+                    lp.currentWeapon = p.currentWeapon || "winchester";
+                    lp.ownedWeapons = p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"];
                     lp.torso = p.torso;
                     lp.head = p.head;
+                    lp.lastFireTick = p.lastFireTick ?? 0;
+
+                    if (p.currentWeapon === "katana" && prevWeapon !== "katana" && pickupCollected) {
+                        startKatanaEquip(lp);
+                    }
+                    if (p.currentWeapon === "katana" && lp.lastFireTick > prevFireTick) {
+                        if (id !== latestState.playerId) {
+                            startKatanaSwing(lp);
+                        }
+                    }
+
                     if (id !== latestState.playerId) {
                         lp.aimAngle = p.aimAngle;
                     }
@@ -347,7 +1029,7 @@ window.addEventListener("message", (event) => {
             for (const plat of G.platforms) {
                 const wasBroken = prevPlatformBroken[plat.id];
                 if (wasBroken === false && plat.broken) {
-                    createSparkHit(plat.x + plat.w / 2, plat.y + plat.h / 2);
+                    createSparkHit(plat.x + plat.w / 2, plat.y + plat.h / 2, 0.35);
                 }
                 prevPlatformBroken[plat.id] = plat.broken;
             }
@@ -357,8 +1039,10 @@ window.addEventListener("message", (event) => {
             for (const hit of G.hitEvents) {
                 if (hit.damage > 0) {
                     createPlayerHitEffect(hit.x, hit.y);
-                } else {
-                    createSparkHit(hit.x, hit.y);
+                    Sfx.playBulletHit(true);
+                } else if (!pickupCollected) {
+                    createWallHit(hit.x, hit.y);
+                    Sfx.playBulletHit(false);
                 }
             }
         }
@@ -369,20 +1053,38 @@ window.addEventListener("message", (event) => {
             const serverBulletIds = new Set(G.bullets.map(b => b.id));
             for (const [id, lb] of localBullets.entries()) {
                 if (!serverBulletIds.has(id)) {
-                    if (!hadHitEvents && lb.body) createSparkHit(lb.body.x, lb.body.y);
+                    if (!hadHitEvents && lb.body) {
+                        let dx = 0;
+                        let dy = -1;
+                        if (lb.prevBody) {
+                            dx = lb.body.x - lb.prevBody.x;
+                            dy = lb.body.y - lb.prevBody.y;
+                        }
+                        createWallHit(lb.body.x, lb.body.y, -dx, -dy);
+                        Sfx.playBulletHit(false);
+                    }
                     localBullets.delete(id);
                 }
             }
             for (const b of G.bullets) {
                 if (!localBullets.has(b.id)) {
                     localBullets.set(b.id, { ...b, prevBody: { ...b.body } });
-                    createMuzzleFlash(b.body.x, b.body.y);
+                    const wId = b.weaponId || localPlayers[b.owner]?.currentWeapon || "winchester";
+                    createMuzzleFlash(b.body.x, b.body.y, wId);
+                    Sfx.playShoot(wId);
                     const shooter = localPlayers[b.owner];
-                    if (shooter) markShootFace(shooter);
+                    if (shooter) {
+                        markShootFace(shooter);
+                        triggerWeaponRecoil(shooter, wId);
+                        if (b.owner === latestState?.playerId) {
+                            triggerRecoilShake(wId);
+                        }
+                    }
                 } else {
                     const lb = localBullets.get(b.id);
                     lb.prevBody = lb.body ? { ...lb.body } : null;
                     lb.body = b.body;
+                    lb.kind = b.kind;
                 }
             }
         }
@@ -392,13 +1094,13 @@ window.addEventListener("message", (event) => {
 window.parent.postMessage({ t: "bordiko:ready" }, "*");
 
 // Particles & hit effects
-function spawnParticle(x, y, vx, vy, color, size, lifeDecay, gravityMul = 0.5, isBlood = false) {
+function spawnParticle(x, y, vx, vy, color, size, lifeDecay, gravityMul = 0.5, isBlood = false, additive = true) {
     const g = new PIXI.Graphics();
     g.beginFill(color);
     g.drawCircle(0, 0, size);
     g.endFill();
     g.position.set(x, y);
-    if (!isBlood) g.blendMode = PIXI.BLEND_MODES.ADD;
+    if (!isBlood && additive) g.blendMode = PIXI.BLEND_MODES.ADD;
     particlesContainer.addChild(g);
     particles.push({
         mesh: g,
@@ -411,35 +1113,233 @@ function spawnParticle(x, y, vx, vy, color, size, lifeDecay, gravityMul = 0.5, i
     });
 }
 
-function createMuzzleFlash(x, y) {
-    for (let i = 0; i < 6; i++) {
+function createMuzzleFlash(x, y, weaponId = "winchester") {
+    const scale = WEAPON_MUZZLE[weaponId] ?? 0.45;
+    const count = Math.min(5, Math.floor(2 + scale * 2));
+    const coreColor = weaponId === "bazooka" ? 0xff6622 : weaponId === "sniper" ? 0xffeeaa : 0xffdd66;
+    for (let i = 0; i < count; i++) {
         const a = Math.random() * Math.PI * 2;
-        const s = 4 + Math.random() * 6;
-        spawnParticle(x, y, Math.cos(a) * s, Math.sin(a) * s, 0xffdd66, 2.5, 0.05, 0.2);
+        const s = (2 + Math.random() * 3) * scale;
+        spawnParticle(x, y, Math.cos(a) * s, Math.sin(a) * s, coreColor, 1.2 + scale * 0.8, 0.05, 0.2);
+    }
+    if (scale >= 0.7) {
+        spawnParticle(x, y, 0, 0, 0xff4422, 3 + scale * 1.5, 0.04, 0.08);
     }
 }
 
-function createSparkHit(x, y) {
-    for (let i = 0; i < 10; i++) {
+const triggerRecoilShake = (weaponId) => {
+    const power = WEAPON_RECOIL_SHAKE[weaponId] ?? 0.75;
+    recoilShake = power;
+    recoilShakeX = (Math.random() - 0.5) * power;
+    recoilShakeY = (Math.random() - 0.5) * power * 0.6;
+};
+
+const initWeaponRecoil = (p) => {
+    if (!p.weaponRecoil) p.weaponRecoil = { arm: 0, torso: 0, aimKick: 0 };
+};
+
+const triggerWeaponRecoil = (p, weaponId) => {
+    if (!p || weaponId === "katana") return;
+    initWeaponRecoil(p);
+    const prof = WEAPON_VISUAL_RECOIL[weaponId] ?? WEAPON_VISUAL_RECOIL.winchester;
+    p.weaponRecoil.arm = Math.max(p.weaponRecoil.arm, prof.arm);
+    p.weaponRecoil.aimKick = prof.aim;
+};
+
+const tickWeaponRecoil = (p, dt) => {
+    if (!p.weaponRecoil) {
+        p.recoilTorsoOffX = 0;
+        p.recoilTorsoOffY = 0;
+        return;
+    }
+    const r = p.weaponRecoil;
+    const decay = Math.pow(0.72, dt);
+    r.arm *= decay;
+    r.aimKick *= decay;
+    r.torso += (r.arm * 0.45 - r.torso) * 0.18 * dt;
+    if (r.arm < 0.05) r.arm = 0;
+    if (Math.abs(r.torso) < 0.05) r.torso = 0;
+    if (Math.abs(r.aimKick) < 0.002) r.aimKick = 0;
+    const aim = p.aimAngle || 0;
+    p.recoilTorsoOffX = -Math.cos(aim) * r.torso * 0.35;
+    p.recoilTorsoOffY = -Math.sin(aim) * r.torso * 0.35;
+};
+
+const getKatanaSwingOffsets = (p) => {
+    const t = p.katanaSwing ?? 0;
+    if (t <= 0) return { aimOffset: 0, armReach: 0, trailAlpha: 0 };
+    if (t < 0.25) {
+        const w = t / 0.25;
+        return { aimOffset: -0.75 * w, armReach: -6 * w, trailAlpha: 0 };
+    }
+    if (t < 0.7) {
+        const s = (t - 0.25) / 0.45;
+        return {
+            aimOffset: -0.75 + 1.35 * s,
+            armReach: -6 + 14 * s,
+            trailAlpha: 0.85 * (1 - s * 0.45),
+        };
+    }
+    const r = (t - 0.7) / 0.3;
+    return {
+        aimOffset: 0.6 * (1 - r),
+        armReach: 8 * (1 - r),
+        trailAlpha: 0.25 * (1 - r),
+    };
+};
+
+const startKatanaSwing = (p) => {
+    if (!p) return;
+    p.katanaSwing = 0.001;
+    p.katanaSwingStartedAt = Date.now();
+    p.katanaSwingDir = p.facing || 1;
+};
+
+const tickKatanaSwing = (p) => {
+    if (!p.katanaSwing || p.katanaSwing <= 0) return;
+    const elapsed = Date.now() - (p.katanaSwingStartedAt || 0);
+    p.katanaSwing = Math.min(1, elapsed / KATANA_SWING_MS);
+    if (p.katanaSwing >= 1) {
+        p.katanaSwing = 0;
+        p.katanaSwingStartedAt = 0;
+    }
+};
+
+const startKatanaEquip = (p) => {
+    if (!p) return;
+    p.katanaEquip = 0.001;
+    p.katanaEquipStartedAt = Date.now();
+};
+
+const tickKatanaEquip = (p) => {
+    if (p.katanaEquip == null || p.katanaEquip >= 1) {
+        p.katanaEquip = 1;
+        return;
+    }
+    const elapsed = Date.now() - (p.katanaEquipStartedAt || 0);
+    p.katanaEquip = Math.min(1, elapsed / KATANA_EQUIP_MS);
+};
+
+const getEffectiveAim = (p) => {
+    let aim = p.aimAngle || 0;
+    if (p.weaponRecoil?.aimKick) aim += p.weaponRecoil.aimKick;
+    if (p.currentWeapon === "katana" && (p.katanaSwing ?? 0) > 0) {
+        aim += getKatanaSwingOffsets(p).aimOffset * (p.katanaSwingDir || p.facing || 1);
+    }
+    return aim;
+};
+
+const applyVisualRecoilToGun = (gun, p) => {
+    const r = p.weaponRecoil;
+    if (!r || (r.arm < 0.01 && r.torso < 0.01)) return gun;
+    const cos = Math.cos(gun.aim);
+    const sin = Math.sin(gun.aim);
+    gun.handX -= cos * r.arm;
+    gun.handY -= sin * r.arm;
+    gun.muzzleX -= cos * r.arm;
+    gun.muzzleY -= sin * r.arm;
+    gun.shoulderX -= cos * r.torso * 0.55;
+    gun.shoulderY -= sin * r.torso * 0.55;
+    if (gun.backHandX != null) {
+        gun.backHandX -= cos * r.torso * 0.35;
+        gun.backHandY -= sin * r.torso * 0.35;
+    }
+    if (gun.gripX != null) {
+        gun.gripX -= cos * r.torso * 0.4;
+        gun.gripY -= sin * r.torso * 0.4;
+    }
+    return gun;
+};
+
+// Particles & hit effects
+let hitFxBudget = 0;
+let hitFxResetAt = 0;
+let surfaceHitFxBudget = 0;
+let surfaceHitFxResetAt = 0;
+
+function createWallHit(x, y, dirX = 0, dirY = -1) {
+    const now = performance.now();
+    if (now > surfaceHitFxResetAt) {
+        surfaceHitFxBudget = 0;
+        surfaceHitFxResetAt = now + 48;
+    }
+    if (surfaceHitFxBudget >= 8) return;
+    surfaceHitFxBudget += 1;
+
+    const len = Math.hypot(dirX, dirY) || 1;
+    const nx = dirX / len;
+    const ny = dirY / len;
+    const tx = -ny;
+    const ty = nx;
+
+    const ring = new PIXI.Graphics();
+    ring.position.set(x, y);
+    particlesContainer.addChild(ring);
+    hitRings.push({ g: ring, life: 1, maxR: 13, color: 0xffbb66 });
+
+    spawnParticle(x, y, 0, 0, 0xffeebb, 1.65, 0.13, 0.045, false, true);
+
+    for (let i = 0; i < 5; i++) {
+        const spread = (i - 2) * 0.42;
+        const px = nx + tx * spread;
+        const py = ny + ty * spread;
+        const plen = Math.hypot(px, py) || 1;
+        const speed = 1.6 + Math.random() * 2.4;
+        spawnParticle(
+            x,
+            y,
+            (px / plen) * speed,
+            (py / plen) * speed,
+            i % 2 === 0 ? 0xffcc77 : 0xffaa55,
+            0.95 + Math.random() * 0.4,
+            0.1,
+            0.24,
+            false,
+            i === 0,
+        );
+    }
+
+    for (let i = 0; i < 4; i++) {
         const a = Math.random() * Math.PI * 2;
-        const s = 3 + Math.random() * 8;
-        spawnParticle(x, y, Math.cos(a) * s, Math.sin(a) * s, 0xffaa44, 2, 0.04, 0.35);
+        const s = 0.5 + Math.random() * 1.2;
+        spawnParticle(x, y, Math.cos(a) * s, Math.sin(a) * s, 0x888899, 0.5, 0.1, 0.18, false, false);
+    }
+}
+
+function createSurfaceHit(x, y, dirX = 0, dirY = -1) {
+    createWallHit(x, y, dirX, dirY);
+}
+
+function createSparkHit(x, y, intensity = 1) {
+    const now = performance.now();
+    if (now > hitFxResetAt) {
+        hitFxBudget = 0;
+        hitFxResetAt = now + 48;
+    }
+    if (hitFxBudget >= 3) return;
+    hitFxBudget += 1;
+
+    const count = intensity >= 0.5 ? Math.max(1, Math.round(intensity)) : 1;
+    for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = (0.6 + Math.random() * 1.4) * intensity;
+        spawnParticle(x, y, Math.cos(a) * s, Math.sin(a) * s, 0xffaa44, 0.65 * intensity, 0.09, 0.2, false, false);
     }
 }
 
 function createBloodSpray(x, y) {
-    for (let i = 0; i < 4; i++) {
-        const a = (Math.PI * 2 * i) / 4 + (Math.random() - 0.5) * 0.4;
-        const s = 1 + Math.random() * 2.8;
+    for (let i = 0; i < 2; i++) {
+        const a = (Math.PI * 2 * i) / 2 + (Math.random() - 0.5) * 0.5;
+        const s = 0.8 + Math.random() * 1.8;
         spawnParticle(
             x,
             y,
             Math.cos(a) * s,
-            Math.sin(a) * s - 0.45,
+            Math.sin(a) * s - 0.35,
             Math.random() > 0.5 ? 0xcc3333 : 0x991818,
-            0.75 + Math.random() * 0.9,
-            0.028,
-            0.18,
+            0.55 + Math.random() * 0.5,
+            0.035,
+            0.16,
             true,
         );
     }
@@ -447,25 +1347,13 @@ function createBloodSpray(x, y) {
 
 function createPlayerHitEffect(x, y) {
     createBloodSpray(x, y);
-    for (let i = 0; i < 2; i++) {
-        spawnParticle(
-            x,
-            y,
-            (Math.random() - 0.5) * 2,
-            (Math.random() - 0.5) * 2,
-            0xffffff,
-            1.5,
-            0.05,
-            0.08,
-        );
-    }
 }
 
 function createHitFlash(x, y) {
-    for (let i = 0; i < 8; i++) {
-        spawnParticle(x, y, (Math.random() - 0.5) * 4, (Math.random() - 0.5) * 4, 0xffffff, 4, 0.06, 0.1);
+    spawnParticle(x, y, 0, 0, 0xff4422, 2.5, 0.05, 0.08);
+    for (let i = 0; i < 3; i++) {
+        spawnParticle(x, y, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2, 0xffffff, 1.2, 0.07, 0.08);
     }
-    spawnParticle(x, y, 0, 0, 0xff4422, 8, 0.035, 0.05);
 }
 
 const hitRings = [];
@@ -474,26 +1362,21 @@ function createHitBurst(x, y) {
     const ring = new PIXI.Graphics();
     ring.position.set(x, y);
     particlesContainer.addChild(ring);
-    hitRings.push({ g: ring, life: 1, maxR: 32 });
+    hitRings.push({ g: ring, life: 1, maxR: 14 });
     createHitFlash(x, y);
-    for (let i = 0; i < 14; i++) {
-        const a = (Math.PI * 2 * i) / 14;
-        spawnParticle(x, y, Math.cos(a) * 12, Math.sin(a) * 12, 0xffffff, 3, 0.035, 0.12);
-        spawnParticle(x, y, Math.cos(a) * 8, Math.sin(a) * 8, 0xff5533, 2.5, 0.03, 0.18);
-    }
 }
 
 // Stickman drawing + animation helpers
 const VISUAL_STAND_LIFT = 5;
 
 const getStickPose = (p) => {
-    const tx = p.displayTorso.x;
-    const ty = p.displayTorso.y;
+    const tx = p.displayTorso.x + (p.recoilTorsoOffX ?? 0);
+    const ty = p.displayTorso.y + (p.recoilTorsoOffY ?? 0);
     const crouch = !!p.crouching && p.grounded;
     const drop = crouch ? STICK.crouchDrop : 0;
     const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
     const footY = ty + FEET_OFF - standLift;
-    const hipY = ty + FEET_OFF * 0.26 + drop * 0.12 - standLift * 0.4;
+    const hipY = ty + FEET_OFF * 0.18 + drop * 0.12 - standLift * 0.4;
     const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.2;
     const hx = p.displayHead.x;
     const hy = crouch ? p.displayHead.y + drop * 0.4 : p.displayHead.y;
@@ -502,36 +1385,136 @@ const getStickPose = (p) => {
 
 const getGunPose = (p) => {
     const pose = getStickPose(p);
-    const aim = p.aimAngle || 0;
+    const aim = getEffectiveAim(p);
     const f = p.facing || 1;
-    const shoulderX = pose.tx + f * 2.5;
-    const shoulderY = pose.neckTop + 2;
-    const handX = shoulderX + Math.cos(aim) * STICK.armLen;
-    const handY = shoulderY + Math.sin(aim) * STICK.armLen;
-    const muzzleDist = GUN.barrel + GUN.tipR * 0.4;
-    const muzzleX = handX + Math.cos(aim) * muzzleDist;
-    const muzzleY = handY + Math.sin(aim) * muzzleDist;
-    const backHandX = pose.tx - f * STICK.footSpread;
-    const backHandY = pose.neckTop + 13;
-    return { ...pose, aim, f, shoulderX, shoulderY, handX, handY, muzzleX, muzzleY, backHandX, backHandY };
-};
-
-const drawGunInHand = (g, gun, isMe) => {
-    const { handX, handY, aim, muzzleX, muzzleY } = gun;
+    const weaponId = p.currentWeapon || "winchester";
+    const barrel = WEAPON_BARREL[weaponId] ?? GUN.barrel;
     const cos = Math.cos(aim);
     const sin = Math.sin(aim);
     const px = -sin;
     const py = cos;
 
-    const at = (along, across) => ({
-        x: handX + cos * along + px * across,
-        y: handY + sin * along + py * across,
+    const shoulderX = pose.tx + f * 2.5;
+    const shoulderY = pose.neckTop + 2;
+
+    if (weaponId === "bazooka") {
+        const mountX = pose.tx + f * 3;
+        const mountY = pose.neckTop + 6;
+        const tubeLen = barrel;
+        const muzzleX = mountX + cos * tubeLen;
+        const muzzleY = mountY + sin * tubeLen;
+        const frontHandX = mountX + cos * (tubeLen * 0.52) + px * f * 2;
+        const frontHandY = mountY + sin * (tubeLen * 0.52) + py * f * 2;
+        const gripX = mountX + cos * 10;
+        const gripY = mountY + sin * 10;
+        const backHandX = mountX - f * 5;
+        const backHandY = mountY + 5;
+        return applyVisualRecoilToGun({
+            ...pose,
+            aim,
+            f,
+            shoulderX: mountX,
+            shoulderY: mountY,
+            handX: frontHandX,
+            handY: frontHandY,
+            gripX,
+            gripY,
+            muzzleX,
+            muzzleY,
+            backHandX,
+            backHandY,
+            weaponId,
+            barrel,
+            carryStyle: "shoulder",
+            tubeLen,
+        }, p);
+    }
+
+    if (weaponId === "katana") {
+        const equip = p.katanaEquip ?? 1;
+        const swing = getKatanaSwingOffsets(p);
+        const readyReach = STICK.armLen + 4 + swing.armReach;
+        const idleReach = STICK.armLen * 0.35 + (1 - equip) * 10;
+        const reach = idleReach + (readyReach - idleReach) * equip;
+        const handX = shoulderX + cos * reach;
+        const handY = shoulderY + sin * reach;
+        const backReach = STICK.armLen * (0.35 + 0.2 * equip) - swing.armReach * 0.25;
+        const backHandX = shoulderX + cos * backReach - px * f * (6 * equip);
+        const backHandY = shoulderY + sin * backReach - py * f * (6 * equip);
+        const muzzleX = handX + cos * barrel;
+        const muzzleY = handY + sin * barrel;
+        return applyVisualRecoilToGun({
+            ...pose,
+            aim,
+            f,
+            shoulderX,
+            shoulderY,
+            handX,
+            handY,
+            muzzleX,
+            muzzleY,
+            backHandX,
+            backHandY,
+            weaponId,
+            barrel,
+            carryStyle: "twoHand",
+            katanaTrailAlpha: swing.trailAlpha,
+        }, p);
+    }
+
+    const armLen =
+        weaponId === "grenade"
+            ? STICK.armLen * 0.75
+            : weaponId === "sniper"
+              ? STICK.armLen + 2
+              : STICK.armLen;
+    const handX = shoulderX + cos * armLen;
+    const handY = shoulderY + sin * armLen;
+    const muzzleDist = barrel + GUN.tipR * 0.4;
+    const muzzleX = handX + cos * muzzleDist;
+    const muzzleY = handY + sin * muzzleDist;
+    const backHandX = pose.tx - f * (weaponId === "auto" ? 7 : STICK.footSpread);
+    const backHandY = pose.neckTop + (weaponId === "auto" ? 16 : 13);
+    return applyVisualRecoilToGun({
+        ...pose,
+        aim,
+        f,
+        shoulderX,
+        shoulderY,
+        handX,
+        handY,
+        muzzleX,
+        muzzleY,
+        backHandX,
+        backHandY,
+        weaponId,
+        barrel,
+        carryStyle: "handheld",
+    }, p);
+};
+
+const drawGunInHand = (g, gun, isMe) => {
+    drawWeaponInHand(g, gun, isMe);
+};
+
+const drawWeaponInHand = (g, gun, isMe) => {
+    const { handX, handY, aim, muzzleX, muzzleY, weaponId, barrel, shoulderX, shoulderY, tubeLen, f } = gun;
+    const cos = Math.cos(aim);
+    const sin = Math.sin(aim);
+    const px = -sin;
+    const py = cos;
+
+    const at = (ox, oy, along, across) => ({
+        x: ox + cos * along + px * across,
+        y: oy + sin * along + py * across,
     });
+
+    const atHand = (along, across) => at(handX, handY, along - (gun.carryStyle === "handheld" ? 0 : 0), across);
 
     const slideCol = isMe ? 0x3d3d3d : 0x4a4a4a;
     const frameCol = 0x2a2a2a;
     const gripCol = 0x1c1410;
-    const accentCol = 0xffe135;
+    const accentCol = weaponId === "bazooka" ? 0xff8844 : 0xffe135;
     const outlineCol = 0x111111;
 
     const poly = (points) => {
@@ -541,60 +1524,214 @@ const drawGunInHand = (g, gun, isMe) => {
         g.closePath();
     };
 
-    // Slide + barrel (pistol top)
     g.lineStyle(1.5, outlineCol, 1, 0.5, true);
-    g.beginFill(slideCol);
-    poly([
-        at(-1, -GUN.slideHalfH),
-        at(GUN.barrel - 2, -GUN.slideHalfH),
-        at(GUN.barrel + 3, -2.5),
-        at(GUN.barrel + 3, 2.5),
-        at(GUN.barrel - 2, GUN.slideHalfH),
-        at(-1, GUN.slideHalfH),
-    ]);
-    g.endFill();
 
-    // Lower frame / receiver
-    g.beginFill(frameCol);
-    poly([
-        at(-4, 2),
-        at(10, 2),
-        at(14, 5),
-        at(8, 7),
-        at(-2, 6),
-    ]);
-    g.endFill();
+    if (weaponId === "katana") {
+        const trailAlpha = gun.katanaTrailAlpha ?? 0;
+        if (trailAlpha > 0.05) {
+            g.lineStyle(5, 0xc8e8ff, trailAlpha * 0.55, 0.5, true, PIXI.LINE_CAP.ROUND);
+            g.moveTo(handX - cos * 8, handY - sin * 8);
+            g.lineTo(muzzleX + cos * 12, muzzleY + sin * 12);
+            g.lineStyle(2.5, 0xffffff, trailAlpha * 0.35, 0.5, true, PIXI.LINE_CAP.ROUND);
+            g.moveTo(handX, handY);
+            g.lineTo(muzzleX + cos * 6, muzzleY + sin * 6);
+        }
+        g.lineStyle(1.5, outlineCol, 1, 0.5, true);
+        g.beginFill(0xe8f4ff);
+        poly([
+            { x: handX + cos * 4 - px * 2, y: handY + sin * 4 - py * 2 },
+            { x: handX + cos * barrel - px * 1.2, y: handY + sin * barrel - py * 1.2 },
+            { x: handX + cos * (barrel + 10), y: handY + sin * (barrel + 10) },
+            { x: handX + cos * 4 + px * 2, y: handY + sin * 4 + py * 2 },
+        ]);
+        g.endFill();
+        g.beginFill(0x2a1810);
+        poly([
+            { x: handX - cos * 6 - px * 2.5, y: handY - sin * 6 - py * 2.5 },
+            { x: handX + cos * 5 - px * 2.5, y: handY + sin * 5 - py * 2.5 },
+            { x: handX + cos * 5 + px * 2.5, y: handY + sin * 5 + py * 2.5 },
+            { x: handX - cos * 6 + px * 2.5, y: handY - sin * 6 + py * 2.5 },
+        ]);
+        g.endFill();
+        g.lineStyle(2, 0x99bbcc, 0.8);
+        g.moveTo(muzzleX - cos * 8, muzzleY - sin * 8);
+        g.lineTo(muzzleX + cos * 4, muzzleY + sin * 4);
+        return;
+    }
 
-    // Grip handle
+    if (weaponId === "bazooka") {
+        const len = tubeLen ?? barrel;
+        const mountX = shoulderX;
+        const mountY = shoulderY;
+        const tubeHalf = 7;
+
+        g.beginFill(0x3d5c32);
+        poly([
+            at(mountX, mountY, -4, -tubeHalf),
+            at(mountX, mountY, len, -tubeHalf + 1),
+            at(mountX, mountY, len + 6, -4),
+            at(mountX, mountY, len + 6, 4),
+            at(mountX, mountY, len, tubeHalf - 1),
+            at(mountX, mountY, -4, tubeHalf),
+        ]);
+        g.endFill();
+
+        g.beginFill(0x556b44);
+        poly([
+            at(mountX, mountY, -12, -tubeHalf - 2),
+            at(mountX, mountY, -2, -tubeHalf - 1),
+            at(mountX, mountY, -2, tubeHalf + 1),
+            at(mountX, mountY, -12, tubeHalf + 2),
+        ]);
+        g.endFill();
+
+        g.beginFill(0x222222);
+        const mouth = at(mountX, mountY, len + 4, 0);
+        g.drawCircle(mouth.x, mouth.y, 5);
+        g.endFill();
+
+        g.lineStyle(2, 0x1a1a1a, 0.9);
+        g.moveTo(mountX - px * f * 3, mountY - py * f * 3);
+        g.lineTo(mountX + cos * 8, mountY + sin * 8);
+
+        g.lineStyle(3, accentCol, 0.9, 0.5, true, PIXI.LINE_CAP.ROUND);
+        g.moveTo(at(mountX, mountY, len - 2, 0).x, at(mountX, mountY, len - 2, 0).y);
+        g.lineTo(muzzleX, muzzleY);
+        g.beginFill(accentCol, 0.9);
+        g.drawCircle(muzzleX, muzzleY, 4.5);
+        g.endFill();
+        return;
+    }
+
+    if (weaponId === "grenade") {
+        const gx = handX + cos * 8;
+        const gy = handY + sin * 8;
+        g.beginFill(0x556b2f);
+        g.drawCircle(gx, gy, 8);
+        g.endFill();
+        g.beginFill(0x778844);
+        g.drawCircle(gx - px * 2, gy - py * 2, 3);
+        g.endFill();
+        g.lineStyle(2, 0xcccc66, 1);
+        g.moveTo(gx - cos * 3, gy - sin * 3);
+        g.lineTo(gx - cos * 3 - px * 5, gy - sin * 3 - py * 5);
+        return;
+    }
+
+    const barrelLen = barrel;
+    const slideHalf =
+        weaponId === "sniper"
+            ? 2
+            : weaponId === "winchester_shotgun"
+              ? 4.5
+              : weaponId === "auto"
+                ? 2.8
+                : GUN.slideHalfH;
+
+    if (weaponId === "auto") {
+        g.beginFill(0x2f2f2f);
+        poly([
+            atHand(-2, -slideHalf),
+            atHand(barrelLen, -slideHalf),
+            atHand(barrelLen + 4, -2),
+            atHand(barrelLen + 4, 2),
+            atHand(barrelLen, slideHalf),
+            atHand(-2, slideHalf),
+        ]);
+        g.endFill();
+        g.beginFill(0x1a1a1a);
+        const mag = atHand(6, slideHalf + 2);
+        g.drawRect(mag.x - 3, mag.y, 6, 9);
+        g.endFill();
+    } else if (weaponId === "winchester_shotgun") {
+        g.beginFill(0x4a3a28);
+        poly([
+            atHand(-2, -slideHalf - 1),
+            atHand(barrelLen, -slideHalf - 1),
+            atHand(barrelLen + 3, -3.5),
+            atHand(barrelLen + 3, 3.5),
+            atHand(barrelLen, slideHalf + 1),
+            atHand(-2, slideHalf + 1),
+        ]);
+        g.endFill();
+        g.lineStyle(2, 0x2a2018, 1);
+        g.moveTo(atHand(barrelLen * 0.3, -slideHalf - 2).x, atHand(barrelLen * 0.3, -slideHalf - 2).y);
+        g.lineTo(atHand(barrelLen * 0.7, -slideHalf - 2).x, atHand(barrelLen * 0.7, -slideHalf - 2).y);
+    } else {
+        g.beginFill(slideCol);
+        poly([
+            atHand(-1, -slideHalf),
+            atHand(barrelLen - 2, -slideHalf),
+            atHand(barrelLen + 3, -2.5),
+            atHand(barrelLen + 3, 2.5),
+            atHand(barrelLen - 2, slideHalf),
+            atHand(-1, slideHalf),
+        ]);
+        g.endFill();
+    }
+
+    if (weaponId !== "auto" && weaponId !== "winchester_shotgun") {
+        g.beginFill(frameCol);
+        poly([
+            atHand(-4, 2),
+            atHand(10, 2),
+            atHand(14, 5),
+            atHand(8, 7),
+            atHand(-2, 6),
+        ]);
+        g.endFill();
+    }
+
     g.beginFill(gripCol);
     poly([
-        at(-2, 5),
-        at(6, 6),
-        at(5, 6 + GUN.gripLen * 0.55),
-        at(-1, 6 + GUN.gripLen),
-        at(-6, 8),
+        atHand(-2, 5),
+        atHand(6, 6),
+        atHand(5, 6 + GUN.gripLen * 0.55),
+        atHand(-1, 6 + GUN.gripLen),
+        atHand(-6, 8),
     ]);
     g.endFill();
 
-    // Trigger guard
-    g.lineStyle(2, outlineCol, 0.9, 0.5, true, PIXI.LINE_CAP.ROUND);
-    g.moveTo(at(2, 5).x, at(2, 5).y);
-    g.quadraticCurveTo(at(5, 10).x, at(5, 10).y, at(9, 6).x, at(9, 6).y);
+    if (weaponId === "winchester") {
+        g.lineStyle(2, 0x886644, 0.9);
+        g.moveTo(atHand(6, 8).x, atHand(6, 8).y);
+        g.lineTo(atHand(10, 14).x, atHand(10, 14).y);
+    }
 
-    // Front sight
-    g.beginFill(0x222222);
-    const sight = at(GUN.barrel - 4, -GUN.slideHalfH - 2.5);
-    g.drawRect(sight.x - 1.2, sight.y - 1.2, 2.4, 3.2);
-    g.endFill();
+    if (weaponId === "sniper") {
+        g.beginFill(0x111111);
+        const scope = atHand(barrelLen * 0.38, -slideHalf - 5);
+        g.drawRect(scope.x - 5, scope.y - 2.5, 10, 5);
+        g.endFill();
+        g.beginFill(0x0a0a0a);
+        g.drawRect(scope.x - 2, scope.y - 1, 4, 2);
+        g.endFill();
+    }
 
-    // Neon muzzle tip
-    g.lineStyle(3, accentCol, 1, 0.5, true, PIXI.LINE_CAP.ROUND);
-    g.moveTo(at(GUN.barrel, 0).x, at(GUN.barrel, 0).y);
+    if (weaponId !== "sniper" && weaponId !== "auto") {
+        g.beginFill(0x222222);
+        const sight = atHand(barrelLen - 4, -slideHalf - 2.5);
+        g.drawRect(sight.x - 1.2, sight.y - 1.2, 2.4, 3.2);
+        g.endFill();
+    }
+
+    const tipSize = weaponId === "sniper" ? 3.2 : weaponId === "auto" ? 2.2 : GUN.tipR * 0.85;
+    g.lineStyle(2 + (weaponId === "sniper" ? 1 : 0), accentCol, 1, 0.5, true, PIXI.LINE_CAP.ROUND);
+    g.moveTo(atHand(barrelLen, 0).x, atHand(barrelLen, 0).y);
     g.lineTo(muzzleX, muzzleY);
-
     g.beginFill(accentCol, 0.85);
-    g.drawCircle(muzzleX, muzzleY, GUN.tipR * 0.85);
+    g.drawCircle(muzzleX, muzzleY, tipSize);
     g.endFill();
+};
+
+const drawSniperLaser = (g, gun) => {
+    g.clear();
+    g.lineStyle(1.5, 0xff2233, 0.75, 0.5, true, PIXI.LINE_CAP.ROUND);
+    g.moveTo(gun.muzzleX, gun.muzzleY);
+    g.lineTo(mouseX, mouseY);
+    g.lineStyle(1, 0xffaaaa, 0.35, 0.5, true, PIXI.LINE_CAP.ROUND);
+    g.moveTo(gun.muzzleX, gun.muzzleY);
+    g.lineTo(mouseX, mouseY);
 };
 
 const stickPalette = (isMe) => ({
@@ -822,6 +1959,10 @@ const initPlayerRenderState = (p) => {
     if (p.shootFaceUntil == null) p.shootFaceUntil = 0;
     if (p.deathCorpse == null) p.deathCorpse = null;
     if (p.moodSeed == null) p.moodSeed = Math.floor(Math.random() * 9999);
+    initWeaponRecoil(p);
+    if (p.katanaSwing == null) p.katanaSwing = 0;
+    if (p.katanaEquip == null) p.katanaEquip = 1;
+    if (p.lastFireTick == null) p.lastFireTick = 0;
 };
 
 const updatePlayerMotionState = (p, action) => {
@@ -836,7 +1977,7 @@ const updatePlayerMotionState = (p, action) => {
     }
 
     if (p.walking) {
-        const speed = p.crouching ? 0.42 : 0.72;
+        const speed = p.crouching ? 0.21 : 0.36;
         p.walkPhase += speed * Math.max(1, Math.abs(p.vx) * 0.12);
     }
 };
@@ -881,15 +2022,15 @@ const computeLegPositions = (p, pose) => {
     } else if (crouch) {
         if (p.walking) {
             const swing = Math.sin(p.walkPhase);
-            lFootX = tx - s - 3 + swing * STICK.stride * 0.42 * f;
+            lFootX = tx - s - 1 + swing * STICK.stride * 0.42 * f;
             lFootY = footY - Math.max(0, swing) * STICK.lift * 0.35;
-            rFootX = tx + s + 3 - swing * STICK.stride * 0.42 * f;
+            rFootX = tx + s + 1 - swing * STICK.stride * 0.42 * f;
             rFootY = footY - Math.max(0, -swing) * STICK.lift * 0.35;
             lBend = 0.55 + Math.max(0, swing) * 0.5;
             rBend = 0.55 + Math.max(0, -swing) * 0.5;
         } else {
-            lFootX = tx - s - 3;
-            rFootX = tx + s + 3;
+            lFootX = tx - s - 1;
+            rFootX = tx + s + 1;
             lBend = 1.25;
             rBend = 1.25;
         }
@@ -942,9 +2083,19 @@ const drawStickmanLines = (g, p, isMe) => {
         g.lineTo(tx, ty);
         g.lineTo(tx, hipY);
         g.moveTo(tx, neckTop + 2);
-        g.lineTo(gun.backHandX, gun.backHandY);
-        g.moveTo(gun.shoulderX, gun.shoulderY);
-        g.lineTo(gun.handX, gun.handY);
+        if (gun.carryStyle === "shoulder") {
+            g.lineTo(gun.backHandX, gun.backHandY);
+            g.moveTo(gun.shoulderX, gun.shoulderY);
+            g.lineTo(gun.handX, gun.handY);
+        } else if (gun.carryStyle === "twoHand") {
+            g.lineTo(gun.backHandX, gun.backHandY);
+            g.moveTo(gun.shoulderX, gun.shoulderY);
+            g.lineTo(gun.handX, gun.handY);
+        } else {
+            g.lineTo(gun.backHandX, gun.backHandY);
+            g.moveTo(gun.shoulderX, gun.shoulderY);
+            g.lineTo(gun.handX, gun.handY);
+        }
         drawLegWithKnee(g, tx - STICK.hipSpread, hipY, legs.lKneeX, legs.lKneeY, legs.lFootX, legs.lFootY);
         drawLegWithKnee(g, tx + STICK.hipSpread, hipY, legs.rKneeX, legs.rKneeY, legs.rFootX, legs.rFootY);
     };
@@ -965,6 +2116,7 @@ const drawStickmanFills = (g, p, isMe) => {
 // Main Loop
 let lastMoveSent = 0;
 const SEND_MOVE_MS = 16;
+let laserGraphics = null;
 
 app.ticker.add((dt) => {
     try {
@@ -972,6 +2124,7 @@ app.ticker.add((dt) => {
 
         const G = latestState.G;
         drawPlatforms(getPlatformsForRender(G));
+        drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
 
         let action = null;
         const crouching =
@@ -980,6 +2133,9 @@ app.ticker.add((dt) => {
 
         // Process Input
         const me = localPlayers[latestState.playerId];
+        if (me && G?.players?.[latestState.playerId]) {
+            me.currentWeapon = G.players[latestState.playerId].currentWeapon || "winchester";
+        }
         if (me && me.health > 0 && me.torso) {
             if (isKeyPressed("KeyA", "a", "A", "ა", "ArrowLeft")) action = "left";
             else if (isKeyPressed("KeyD", "d", "D", "დ", "ArrowRight")) action = "right";
@@ -988,6 +2144,7 @@ app.ticker.add((dt) => {
             if (jumpQueued) {
                 action = "jump";
                 jumpQueued = false;
+                Sfx.playJump();
             }
 
             const pose = getStickPose(me);
@@ -1000,6 +2157,26 @@ app.ticker.add((dt) => {
         }
 
         const now = Date.now();
+        if (
+            pointerHeld &&
+            me &&
+            me.health > 0 &&
+            me.currentWeapon === "auto" &&
+            now - lastShootSent >= AUTO_FIRE_MS
+        ) {
+            tryShoot();
+        }
+
+        if (me && me.health > 0 && me.currentWeapon === "sniper") {
+            if (!laserGraphics) {
+                laserGraphics = new PIXI.Graphics();
+                laserContainer.addChild(laserGraphics);
+            }
+            drawSniperLaser(laserGraphics, getGunPose(me));
+        } else if (laserGraphics) {
+            laserGraphics.clear();
+        }
+
         if (now - lastMoveSent >= SEND_MOVE_MS) {
             window.parent.postMessage({
                 t: "bordiko:move",
@@ -1014,17 +2191,34 @@ app.ticker.add((dt) => {
             lastMoveSent = now;
         }
 
-        const smooth = Math.min(1, 0.35 * dt);
+        if (recoilShake > 0.05) {
+            recoilShake *= 0.82;
+            gameContainer.position.set(
+                viewOffsetX + recoilShakeX * recoilShake * 0.35,
+                viewOffsetY + recoilShakeY * recoilShake * 0.35,
+            );
+        } else {
+            recoilShake = 0;
+            gameContainer.position.set(viewOffsetX, viewOffsetY);
+        }
+
+        const smooth = Math.min(1, 0.28 * dt);
         for (const p of Object.values(localPlayers)) {
             if (p.deathCorpse && (p.health <= 0 || !p.torso)) continue;
             if (!p.torso || !p.head) continue;
             initPlayerRenderState(p);
+            tickWeaponRecoil(p, dt);
+            tickKatanaSwing(p);
+            tickKatanaEquip(p);
             p.displayTorso = lerpBody(p.displayTorso, p.torso, smooth);
             p.displayHead = lerpBody(p.displayHead, p.head, smooth);
             updatePlayerMotionState(p, p === me ? action : null);
             tickFaceExpr(p, dt);
             if (p === me) {
                 p.crouching = crouching && p.grounded;
+            }
+            if (p === me && p.walking && p.grounded && !p.crouching && p.health > 0) {
+                Sfx.playFootstep();
             }
         }
 
@@ -1039,13 +2233,31 @@ app.ticker.add((dt) => {
             }
 
             const g = new PIXI.Graphics();
-            g.lineStyle(1.6, 0xffffff, 0.95);
-            g.beginFill(0xffaa00, 1);
-            g.drawCircle(0, 0, 3.5);
-            g.endFill();
-            g.beginFill(0xffff66, 0.85);
-            g.drawCircle(Math.cos(angle) * 1.2, Math.sin(angle) * 1.2, 1.5);
-            g.endFill();
+            const kind = b.kind || "bullet";
+            if (kind === "rocket") {
+                g.beginFill(0xff4422, 1);
+                g.drawCircle(0, 0, 6);
+                g.endFill();
+                g.lineStyle(2, 0xffaa88, 0.9);
+                g.moveTo(-Math.cos(angle) * 10, -Math.sin(angle) * 10);
+                g.lineTo(0, 0);
+            } else if (kind === "grenade") {
+                g.beginFill(0x66aa33, 1);
+                g.drawCircle(0, 0, 5);
+                g.endFill();
+            } else if (kind === "pellet") {
+                g.beginFill(0xffcc66, 1);
+                g.drawCircle(0, 0, 2.5);
+                g.endFill();
+            } else {
+                g.lineStyle(1.6, 0xffffff, 0.95);
+                g.beginFill(0xffaa00, 1);
+                g.drawCircle(0, 0, 3.5);
+                g.endFill();
+                g.beginFill(0xffff66, 0.85);
+                g.drawCircle(Math.cos(angle) * 1.2, Math.sin(angle) * 1.2, 1.5);
+                g.endFill();
+            }
             g.position.set(b.body.x, b.body.y);
             bulletsContainer.addChild(g);
 
@@ -1092,9 +2304,10 @@ app.ticker.add((dt) => {
             }
             const r = ring.maxR * (1 - ring.life);
             ring.g.clear();
-            ring.g.lineStyle(3 * ring.life, 0xff7744, ring.life);
+            const ringColor = ring.color ?? 0xff7744;
+            ring.g.lineStyle(1.6 * ring.life, ringColor, ring.life * 0.75);
             ring.g.drawCircle(0, 0, r);
-            ring.g.lineStyle(1.5 * ring.life, 0xffffff, ring.life * 0.8);
+            ring.g.lineStyle(0.9 * ring.life, 0xffffff, ring.life * 0.5);
             ring.g.drawCircle(0, 0, r * 0.55);
         }
 
@@ -1164,6 +2377,22 @@ app.ticker.add((dt) => {
                 }
                 const scoresInfo = document.getElementById('scores-info');
                 if (scoresInfo) scoresInfo.innerHTML = scoreHtml;
+            }
+
+            const weaponInfo = document.getElementById('weapon-info');
+            if (weaponInfo && me) {
+                const wId = me.currentWeapon || "winchester";
+                const label = WEAPON_LABELS[wId] || wId;
+                const owned = getOrderedOwnedWeapons(latestState.playerId);
+                let weaponList = owned.map((id, i) => {
+                    const active = id === wId ? " style=\"color:#ffe135;font-weight:bold;\"" : "";
+                    return `<span${active}>${i + 1}. ${WEAPON_LABELS[id]}</span>`;
+                }).join("<br/>");
+                const cycleHint =
+                    owned.length > 1
+                        ? `<div style="margin-top:6px;font-size:11px;color:#aaa;">Q — შემდეგი იარაღი</div>`
+                        : `<div style="margin-top:6px;font-size:11px;color:#777;">აიღე იარაღი drop-იდან</div>`;
+                weaponInfo.innerHTML = `<div style="font-weight:bold;margin-bottom:4px;">${label}</div>${weaponList}${cycleHint}`;
             }
 
             if (latestState.ended) {

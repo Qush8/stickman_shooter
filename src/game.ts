@@ -1,6 +1,137 @@
 import { defineGame, INVALID_MOVE } from "@bordiko/sdk";
 import * as planck from "planck";
 
+export type WeaponId =
+  | "auto"
+  | "katana"
+  | "bazooka"
+  | "grenade"
+  | "winchester"
+  | "winchester_shotgun"
+  | "sniper";
+
+export const WEAPON_ORDER: WeaponId[] = [
+  "auto",
+  "katana",
+  "bazooka",
+  "grenade",
+  "winchester",
+  "winchester_shotgun",
+  "sniper",
+];
+
+export interface WeaponDef {
+  damage: number;
+  spread: number;
+  speed: number;
+  maxActive: number;
+  fireRateTicks: number;
+  pelletCount?: number;
+  kind: "bullet" | "rocket" | "grenade" | "melee";
+  aoeRadius?: number;
+  gravityScale?: number;
+  barrelPx: number;
+  meleeRange?: number;
+  fuseTicks?: number;
+  recoilForce: number;
+  recoilImpulseMul?: number;
+  muzzleFlashScale?: number;
+}
+
+export const WEAPONS: Record<WeaponId, WeaponDef> = {
+  auto: {
+    damage: 80,
+    spread: 0.06,
+    speed: 54,
+    maxActive: 6,
+    fireRateTicks: 8,
+    kind: "bullet",
+    gravityScale: 0.62,
+    barrelPx: 32,
+    recoilForce: 22,
+    muzzleFlashScale: 1.1,
+  },
+  katana: {
+    damage: 400,
+    spread: 0,
+    speed: 0,
+    maxActive: 0,
+    fireRateTicks: 24,
+    kind: "melee",
+    barrelPx: 38,
+    meleeRange: 60,
+    recoilForce: 8,
+    muzzleFlashScale: 0.4,
+  },
+  bazooka: {
+    damage: 350,
+    spread: 0.01,
+    speed: 37,
+    maxActive: 2,
+    fireRateTicks: 45,
+    kind: "rocket",
+    aoeRadius: 80,
+    gravityScale: 0.35,
+    barrelPx: 52,
+    recoilForce: 100,
+    recoilImpulseMul: 2.6,
+    muzzleFlashScale: 2.8,
+  },
+  grenade: {
+    damage: 280,
+    spread: 0.08,
+    speed: 34,
+    maxActive: 2,
+    fireRateTicks: 36,
+    kind: "grenade",
+    aoeRadius: 70,
+    gravityScale: 0.85,
+    barrelPx: 14,
+    fuseTicks: 90,
+    recoilForce: 30,
+    muzzleFlashScale: 1.2,
+  },
+  winchester: {
+    damage: 250,
+    spread: 0.02,
+    speed: 60,
+    maxActive: 3,
+    fireRateTicks: 28,
+    kind: "bullet",
+    gravityScale: 0.62,
+    barrelPx: 30,
+    recoilForce: 36,
+    muzzleFlashScale: 1.15,
+  },
+  winchester_shotgun: {
+    damage: 60,
+    spread: 0.22,
+    speed: 46,
+    maxActive: 12,
+    fireRateTicks: 36,
+    pelletCount: 6,
+    kind: "bullet",
+    gravityScale: 0.62,
+    barrelPx: 26,
+    recoilForce: 50,
+    recoilImpulseMul: 1.55,
+    muzzleFlashScale: 1.65,
+  },
+  sniper: {
+    damage: 500,
+    spread: 0,
+    speed: 84,
+    maxActive: 2,
+    fireRateTicks: 75,
+    kind: "bullet",
+    gravityScale: 0.45,
+    barrelPx: 42,
+    recoilForce: 62,
+    recoilImpulseMul: 1.75,
+    muzzleFlashScale: 1.9,
+  },
+};
+
 export interface BodyState {
   x: number;
   y: number;
@@ -12,6 +143,9 @@ export interface PlayerState {
   aimAngle: number;
   facing: number;
   crouching: boolean;
+  currentWeapon: WeaponId;
+  ownedWeapons: WeaponId[];
+  lastFireTick: number;
   torso: BodyState;
   head: BodyState;
 }
@@ -20,6 +154,11 @@ export interface BulletState {
   id: number;
   owner: string;
   body: BodyState;
+  kind: "bullet" | "rocket" | "grenade" | "pellet";
+  weaponId: WeaponId;
+  damage: number;
+  aoeRadius?: number;
+  fuseTicks?: number;
 }
 
 export interface HitEvent {
@@ -38,13 +177,48 @@ export interface PlatformState {
   health: number;
   maxHealth: number;
   broken: boolean;
+  kind: "static" | "elevator";
+  vx?: number;
+  minX?: number;
+  maxX?: number;
+  ttlTicks?: number;
+}
+
+export interface CrateState {
+  id: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  health: number;
+  maxHealth: number;
+  onPlatformId?: number;
+}
+
+export interface PickupState {
+  id: number;
+  kind: "health" | "weapon";
+  x: number;
+  y: number;
+  weaponId?: WeaponId;
+  onPlatformId?: number;
+  targetY?: number;
+  fallToFloor?: boolean;
 }
 
 export interface ShooterState {
   players: Record<string, PlayerState>;
   bullets: BulletState[];
   platforms: PlatformState[];
+  crates: CrateState[];
+  pickups: PickupState[];
   nextBulletId: number;
+  nextPlatformId: number;
+  nextCrateId: number;
+  nextPickupId: number;
+  spawnTick: number;
+  worldTick: number;
+  matchSeed: string;
   scores: Record<string, number>;
   hitEvents: HitEvent[];
 }
@@ -52,6 +226,8 @@ export interface ShooterState {
 const ARENA_W = 912;
 const ARENA_H = 500;
 const FLOOR_Y = ARENA_H;
+const FLOOR_PICKUP_Y = FLOOR_Y - 20;
+const PICKUP_FALL_SPEED = 8;
 const SCALE = 30;
 const MAX_HEALTH = 1000;
 const BULLET_DAMAGE = 125;
@@ -60,11 +236,11 @@ const PLAYER_HALF_W = 0.48;
 const PLAYER_HALF_H = 1.06;
 const HEAD_OFFSET = 36;
 const HEAD_RADIUS = 0.46;
-const MOVE_SPEED = 30;
-const JUMP_IMPULSE = 54;
-const GRAVITY = 195;
-const WALL_JUMP_IMPULSE_X = 22;
-const BULLET_SPEED = 58;
+const MOVE_SPEED = 15;
+const JUMP_IMPULSE = 40;
+const GRAVITY = 97.5;
+const WALL_JUMP_IMPULSE_X = 11;
+const BULLET_SPEED = 51;
 const BULLET_GRAVITY_SCALE = 0.62;
 const AIR_RECOIL_FORCE_MUL = 2.5;
 const AIR_RECOIL_VEL_MUL = 0.45;
@@ -76,22 +252,60 @@ const STAND_LIFT = 0.14;
 const MAX_BULLET_BOUNCES = 2;
 const PLATFORM_MAX_HEALTH = BULLET_DAMAGE * 4;
 const PLATFORM_BORDER_PX = 2;
+const CRATE_MAX_HEALTH = 500;
+const CRATE_W = 36;
+const CRATE_H = 36;
+const SPAWN_INTERVAL_TICKS = 480;
+const ELEVATOR_TTL_TICKS = 1800;
+const PICKUP_RADIUS = 14;
+const HEALTH_PICKUP_AMOUNT = 300;
+const START_WEAPON: WeaponId = "winchester";
+const KATANA_BLADE_HIT_RADIUS = 30;
+const KATANA_SWING_HIT_SAMPLES = [0.28, 0.36, 0.44, 0.52, 0.6, 0.68];
 
-// Visual stickman proportions (pixels) — keep in sync with ui.js STICK / GUN
 const STICK_BODY_LEN_PX = 44;
 const STICK_ARM_LEN_PX = 28;
 const STICK_CROUCH_DROP_PX = 18;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
 
-// Jump reach (px): vertical ~195, diagonal ~115 up + ~150 sideways — keep tiers within that.
 const PLATFORMS = [
-  { id: 0, x: 63, y: 388, w: 118, h: 12 },
-  { id: 1, x: 234, y: 273, w: 118, h: 12 },
-  { id: 2, x: 405, y: 388, w: 118, h: 12 },
-  { id: 3, x: 576, y: 273, w: 118, h: 12 },
-  { id: 4, x: 405, y: 158, w: 118, h: 12 },
-  { id: 5, x: 234, y: 43, w: 118, h: 12 },
+  { id: 0, x: 63, y: 388, w: 118, h: 12, kind: "static" as const },
+  {
+    id: 1,
+    x: 234,
+    y: 273,
+    w: 118,
+    h: 12,
+    kind: "elevator" as const,
+    vx: 22,
+    minX: 154,
+    maxX: 314,
+  },
+  { id: 2, x: 405, y: 388, w: 118, h: 12, kind: "static" as const },
+  {
+    id: 3,
+    x: 576,
+    y: 273,
+    w: 118,
+    h: 12,
+    kind: "elevator" as const,
+    vx: -22,
+    minX: 496,
+    maxX: 656,
+  },
+  { id: 4, x: 405, y: 158, w: 118, h: 12, kind: "static" as const },
+  {
+    id: 5,
+    x: 234,
+    y: 43,
+    w: 118,
+    h: 12,
+    kind: "elevator" as const,
+    vx: 22,
+    minX: 154,
+    maxX: 314,
+  },
 ];
 
 const spawnOnFloor = (x: number) => ({
@@ -104,13 +318,17 @@ type FixtureUserData =
   | { type: "head"; id: string }
   | { type: "bullet"; id: number; owner: string }
   | { type: "ground" }
-  | { type: "platform"; id: number };
+  | { type: "platform"; id: number }
+  | { type: "crate"; id: number }
+  | { type: "pickup"; id: number };
 
 type PlatformDef = (typeof PLATFORMS)[number];
 
 let world: planck.World;
 let playerBodies: Record<string, { torso: planck.Body; head: planck.Body }> = {};
 let platformBodies: Record<number, planck.Body> = {};
+let crateBodies: Record<number, planck.Body> = {};
+let pickupBodies: Record<number, planck.Body> = {};
 let bulletBodies: Record<number, planck.Body> = {};
 let bulletBounceCounts: Record<number, number> = {};
 let playerGrounded: Record<string, boolean> = {};
@@ -120,7 +338,25 @@ let playerJumpGrace: Record<string, number> = {};
 const pendingBulletDestroys = new Set<number>();
 const pendingHits: HitEvent[] = [];
 const pendingPlatformDamages: { id: number; damage: number; x: number; y: number }[] = [];
+const pendingCrateDamages: { id: number; damage: number; x: number; y: number }[] = [];
+const pendingExplosions: { x: number; y: number; radius: number; damage: number; owner: string }[] =
+  [];
+let currentG: ShooterState | null = null;
 const sharedWorldManifold = new planck.WorldManifold();
+
+function setCurrentG(G: ShooterState) {
+  currentG = G;
+}
+
+function seededRandom(seed: string, n: number): number {
+  let h = 2166136261;
+  const s = `${seed}:${n}`;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
+}
 
 function getFixtureData(fixture: planck.Fixture): FixtureUserData | null {
   return (fixture.getUserData() as FixtureUserData | null) ?? null;
@@ -129,18 +365,28 @@ function getFixtureData(fixture: planck.Fixture): FixtureUserData | null {
 function isSolidSurface(data: FixtureUserData | null, body: planck.Body) {
   if (data?.type === "ground") return true;
   if (data?.type === "platform") return true;
+  if (data?.type === "crate") return true;
   return body.getType() === "static" && data?.type !== "bullet";
 }
 
-function createPlatformBody(def: PlatformDef) {
-  const pBody = world.createBody({
-    position: planck.Vec2((def.x + def.w / 2) / SCALE, (def.y + def.h / 2) / SCALE),
-  });
-  pBody.createFixture(planck.Box(def.w / 2 / SCALE, def.h / 2 / SCALE), {
+function platformCenterMeters(plat: PlatformState) {
+  return planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE);
+}
+
+function createPlatformBody(plat: PlatformState) {
+  const pos = platformCenterMeters(plat);
+  const pBody =
+    plat.kind === "elevator"
+      ? world.createKinematicBody({ position: pos })
+      : world.createBody({ position: pos });
+  pBody.createFixture(planck.Box(plat.w / 2 / SCALE, plat.h / 2 / SCALE), {
     friction: 0.15,
-    userData: { type: "platform", id: def.id } satisfies FixtureUserData,
+    userData: { type: "platform", id: plat.id } satisfies FixtureUserData,
   });
-  platformBodies[def.id] = pBody;
+  platformBodies[plat.id] = pBody;
+  if (plat.kind === "elevator" && plat.vx) {
+    pBody.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
+  }
 }
 
 function initPlatforms(G: ShooterState) {
@@ -157,10 +403,163 @@ function initPlatforms(G: ShooterState) {
     health: PLATFORM_MAX_HEALTH,
     maxHealth: PLATFORM_MAX_HEALTH,
     broken: false,
+    kind: def.kind,
+    vx: def.kind === "elevator" ? def.vx : undefined,
+    minX: def.kind === "elevator" ? def.minX : undefined,
+    maxX: def.kind === "elevator" ? def.maxX : undefined,
   }));
-  for (const def of PLATFORMS) {
-    createPlatformBody(def);
+  for (const plat of G.platforms) {
+    createPlatformBody(plat);
   }
+}
+
+function destroyCrateBody(id: number) {
+  const body = crateBodies[id];
+  if (body) {
+    world.destroyBody(body);
+    delete crateBodies[id];
+  }
+}
+
+function destroyPickupBody(id: number) {
+  const body = pickupBodies[id];
+  if (body) {
+    world.destroyBody(body);
+    delete pickupBodies[id];
+  }
+}
+
+function createCrateBody(crate: CrateState) {
+  const body = world.createDynamicBody({
+    position: planck.Vec2((crate.x + crate.w / 2) / SCALE, (crate.y + crate.h / 2) / SCALE),
+    fixedRotation: true,
+  });
+  body.createFixture(planck.Box(crate.w / 2 / SCALE, crate.h / 2 / SCALE), {
+    density: 2.5,
+    friction: 0.4,
+    restitution: 0.05,
+    userData: { type: "crate", id: crate.id } satisfies FixtureUserData,
+  });
+  crateBodies[crate.id] = body;
+}
+
+function createPickupBody(pickup: PickupState) {
+  const body = world.createKinematicBody({
+    position: planck.Vec2(pickup.x / SCALE, pickup.y / SCALE),
+  });
+  body.createFixture(planck.Circle(PICKUP_RADIUS / SCALE), {
+    isSensor: true,
+    userData: { type: "pickup", id: pickup.id } satisfies FixtureUserData,
+  });
+  pickupBodies[pickup.id] = body;
+}
+
+function getElevators(G: ShooterState) {
+  return G.platforms.filter((p) => !p.broken && p.kind === "elevator");
+}
+
+function getRandomElevator(G: ShooterState, n: number): PlatformState | null {
+  const elevators = getElevators(G);
+  if (!elevators.length) return null;
+  const idx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 17 + n) * elevators.length);
+  return elevators[idx] ?? null;
+}
+
+function findFallTargetY(
+  G: ShooterState,
+  x: number,
+  fromY: number,
+  excludePlatId?: number,
+  floorOnly = false,
+) {
+  if (floorOnly) return FLOOR_PICKUP_Y;
+  let bestPlatY = FLOOR_Y;
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    if (excludePlatId != null && plat.id === excludePlatId) continue;
+    if (x < plat.x - 12 || x > plat.x + plat.w + 12) continue;
+    const surfaceY = plat.y - 20;
+    if (surfaceY <= fromY + 0.5) continue;
+    if (plat.y < bestPlatY) bestPlatY = plat.y;
+  }
+  return bestPlatY - 20;
+}
+
+function pickupGoalY(G: ShooterState, pickup: PickupState) {
+  if (pickup.fallToFloor) return FLOOR_PICKUP_Y;
+  return findFallTargetY(G, pickup.x, pickup.y + 0.5);
+}
+
+function pickupAffectedByPlatformBreak(pickup: PickupState, plat: PlatformState) {
+  if (pickup.onPlatformId === plat.id) return true;
+  const padX = 24;
+  if (pickup.x < plat.x - padX || pickup.x > plat.x + plat.w + padX) return false;
+  return pickup.y <= plat.y + 24;
+}
+
+function fixOrphanedPickups(G: ShooterState) {
+  for (const pickup of G.pickups) {
+    if (pickup.fallToFloor) continue;
+    if (pickup.y >= FLOOR_PICKUP_Y - 1) continue;
+    if (findPlatformIdUnderPickup(G, pickup)) continue;
+
+    if (pickup.onPlatformId != null) {
+      const plat = G.platforms.find((p) => p.id === pickup.onPlatformId);
+      if (!plat || plat.broken) {
+        pickup.onPlatformId = undefined;
+        pickup.fallToFloor = true;
+        pickup.targetY = undefined;
+      }
+    }
+  }
+}
+
+function pickupHasPlatformSupport(G: ShooterState, pickup: PickupState) {
+  if (pickup.fallToFloor) return false;
+  if (pickup.y >= FLOOR_PICKUP_Y - 1) {
+    pickup.y = FLOOR_PICKUP_Y;
+    pickup.targetY = undefined;
+    pickup.fallToFloor = false;
+    return true;
+  }
+  return findPlatformIdUnderPickup(G, pickup) !== undefined;
+}
+
+function findPlatformIdUnderPickup(G: ShooterState, pickup: PickupState) {
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    if (pickup.x < plat.x - 12 || pickup.x > plat.x + plat.w + 12) continue;
+    const surfaceY = plat.y - 20;
+    if (pickup.y >= surfaceY - 2 && pickup.y <= surfaceY + 6) return plat.id;
+  }
+  return undefined;
+}
+
+function settlePickupDrops(G: ShooterState) {
+  for (let i = 0; i < 180; i++) {
+    let moving = false;
+    for (const pickup of G.pickups) {
+      if (pickupHasPlatformSupport(G, pickup)) continue;
+      const goal = pickupGoalY(G, pickup);
+      if (pickup.y < goal - 0.5) {
+        moving = true;
+        break;
+      }
+    }
+    if (!moving) break;
+    updatePickupDrops(G);
+  }
+  updatePickupDrops(G);
+}
+
+function releasePickupsFromPlatform(G: ShooterState, platId: number, plat: PlatformState) {
+  for (const pickup of G.pickups) {
+    if (!pickupAffectedByPlatformBreak(pickup, plat)) continue;
+    pickup.onPlatformId = undefined;
+    pickup.targetY = undefined;
+    pickup.fallToFloor = true;
+  }
+  settlePickupDrops(G);
 }
 
 function breakPlatform(G: ShooterState, id: number) {
@@ -168,6 +567,7 @@ function breakPlatform(G: ShooterState, id: number) {
   if (!plat || plat.broken) return;
   plat.broken = true;
   plat.health = 0;
+  releasePickupsFromPlatform(G, id, plat);
   const body = platformBodies[id];
   if (body) {
     world.destroyBody(body);
@@ -191,6 +591,28 @@ function damagePlatform(G: ShooterState, id: number, damage: number, x: number, 
   }
 }
 
+function destroyCrate(G: ShooterState, id: number) {
+  destroyCrateBody(id);
+  const idx = G.crates.findIndex((c) => c.id === id);
+  if (idx >= 0) G.crates.splice(idx, 1);
+}
+
+function damageCrate(G: ShooterState, id: number, damage: number, x: number, y: number) {
+  const crate = G.crates.find((c) => c.id === id);
+  if (!crate) return;
+  crate.health = Math.max(0, crate.health - damage);
+  pendingHits.push({ x, y, targetId: "", damage: 0 });
+  if (crate.health <= 0) {
+    destroyCrate(G, id);
+  }
+}
+
+function removePickup(G: ShooterState, id: number) {
+  destroyPickupBody(id);
+  const idx = G.pickups.findIndex((p) => p.id === id);
+  if (idx >= 0) G.pickups.splice(idx, 1);
+}
+
 function destroyBullet(G: ShooterState, bulletId: number) {
   const body = bulletBodies[bulletId];
   if (body) {
@@ -208,14 +630,29 @@ function computeMuzzleMeters(
   aimAngle: number,
   facing: number,
   crouching: boolean,
+  weaponId: WeaponId = "winchester",
 ) {
+  const weapon = WEAPONS[weaponId];
   const drop = crouching ? STICK_CROUCH_DROP_PX : 0;
   const neckTop = torsoYpx - STICK_BODY_LEN_PX * 0.48 + drop * 0.2;
+
+  if (weaponId === "bazooka") {
+    const mountX = torsoXpx + facing * 3;
+    const mountY = neckTop + 6;
+    const tubeLen = weapon.barrelPx;
+    return {
+      x: (mountX + Math.cos(aimAngle) * tubeLen) / SCALE,
+      y: (mountY + Math.sin(aimAngle) * tubeLen) / SCALE,
+    };
+  }
+
   const shoulderX = torsoXpx + facing * 2.5;
   const shoulderY = neckTop + 2;
-  const handX = shoulderX + Math.cos(aimAngle) * STICK_ARM_LEN_PX;
-  const handY = shoulderY + Math.sin(aimAngle) * STICK_ARM_LEN_PX;
-  const muzzleDist = GUN_BARREL_PX + GUN_TIP_PX * 0.4;
+  const armReach =
+    weaponId === "grenade" ? STICK_ARM_LEN_PX * 0.72 : STICK_ARM_LEN_PX;
+  const handX = shoulderX + Math.cos(aimAngle) * armReach;
+  const handY = shoulderY + Math.sin(aimAngle) * armReach;
+  const muzzleDist = weapon.barrelPx + GUN_TIP_PX * 0.4;
   return {
     x: (handX + Math.cos(aimAngle) * muzzleDist) / SCALE,
     y: (handY + Math.sin(aimAngle) * muzzleDist) / SCALE,
@@ -284,7 +721,7 @@ function feetPositionMeters(torso: planck.Body) {
 function isStandableFixture(fixture: planck.Fixture, selfId: string) {
   const data = getFixtureData(fixture);
   const body = fixture.getBody();
-  if (data?.type === "bullet") return false;
+  if (data?.type === "bullet" || data?.type === "pickup") return false;
   if (data?.type === "player" || data?.type === "head") {
     if (data.id === selfId) return false;
     return playerBodies[data.id] != null;
@@ -296,6 +733,7 @@ function isFixtureGround(fixture: planck.Fixture) {
   const data = getFixtureData(fixture);
   const body = fixture.getBody();
   if (data?.type === "player" || data?.type === "head" || data?.type === "bullet") return false;
+  if (data?.type === "pickup") return false;
   return isSolidSurface(data, body);
 }
 
@@ -404,6 +842,99 @@ function raycastStaticGroundBelow(feetX: number, feetY: number, maxDist = 0.85):
   return hit.point;
 }
 
+function isEntityOnPlatform(
+  centerX: number,
+  feetY: number,
+  plat: PlatformState,
+  tolerance = 10,
+): boolean {
+  if (centerX < plat.x - 4 || centerX > plat.x + plat.w + 4) return false;
+  return Math.abs(feetY - plat.y) <= tolerance;
+}
+
+function isPlayerOnPlatform(playerId: string, plat: PlatformState): boolean {
+  const bodies = playerBodies[playerId];
+  if (!bodies || !measureGrounded(playerId, bodies.torso)) return false;
+  const feet = feetPositionMeters(bodies.torso);
+  return isEntityOnPlatform(feet.x * SCALE, feet.y * SCALE, plat);
+}
+
+function applyPlatformRiderDelta(G: ShooterState, plat: PlatformState, dx: number) {
+  if (dx === 0) return;
+  const dxM = dx / SCALE;
+
+  for (const [id, bodies] of Object.entries(playerBodies)) {
+    if (!isPlayerOnPlatform(id, plat)) continue;
+    const torso = bodies.torso;
+    const head = bodies.head;
+    const tPos = torso.getPosition();
+    const hPos = head.getPosition();
+    const vel = torso.getLinearVelocity();
+    torso.setTransform(planck.Vec2(tPos.x + dxM, tPos.y), 0);
+    head.setTransform(planck.Vec2(hPos.x + dxM, hPos.y), head.getAngle());
+    torso.setLinearVelocity(planck.Vec2(vel.x + (plat.vx ?? 0) / SCALE, vel.y));
+  }
+
+  for (const crate of G.crates) {
+    if (crate.onPlatformId !== plat.id) continue;
+    const body = crateBodies[crate.id];
+    if (!body) continue;
+    const pos = body.getPosition();
+    const vel = body.getLinearVelocity();
+    body.setTransform(planck.Vec2(pos.x + dxM, pos.y), 0);
+    body.setLinearVelocity(planck.Vec2(vel.x + (plat.vx ?? 0) / SCALE, vel.y));
+    crate.x += dx;
+  }
+
+  for (const pickup of G.pickups) {
+    if (pickup.onPlatformId !== plat.id) continue;
+    pickup.x += dx;
+    const body = pickupBodies[pickup.id];
+    if (body) {
+      body.setTransform(planck.Vec2(pickup.x / SCALE, pickup.y / SCALE), 0);
+    }
+  }
+}
+
+function advancePlatformMotion(G: ShooterState) {
+  const dt = 1 / 60;
+
+  for (const plat of G.platforms) {
+    if (plat.broken || plat.kind !== "elevator" || plat.vx == null) continue;
+
+    const prevX = plat.x;
+    let newX = plat.x + plat.vx * dt;
+
+    if (plat.minX != null && newX < plat.minX) {
+      newX = plat.minX;
+      plat.vx = Math.abs(plat.vx);
+    }
+    if (plat.maxX != null && newX > plat.maxX) {
+      newX = plat.maxX;
+      plat.vx = -Math.abs(plat.vx);
+    }
+
+    if (plat.ttlTicks != null) {
+      plat.ttlTicks -= 1;
+      if (plat.ttlTicks <= 0 || newX < -200 || newX > ARENA_W + 200) {
+        breakPlatform(G, plat.id);
+        continue;
+      }
+    }
+
+    const dx = newX - prevX;
+    plat.x = newX;
+
+    const body = platformBodies[plat.id];
+    if (body) {
+      body.setTransform(platformCenterMeters(plat), 0);
+      body.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
+    }
+
+    applyPlatformRiderDelta(G, plat, dx);
+  }
+}
+
 function snapPlayersToGround() {
   for (const [, bodies] of Object.entries(playerBodies)) {
     const torso = bodies.torso;
@@ -453,7 +984,7 @@ function applyVerticalJump(
 function isWallLikeContact(otherFixture: planck.Fixture, selfId: string) {
   const data = getFixtureData(otherFixture);
   const body = otherFixture.getBody();
-  if (data?.type === "bullet") return false;
+  if (data?.type === "bullet" || data?.type === "pickup") return false;
   if (data?.type === "player" || data?.type === "head") {
     if (data.id === selfId) return false;
     return playerBodies[data.id] != null;
@@ -570,6 +1101,484 @@ function syncStateFromPhysics(G: ShooterState) {
       b.body = { x: pos.x * SCALE, y: pos.y * SCALE, angle: body.getAngle() };
     }
   }
+
+  for (const crate of G.crates) {
+    const body = crateBodies[crate.id];
+    if (body) {
+      const pos = body.getPosition();
+      crate.x = pos.x * SCALE - crate.w / 2;
+      crate.y = pos.y * SCALE - crate.h / 2;
+    }
+  }
+}
+
+function queueExplosion(x: number, y: number, radius: number, damage: number, owner: string) {
+  pendingExplosions.push({ x, y, radius, damage, owner });
+}
+
+function processExplosions(G: ShooterState) {
+  for (const ex of pendingExplosions) {
+    pendingHits.push({ x: ex.x, y: ex.y, targetId: "", damage: 0 });
+
+    for (const [id, p] of Object.entries(G.players)) {
+      if (p.health <= 0 || !playerBodies[id]) continue;
+      const tPos = playerBodies[id].torso.getPosition();
+      const dx = tPos.x * SCALE - ex.x;
+      const dy = tPos.y * SCALE - ex.y;
+      if (Math.hypot(dx, dy) <= ex.radius) {
+        pendingHits.push({ x: ex.x, y: ex.y, targetId: id, damage: ex.damage });
+      }
+    }
+
+    for (const crate of [...G.crates]) {
+      const cx = crate.x + crate.w / 2;
+      const cy = crate.y + crate.h / 2;
+      if (Math.hypot(cx - ex.x, cy - ex.y) <= ex.radius) {
+        damageCrate(G, crate.id, ex.damage, ex.x, ex.y);
+      }
+    }
+  }
+  pendingExplosions.length = 0;
+}
+
+function getKatanaSwingOffsets(progress: number) {
+  if (progress < 0.25) {
+    const w = progress / 0.25;
+    return { aimOffset: -0.75 * w, armReach: -6 * w };
+  }
+  if (progress < 0.7) {
+    const s = (progress - 0.25) / 0.45;
+    return { aimOffset: -0.75 + 1.35 * s, armReach: -6 + 14 * s };
+  }
+  const r = (progress - 0.7) / 0.3;
+  return { aimOffset: 0.6 * (1 - r), armReach: 8 * (1 - r) };
+}
+
+function computeKatanaBladeSegment(
+  torsoX: number,
+  torsoY: number,
+  aimAngle: number,
+  facing: number,
+  swingProgress: number,
+) {
+  const drop = 0;
+  const neckTop = torsoY - STICK_BODY_LEN_PX * 0.48 + drop * 0.2;
+  const shoulderX = torsoX + facing * 2.5;
+  const shoulderY = neckTop + 2;
+  const swing = getKatanaSwingOffsets(swingProgress);
+  const aim = aimAngle + swing.aimOffset * facing;
+  const reach = STICK_ARM_LEN_PX + 4 + swing.armReach;
+  const handX = shoulderX + Math.cos(aim) * reach;
+  const handY = shoulderY + Math.sin(aim) * reach;
+  const barrel = WEAPONS.katana.barrelPx;
+  const tipLen = barrel + 10;
+  return {
+    x1: handX,
+    y1: handY,
+    x2: handX + Math.cos(aim) * tipLen,
+    y2: handY + Math.sin(aim) * tipLen,
+  };
+}
+
+function distPointToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 0.001) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + dx * t), py - (y1 + dy * t));
+}
+
+function resolveMeleeSwingHits(
+  G: ShooterState,
+  playerId: string,
+  aimAngle: number,
+  facing: number,
+  weapon: WeaponDef,
+) {
+  const bodies = playerBodies[playerId];
+  if (!bodies) return;
+
+  const hitIds: string[] = [];
+
+  for (const progress of KATANA_SWING_HIT_SAMPLES) {
+    const tPos = bodies.torso.getPosition();
+    const blade = computeKatanaBladeSegment(
+      tPos.x * SCALE,
+      tPos.y * SCALE,
+      aimAngle,
+      facing,
+      progress,
+    );
+
+    for (const [targetId, target] of Object.entries(G.players)) {
+      if (targetId === playerId || target.health <= 0 || !playerBodies[targetId]) continue;
+      if (hitIds.includes(targetId)) continue;
+
+      const targetBodies = playerBodies[targetId];
+      const torsoPos = targetBodies.torso.getPosition();
+      const headPos = targetBodies.head.getPosition();
+      const hitPoints: [number, number][] = [
+        [torsoPos.x * SCALE, torsoPos.y * SCALE],
+        [headPos.x * SCALE, headPos.y * SCALE],
+      ];
+
+      let hit = false;
+      for (const [tx, ty] of hitPoints) {
+        const dist = distPointToSegment(tx, ty, blade.x1, blade.y1, blade.x2, blade.y2);
+        if (dist <= KATANA_BLADE_HIT_RADIUS) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) continue;
+
+      hitIds.push(targetId);
+      pendingHits.push({
+        x: torsoPos.x * SCALE,
+        y: torsoPos.y * SCALE,
+        targetId,
+        damage: weapon.damage,
+      });
+    }
+  }
+}
+
+function spawnProjectile(
+  G: ShooterState,
+  owner: string,
+  weaponId: WeaponId,
+  weapon: WeaponDef,
+  startX: number,
+  startY: number,
+  shotAngle: number,
+) {
+  const bulletId = G.nextBulletId++;
+  const kind =
+    weapon.kind === "rocket"
+      ? "rocket"
+      : weapon.kind === "grenade"
+        ? "grenade"
+        : weapon.pelletCount && weapon.pelletCount > 1
+          ? "pellet"
+          : "bullet";
+
+  const bBody = world.createDynamicBody({
+    position: planck.Vec2(startX, startY),
+    bullet: true,
+    gravityScale: weapon.gravityScale ?? BULLET_GRAVITY_SCALE,
+  });
+
+  const radius =
+    kind === "rocket" ? 0.11 : kind === "grenade" ? 0.09 : kind === "pellet" ? 0.05 : 0.07;
+
+  bBody.createFixture(planck.Circle(radius), {
+    density: 5.0,
+    restitution: kind === "grenade" ? 0.45 : 0.55,
+    friction: 0.05,
+    userData: { type: "bullet", id: bulletId, owner } satisfies FixtureUserData,
+  });
+
+  const speed = weapon.speed || BULLET_SPEED;
+  bBody.setLinearVelocity(
+    planck.Vec2(Math.cos(shotAngle) * speed, Math.sin(shotAngle) * speed),
+  );
+
+  bulletBodies[bulletId] = bBody;
+
+  G.bullets.push({
+    id: bulletId,
+    owner,
+    body: { x: startX * SCALE, y: startY * SCALE, angle: shotAngle },
+    kind,
+    weaponId,
+    damage: weapon.damage,
+    aoeRadius: weapon.aoeRadius,
+    fuseTicks: weapon.fuseTicks,
+  });
+}
+
+function applyRecoil(
+  torso: planck.Body,
+  aimAngle: number,
+  onGround: boolean,
+  crouching: boolean,
+  weaponId: WeaponId,
+) {
+  const weapon = WEAPONS[weaponId];
+  const tVel = torso.getLinearVelocity();
+  const baseRecoil = (crouching ? weapon.recoilForce * 0.38 : weapon.recoilForce);
+  const sideways = Math.abs(Math.sin(aimAngle));
+  const groundedMul = onGround ? 1 + sideways * 1.15 : AIR_RECOIL_FORCE_MUL;
+  const recoilForce = baseRecoil * groundedMul;
+  const rx = -Math.cos(aimAngle) * recoilForce;
+  const ry = -Math.sin(aimAngle) * recoilForce;
+  const impulseMul = weapon.recoilImpulseMul ?? 1.4;
+  const velMul = weaponId === "bazooka" ? 0.58 : weaponId === "sniper" ? 0.42 : 0.32;
+  const velYMul = weaponId === "bazooka" ? 0.38 : 0.18;
+
+  if (onGround) {
+    torso.setLinearVelocity(planck.Vec2(tVel.x + rx * velMul, tVel.y + ry * velYMul));
+    torso.applyLinearImpulse(planck.Vec2(rx * impulseMul, ry * impulseMul), torso.getWorldCenter(), true);
+  } else {
+    torso.setLinearVelocity(
+      planck.Vec2(tVel.x + rx * AIR_RECOIL_VEL_MUL, tVel.y + ry * AIR_RECOIL_VEL_MUL),
+    );
+    torso.applyLinearImpulse(
+      planck.Vec2(rx * AIR_RECOIL_IMPULSE_MUL * (impulseMul * 0.55), ry * AIR_RECOIL_IMPULSE_MUL * (impulseMul * 0.55)),
+      torso.getWorldCenter(),
+      true,
+    );
+  }
+}
+
+function getPickupCollectY(pickup: PickupState) {
+  const body = pickupBodies[pickup.id];
+  if (!body) return pickup.y;
+  const bodyY = body.getPosition().y * SCALE;
+  return Math.max(pickup.y, bodyY);
+}
+
+function isFloorCollectiblePickup(pickup: PickupState, collectY: number, feetY: number) {
+  if (collectY >= FLOOR_PICKUP_Y - 4) return true;
+  if (!pickup.fallToFloor || feetY < FLOOR_Y - 28) return false;
+  return collectY >= FLOOR_PICKUP_Y - 72;
+}
+
+function defaultOwnedWeapons(): WeaponId[] {
+  return [START_WEAPON];
+}
+
+function playerOwnsWeapon(p: PlayerState, weaponId: WeaponId) {
+  return p.ownedWeapons.includes(weaponId);
+}
+
+function addOwnedWeapon(p: PlayerState, weaponId: WeaponId) {
+  if (!playerOwnsWeapon(p, weaponId)) {
+    p.ownedWeapons.push(weaponId);
+  }
+}
+
+function cycleOwnedWeapon(p: PlayerState) {
+  const owned = WEAPON_ORDER.filter((w) => playerOwnsWeapon(p, w));
+  if (owned.length <= 1) return;
+  const idx = owned.indexOf(p.currentWeapon);
+  p.currentWeapon = owned[(idx + 1) % owned.length] ?? p.currentWeapon;
+}
+
+function applyPickupToPlayer(G: ShooterState, playerId: string, pickup: PickupState) {
+  const p = G.players[playerId];
+  if (!p || p.health <= 0) return false;
+  if (!G.pickups.some((pu) => pu.id === pickup.id)) return false;
+
+  if (pickup.kind === "health") {
+    p.health = Math.min(MAX_HEALTH, p.health + HEALTH_PICKUP_AMOUNT);
+  } else if (pickup.kind === "weapon" && pickup.weaponId) {
+    addOwnedWeapon(p, pickup.weaponId);
+    p.currentWeapon = pickup.weaponId;
+  }
+
+  pendingHits.push({ x: pickup.x, y: pickup.y, targetId: "", damage: 0 });
+  removePickup(G, pickup.id);
+  return true;
+}
+
+function canPlayerCollectPickup(
+  px: number,
+  py: number,
+  headX: number,
+  headY: number,
+  feetY: number,
+  pickup: PickupState,
+) {
+  const collectY = getPickupCollectY(pickup);
+  const playerHalfW = PLAYER_HALF_W * SCALE;
+  const hPad = PICKUP_RADIUS + playerHalfW + 16;
+  const nearX =
+    Math.abs(pickup.x - px) <= hPad ||
+    Math.abs(pickup.x - headX) <= hPad ||
+    Math.abs(pickup.x - (px + headX) * 0.5) <= hPad;
+  if (!nearX) return false;
+
+  if (isFloorCollectiblePickup(pickup, collectY, feetY)) return true;
+
+  const pTop = headY - HEAD_RADIUS * SCALE - 8;
+  const pBottom = feetY + 10;
+  const kTop = collectY - PICKUP_RADIUS - 8;
+  const kBottom = collectY + PICKUP_RADIUS + 8;
+  if (pTop <= kBottom && pBottom >= kTop) return true;
+
+  return Math.hypot(pickup.x - px, collectY - py) <= PICKUP_RADIUS + 34;
+}
+
+function pickupBodyOverlapsPlayer(bodies: { torso: planck.Body; head: planck.Body }, pickupId: number) {
+  const pickBody = pickupBodies[pickupId];
+  if (!pickBody) return false;
+
+  const pickFixture = pickBody.getFixtureList();
+  if (!pickFixture) return false;
+
+  for (const part of [bodies.torso, bodies.head]) {
+    for (let fixture = part.getFixtureList(); fixture; fixture = fixture.getNext()) {
+      if (
+        planck.testOverlap(
+          fixture.getShape(),
+          0,
+          pickFixture.getShape(),
+          0,
+          fixture.getBody().getTransform(),
+          pickBody.getTransform(),
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function collectPickupsForPlayers(G: ShooterState) {
+  for (const [playerId, bodies] of Object.entries(playerBodies)) {
+    const p = G.players[playerId];
+    if (!p || p.health <= 0) continue;
+    const tPos = bodies.torso.getPosition();
+    const hPos = bodies.head.getPosition();
+    const px = tPos.x * SCALE;
+    const py = tPos.y * SCALE;
+    const headX = hPos.x * SCALE;
+    const headY = hPos.y * SCALE;
+    const feetY = py + FEET_PIXELS;
+
+    for (const pickup of [...G.pickups]) {
+      const overlaps =
+        canPlayerCollectPickup(px, py, headX, headY, feetY, pickup) ||
+        pickupBodyOverlapsPlayer(bodies, pickup.id);
+      if (!overlaps) continue;
+      applyPickupToPlayer(G, playerId, pickup);
+    }
+  }
+}
+
+function handleContactPickupCollection(G: ShooterState, contact: planck.Contact) {
+  const fixtureA = contact.getFixtureA();
+  const fixtureB = contact.getFixtureB();
+  const dataA = getFixtureData(fixtureA);
+  const dataB = getFixtureData(fixtureB);
+
+  const pickupData =
+    dataA?.type === "pickup" ? dataA : dataB?.type === "pickup" ? dataB : null;
+  if (!pickupData) return;
+
+  const otherData = pickupData === dataA ? dataB : dataA;
+  if (otherData?.type !== "player" && otherData?.type !== "head") return;
+
+  const pickup = G.pickups.find((p) => p.id === pickupData.id);
+  if (!pickup) return;
+
+  applyPickupToPlayer(G, otherData.id, pickup);
+}
+
+function updatePickupDrops(G: ShooterState) {
+  for (const pickup of G.pickups) {
+    if (pickupHasPlatformSupport(G, pickup)) {
+      pickup.targetY = undefined;
+      pickup.onPlatformId = findPlatformIdUnderPickup(G, pickup);
+      const body = pickupBodies[pickup.id];
+      if (body) {
+        body.setTransform(planck.Vec2(pickup.x / SCALE, pickup.y / SCALE), 0);
+      }
+      continue;
+    }
+
+    pickup.onPlatformId = undefined;
+    const goal = pickupGoalY(G, pickup);
+
+    if (pickup.y < goal - 0.5) {
+      pickup.y = Math.min(goal, pickup.y + PICKUP_FALL_SPEED);
+      pickup.targetY = goal;
+    } else {
+      pickup.y = goal;
+      pickup.targetY = undefined;
+      if (pickup.fallToFloor && goal >= FLOOR_PICKUP_Y - 1) {
+        pickup.fallToFloor = false;
+      }
+      const platId = findPlatformIdUnderPickup(G, pickup);
+      if (platId != null) pickup.onPlatformId = platId;
+    }
+
+    const body = pickupBodies[pickup.id];
+    if (body) {
+      body.setTransform(planck.Vec2(pickup.x / SCALE, pickup.y / SCALE), 0);
+    }
+  }
+}
+
+function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, n: number) {
+  const id = G.nextPickupId++;
+  const roll = seededRandom(G.matchSeed, G.spawnTick * 31 + n);
+  const kind: PickupState["kind"] = roll < 0.5 ? "health" : "weapon";
+  const targetY = plat.y - 20;
+  const pickup: PickupState = {
+    id,
+    kind,
+    x: plat.x + plat.w / 2,
+    y: kind === "weapon" ? plat.y - 58 : targetY,
+    onPlatformId: plat.id,
+  };
+  if (kind === "weapon") {
+    const wIdx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 37 + n) * WEAPON_ORDER.length);
+    pickup.weaponId = WEAPON_ORDER[wIdx] ?? "winchester";
+  }
+  G.pickups.push(pickup);
+  createPickupBody(pickup);
+}
+
+function spawnIncomingElevator(G: ShooterState, n: number) {
+  const fromLeft = seededRandom(G.matchSeed, G.spawnTick * 41 + n) < 0.5;
+  const yChoices = [158, 273, 388];
+  const yIdx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 43 + n) * yChoices.length);
+  const y = yChoices[yIdx] ?? 273;
+  const id = G.nextPlatformId++;
+  const w = 100;
+  const x = fromLeft ? -140 : ARENA_W + 40;
+  const vx = fromLeft ? 27 : -27;
+
+  const plat: PlatformState = {
+    id,
+    x,
+    y,
+    w,
+    h: 12,
+    health: PLATFORM_MAX_HEALTH,
+    maxHealth: PLATFORM_MAX_HEALTH,
+    broken: false,
+    kind: "elevator",
+    vx,
+    minX: fromLeft ? -160 : ARENA_W - 260,
+    maxX: fromLeft ? ARENA_W - 260 : ARENA_W + 160,
+    ttlTicks: ELEVATOR_TTL_TICKS,
+  };
+
+  G.platforms.push(plat);
+  createPlatformBody(plat);
+}
+
+function runSpawnCycle(G: ShooterState) {
+  G.spawnTick += 1;
+  if (G.spawnTick % SPAWN_INTERVAL_TICKS !== 0) return;
+
+  const n = G.spawnTick;
+  spawnIncomingElevator(G, n);
+
+  const elev = getRandomElevator(G, n);
+  if (elev) {
+    spawnPickupOnPlatform(G, elev, n);
+    if (seededRandom(G.matchSeed, n * 53) > 0.4) {
+      const elev2 = getRandomElevator(G, n + 7);
+      if (elev2) spawnPickupOnPlatform(G, elev2, n + 1);
+    }
+  }
 }
 
 function processPendingHits(G: ShooterState) {
@@ -601,39 +1610,103 @@ function processPendingHits(G: ShooterState) {
   }
   pendingPlatformDamages.length = 0;
 
+  for (const hit of pendingCrateDamages) {
+    damageCrate(G, hit.id, hit.damage, hit.x, hit.y);
+  }
+  pendingCrateDamages.length = 0;
+
   for (const bulletId of pendingBulletDestroys) {
     destroyBullet(G, bulletId);
   }
   pendingBulletDestroys.clear();
 }
 
-function handleContact(contact: planck.Contact) {
+function handleProjectileImpacts(G: ShooterState) {
+  for (const b of [...G.bullets]) {
+    const body = bulletBodies[b.id];
+    if (!body) continue;
+
+    if (b.kind === "rocket" || b.kind === "grenade") {
+      for (let edge = body.getContactList(); edge; edge = edge.next) {
+        const edgeContact = edge.contact;
+        if (!edgeContact.isTouching()) continue;
+        const fixtureA = edgeContact.getFixtureA();
+        const fixtureB = edgeContact.getFixtureB();
+        const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
+        const otherData = getFixtureData(otherFixture);
+        if (
+          otherData?.type === "player" ||
+          otherData?.type === "head" ||
+          otherData?.type === "platform" ||
+          otherData?.type === "crate" ||
+          otherData?.type === "ground"
+        ) {
+          const pos = body.getPosition();
+          queueExplosion(
+            pos.x * SCALE,
+            pos.y * SCALE,
+            b.aoeRadius ?? 70,
+            b.damage,
+            b.owner,
+          );
+          pendingBulletDestroys.add(b.id);
+          break;
+        }
+      }
+    }
+
+    if (b.fuseTicks != null) {
+      b.fuseTicks -= 1;
+      if (b.fuseTicks <= 0) {
+        const pos = body.getPosition();
+        queueExplosion(pos.x * SCALE, pos.y * SCALE, b.aoeRadius ?? 70, b.damage, b.owner);
+        pendingBulletDestroys.add(b.id);
+      }
+    }
+  }
+}
+
+function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact) {
   const fixtureA = contact.getFixtureA();
   const fixtureB = contact.getFixtureB();
   const dataA = getFixtureData(fixtureA);
   const dataB = getFixtureData(fixtureB);
-  const bodyA = fixtureA.getBody();
-  const bodyB = fixtureB.getBody();
 
   const bulletData =
     dataA?.type === "bullet" ? dataA : dataB?.type === "bullet" ? dataB : null;
   if (!bulletData) return;
   if (pendingBulletDestroys.has(bulletData.id)) return;
 
+  const bullet = G.bullets.find((b) => b.id === bulletData.id);
+  const bulletDamage = bullet?.damage ?? BULLET_DAMAGE;
+  const bulletKind = bullet?.kind ?? "bullet";
+  const aoeRadius = bullet?.aoeRadius;
+  const owner = bullet?.owner ?? bulletData.owner;
+
   const otherData = bulletData === dataA ? dataB : dataA;
-  const otherBody = bulletData === dataA ? bodyB : bodyA;
-  const bulletBody = bulletData === dataA ? bodyA : bodyB;
+  const bulletBody = bulletData === dataA ? fixtureA.getBody() : fixtureB.getBody();
   const bulletPos = bulletBody.getPosition();
 
   if (otherData?.type === "player" || otherData?.type === "head") {
-    if (otherData.id === bulletData.owner) return;
+    if (otherData.id === owner) return;
     if (!playerBodies[otherData.id]) return;
     pendingBulletDestroys.add(bulletData.id);
     pendingHits.push({
       x: bulletPos.x * SCALE,
       y: bulletPos.y * SCALE,
       targetId: otherData.id,
-      damage: BULLET_DAMAGE,
+      damage: bulletDamage,
+    });
+    return;
+  }
+
+  if (otherData?.type === "crate") {
+    pendingBulletDestroys.add(bulletData.id);
+    pendingCrateDamages.push({
+      id: otherData.id,
+      damage: bulletDamage,
+      x: bulletPos.x * SCALE,
+      y: bulletPos.y * SCALE,
     });
     return;
   }
@@ -642,7 +1715,7 @@ function handleContact(contact: planck.Contact) {
     pendingBulletDestroys.add(bulletData.id);
     pendingPlatformDamages.push({
       id: otherData.id,
-      damage: BULLET_DAMAGE,
+      damage: bulletDamage,
       x: bulletPos.x * SCALE,
       y: bulletPos.y * SCALE,
     });
@@ -650,6 +1723,12 @@ function handleContact(contact: planck.Contact) {
   }
 
   if (otherData?.type === "ground") {
+    if (bulletKind === "rocket" || bulletKind === "grenade") {
+      queueExplosion(bulletPos.x * SCALE, bulletPos.y * SCALE, aoeRadius ?? 70, bulletDamage, owner);
+      pendingBulletDestroys.add(bulletData.id);
+      return;
+    }
+
     const bounces = bulletBounceCounts[bulletData.id] ?? 0;
     pendingHits.push({
       x: bulletPos.x * SCALE,
@@ -687,13 +1766,24 @@ function handleContact(contact: planck.Contact) {
 }
 
 function advanceWorld(G: ShooterState) {
+  setCurrentG(G);
   G.hitEvents = [];
+  G.worldTick += 1;
+  runSpawnCycle(G);
+  advancePlatformMotion(G);
+  updatePickupDrops(G);
   world.step(1 / 60);
   updatePlayerGroundedState();
   updatePlayerWallContacts();
   resolvePlayerSideStick();
   snapPlayersToGround();
+  handleProjectileImpacts(G);
+  processExplosions(G);
   processPendingHits(G);
+  fixOrphanedPickups(G);
+  updatePickupDrops(G);
+  updatePickupDrops(G);
+  collectPickupsForPlayers(G);
 
   for (let i = G.bullets.length - 1; i >= 0; i--) {
     const b = G.bullets[i];
@@ -715,15 +1805,23 @@ function advanceWorld(G: ShooterState) {
 }
 
 function resetRound(G: ShooterState) {
-  for (const [id, b] of Object.entries(playerBodies)) {
+  for (const [, b] of Object.entries(playerBodies)) {
     world.destroyBody(b.torso);
     world.destroyBody(b.head);
   }
   for (const b of Object.values(bulletBodies)) {
     world.destroyBody(b);
   }
+  for (const b of Object.values(crateBodies)) {
+    world.destroyBody(b);
+  }
+  for (const b of Object.values(pickupBodies)) {
+    world.destroyBody(b);
+  }
   playerBodies = {};
   platformBodies = {};
+  crateBodies = {};
+  pickupBodies = {};
   bulletBodies = {};
   bulletBounceCounts = {};
   playerGrounded = {};
@@ -731,7 +1829,11 @@ function resetRound(G: ShooterState) {
   playerWallContact = {};
   playerJumpGrace = {};
   G.bullets = [];
+  G.crates = [];
+  G.pickups = [];
   G.hitEvents = [];
+  G.spawnTick = 0;
+  G.worldTick = 0;
   initPlatforms(G);
 
   const spawns = [
@@ -746,10 +1848,74 @@ function resetRound(G: ShooterState) {
     const spawn = spawns[index % spawns.length];
     p.health = MAX_HEALTH;
     p.crouching = false;
+    p.currentWeapon = START_WEAPON;
+    p.ownedWeapons = defaultOwnedWeapons();
+    p.lastFireTick = 0;
     createPlayerPhysics(id, spawn.x, spawn.y);
     index++;
   }
   syncStateFromPhysics(G);
+}
+
+function countActiveProjectiles(G: ShooterState, owner: string, weaponId: WeaponId) {
+  return G.bullets.filter((b) => b.owner === owner && b.weaponId === weaponId).length;
+}
+
+function fireWeapon(G: ShooterState, playerId: string, aimAngle: number, facing: number) {
+  const p = G.players[playerId];
+  const bodies = playerBodies[playerId];
+  if (!p || !bodies || p.health <= 0) return false;
+
+  const weaponId = p.currentWeapon;
+  const weapon = WEAPONS[weaponId];
+  if (!weapon) return false;
+
+  if (p.lastFireTick > 0 && G.worldTick - p.lastFireTick < weapon.fireRateTicks) return false;
+
+  if (weapon.kind === "melee") {
+    const torso = bodies.torso;
+    const onGround = isPlayerGrounded(playerId, torso);
+    applyRecoil(torso, aimAngle, onGround, p.crouching, weaponId);
+    resolveMeleeSwingHits(G, playerId, aimAngle, facing, weapon);
+    p.lastFireTick = G.worldTick;
+    return true;
+  }
+
+  const pellets = weapon.pelletCount ?? 1;
+  const activeCount = G.bullets.filter((b) => b.owner === playerId).length;
+  if (activeCount + pellets > weapon.maxActive) {
+    if (activeCount >= weapon.maxActive) return false;
+  }
+
+  const weaponActive = countActiveProjectiles(G, playerId, weaponId);
+  if (weaponActive >= weapon.maxActive) return false;
+
+  const torso = bodies.torso;
+  const tPos = torso.getPosition();
+  const onGround = isPlayerGrounded(playerId, torso);
+  applyRecoil(torso, aimAngle, onGround, p.crouching, weaponId);
+
+  const muzzle = computeMuzzleMeters(
+    tPos.x * SCALE,
+    tPos.y * SCALE,
+    aimAngle,
+    facing,
+    p.crouching,
+    weaponId,
+  );
+
+  const spawnPad = 0.38;
+  for (let i = 0; i < pellets; i++) {
+    if (G.bullets.filter((b) => b.owner === playerId).length >= weapon.maxActive) break;
+    const spread = (Math.random() - 0.5) * weapon.spread * 2;
+    const shotAngle = aimAngle + spread;
+    const startX = muzzle.x + Math.cos(shotAngle) * spawnPad;
+    const startY = muzzle.y + Math.sin(shotAngle) * spawnPad;
+    spawnProjectile(G, playerId, weaponId, weapon, startX, startY, shotAngle);
+  }
+
+  p.lastFireTick = G.worldTick;
+  return true;
 }
 
 export default defineGame<ShooterState>({
@@ -761,10 +1927,14 @@ export default defineGame<ShooterState>({
   minPlayers: 2,
   maxPlayers: 4,
 
+  initialActive: (G) => Object.keys(G.players),
+
   setup: (ctx) => {
     world = planck.World({ gravity: planck.Vec2(0, GRAVITY) });
     playerBodies = {};
     platformBodies = {};
+    crateBodies = {};
+    pickupBodies = {};
     bulletBodies = {};
     bulletBounceCounts = {};
     playerGrounded = {};
@@ -773,9 +1943,15 @@ export default defineGame<ShooterState>({
     playerJumpGrace = {};
     pendingHits.length = 0;
     pendingPlatformDamages.length = 0;
+    pendingCrateDamages.length = 0;
+    pendingExplosions.length = 0;
     pendingBulletDestroys.clear();
 
-    world.on("begin-contact", handleContact);
+    world.on("begin-contact", (contact) => {
+      if (!currentG) return;
+      handleContactPickupCollection(currentG, contact);
+      handleContactWithBulletDamage(currentG, contact);
+    });
 
     const ground = world.createBody();
     ground.createFixture(
@@ -814,6 +1990,9 @@ export default defineGame<ShooterState>({
         aimAngle: 0,
         facing: 1,
         crouching: false,
+        currentWeapon: START_WEAPON,
+        ownedWeapons: defaultOwnedWeapons(),
+        lastFireTick: 0,
         torso: { x: spawn.x, y: spawn.y, angle: 0 },
         head: { x: spawn.x, y: spawn.y - HEAD_OFFSET, angle: 0 },
       };
@@ -824,17 +2003,27 @@ export default defineGame<ShooterState>({
       players,
       bullets: [],
       platforms: [],
+      crates: [],
+      pickups: [],
       nextBulletId: 1,
+      nextPlatformId: 100,
+      nextCrateId: 1,
+      nextPickupId: 1,
+      spawnTick: 0,
+      worldTick: 0,
+      matchSeed: ctx.players.slice().sort().join("|"),
       scores: {},
       hitEvents: [],
     };
     initPlatforms(G);
     syncStateFromPhysics(G);
+    setCurrentG(G);
     return G;
   },
 
   moves: {
     move: (G, payload, ctx) => {
+      setCurrentG(G);
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
 
@@ -885,95 +2074,46 @@ export default defineGame<ShooterState>({
 
       advanceWorld(G);
     },
-    shoot: (G, payload, ctx) => {
+    switchWeapon: (G, payload, ctx) => {
+      setCurrentG(G);
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
 
-      const activeCount = G.bullets.filter((b) => b.owner === ctx.playerId).length;
-      if (activeCount >= MAX_BULLETS_PER_PLAYER) return INVALID_MOVE;
+      const data = payload as { weaponId?: WeaponId; cycle?: boolean };
+      if (data.cycle) {
+        if (p.ownedWeapons.length <= 1) return INVALID_MOVE;
+        cycleOwnedWeapon(p);
+      } else if (data.weaponId && WEAPONS[data.weaponId]) {
+        if (!playerOwnsWeapon(p, data.weaponId)) return INVALID_MOVE;
+        p.currentWeapon = data.weaponId;
+      } else {
+        return INVALID_MOVE;
+      }
+
+      advanceWorld(G);
+    },
+    shoot: (G, payload, ctx) => {
+      setCurrentG(G);
+      const p = G.players[ctx.playerId];
+      if (!p || p.health <= 0) return INVALID_MOVE;
 
       const data = payload as { aimAngle?: number; facing?: number };
       const aimAngle = typeof data?.aimAngle === "number" ? data.aimAngle : p.aimAngle;
       p.aimAngle = aimAngle;
-      if (typeof data?.facing === "number") {
-        p.facing = data.facing >= 0 ? 1 : -1;
-      }
+      const facing =
+        typeof data?.facing === "number"
+          ? data.facing >= 0
+            ? 1
+            : -1
+          : p.facing ?? (Math.cos(aimAngle) >= 0 ? 1 : -1);
+      p.facing = facing;
 
-      const bodies = playerBodies[ctx.playerId];
-      if (!bodies) return INVALID_MOVE;
-
-      const torso = bodies.torso;
-      const tPos = torso.getPosition();
-      const tVel = torso.getLinearVelocity();
-      const onGround = isPlayerGrounded(ctx.playerId, torso);
-      const facing = p.facing ?? (Math.cos(aimAngle) >= 0 ? 1 : -1);
-      const muzzle = computeMuzzleMeters(
-        tPos.x * SCALE,
-        tPos.y * SCALE,
-        aimAngle,
-        facing,
-        p.crouching,
-      );
-
-      const baseRecoil = p.crouching ? 12 : 36;
-      const sideways = Math.abs(Math.sin(aimAngle));
-      const groundedMul = onGround ? 1 + sideways * 1.15 : AIR_RECOIL_FORCE_MUL;
-      const recoilForce = baseRecoil * groundedMul;
-      const rx = -Math.cos(aimAngle) * recoilForce;
-      const ry = -Math.sin(aimAngle) * recoilForce;
-
-      if (onGround) {
-        torso.setLinearVelocity(
-          planck.Vec2(tVel.x + rx * 0.32, tVel.y + ry * 0.18),
-        );
-        torso.applyLinearImpulse(planck.Vec2(rx * 1.4, ry * 1.4), torso.getWorldCenter(), true);
-      } else {
-        torso.setLinearVelocity(
-          planck.Vec2(tVel.x + rx * AIR_RECOIL_VEL_MUL, tVel.y + ry * AIR_RECOIL_VEL_MUL),
-        );
-        torso.applyLinearImpulse(
-          planck.Vec2(rx * AIR_RECOIL_IMPULSE_MUL, ry * AIR_RECOIL_IMPULSE_MUL),
-          torso.getWorldCenter(),
-          true,
-        );
-      }
-
-      const bulletId = G.nextBulletId++;
-      const spawnPad = 0.38;
-      const startX = muzzle.x + Math.cos(aimAngle) * spawnPad;
-      const startY = muzzle.y + Math.sin(aimAngle) * spawnPad;
-
-      const bBody = world.createDynamicBody({
-        position: planck.Vec2(startX, startY),
-        bullet: true,
-        gravityScale: BULLET_GRAVITY_SCALE,
-      });
-      bBody.createFixture(planck.Circle(0.07), {
-        density: 5.0,
-        restitution: 0.55,
-        friction: 0.05,
-        userData: { type: "bullet", id: bulletId, owner: ctx.playerId } satisfies FixtureUserData,
-      });
-
-      const bulletSpeed = BULLET_SPEED;
-      const spread = (Math.random() - 0.5) * 0.04;
-      const shotAngle = aimAngle + spread;
-      bBody.setLinearVelocity(
-        planck.Vec2(Math.cos(shotAngle) * bulletSpeed, Math.sin(shotAngle) * bulletSpeed),
-      );
-
-      bulletBodies[bulletId] = bBody;
-
-      G.bullets.push({
-        id: bulletId,
-        owner: ctx.playerId,
-        body: { x: startX * SCALE, y: startY * SCALE, angle: aimAngle },
-      });
+      if (!fireWeapon(G, ctx.playerId, aimAngle, facing)) return INVALID_MOVE;
 
       advanceWorld(G);
     },
   },
-  enumerate: (G, playerId, flow) => {
+  enumerate: (G, playerId) => {
     const p = G.players[playerId];
     if (!p || p.health <= 0) return [];
     return [
@@ -982,6 +2122,20 @@ export default defineGame<ShooterState>({
       { type: "move", payload: { action: "jump", aimAngle: p.aimAngle, crouching: p.crouching } as any },
       { type: "move", payload: { action: "crouch", aimAngle: p.aimAngle, crouching: true } as any },
       { type: "shoot", payload: { aimAngle: p.aimAngle } as any },
+      ...(p.ownedWeapons.length > 1
+        ? [{ type: "switchWeapon" as const, payload: { cycle: true } as any }]
+        : []),
+      ...p.ownedWeapons
+        .filter((weaponId) => weaponId !== p.currentWeapon)
+        .map((weaponId) => ({
+          type: "switchWeapon" as const,
+          payload: { weaponId } as any,
+        })),
     ];
   },
 });
+
+export const testUtils = {
+  breakPlatform: (G: ShooterState, id: number) => breakPlatform(G, id),
+  createPickupBody: (pickup: PickupState) => createPickupBody(pickup),
+};

@@ -14,7 +14,7 @@
     "board": "custom"
   },
   "scripts": {
-    "build:ui": "esbuild src/ui.js --bundle --outfile=dist/ui.bundle.js && node build-ui.cjs",
+    "build:ui": "node scripts/embed-sfx.mjs && esbuild src/ui.js --bundle --outfile=dist/ui.bundle.js && node build-ui.cjs",
     "dev": "node scripts/dev.mjs",
     "build": "bordiko build",
     "publish:game": "bordiko publish",
