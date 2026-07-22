@@ -1023,7 +1023,7 @@ let prevMatchEnded = false;
 const bordikoHost = connectBordiko();
 const hostMove = bordikoHost.move.bind(bordikoHost);
 bordikoHost.move = (type, payload) => {
-    console.log("[stickman-brawler] -> host move", type, payload);
+    console.log("[stickman-shooter] -> host move", type, payload);
     hostMove(type, payload);
 };
 
@@ -1034,7 +1034,7 @@ const signalHostReady = () => {
     try {
         window.parent.postMessage({ t: "bordiko:ready" }, "*");
     } catch (err) {
-        console.warn("[stickman-brawler] bordiko:ready postMessage failed", err);
+        console.warn("[stickman-shooter] bordiko:ready postMessage failed", err);
     }
 };
 
@@ -1056,7 +1056,7 @@ window.addEventListener(
     (event) => {
         const msg = event.data;
         if (msg && msg.t === "bordiko:state" && msg.state) {
-            console.log("[stickman-brawler] <- host raw state", {
+            console.log("[stickman-shooter] <- host raw state", {
                 moveCount: msg.state.moveCount,
                 playerId: msg.state.playerId,
             });
@@ -1168,7 +1168,7 @@ let prevPickupIds = new Set();
 // Network Sync
 const handleGameState = (state) => {
         hostStateCount += 1;
-        console.log("[stickman-brawler] onGameState", {
+        console.log("[stickman-shooter] onGameState", {
             n: hostStateCount,
             moveCount: state?.moveCount,
             playerId: state?.playerId,
@@ -2962,7 +2962,7 @@ const installBordikoGlobals = () => {
     root.onUpdate = handleGameState;
     root.render = () => {};
     root.bordikoReady = signalHostReady;
-    root.__stickmanBrawlerUI = { version: "0.1.7-bridge" };
+    root.__stickmanShooterUI = { version: "0.1.7-bridge" };
 };
 
 installBordikoGlobals();

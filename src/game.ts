@@ -2118,9 +2118,9 @@ function fireWeapon(
 }
 
 export default defineGame<ShooterState>({
-  name: "stickman-brawler",
+  name: "stickman-shooter",
   meta: {
-    displayName: "Stickman Brawler",
+    displayName: "Stickman Shooter",
     categories: ["action"],
   },
   minPlayers: 2,
@@ -2135,10 +2135,26 @@ export default defineGame<ShooterState>({
   initialActive: (G) => Object.keys(G.players),
 
   // @ts-ignore
-  tick: (G: ShooterState, dt: number, ctx: TickContext) => {
-    console.log("REALTIME TICK IS RUNNING", { dt, worldTick: G.worldTick });
+  tick: (G: ShooterState, dt: number | undefined, ctx: TickContext) => {
+    // 1. Safe logging (WASM safe, string only)
+    console.log("REALTIME TICK IS RUNNING. worldTick: " + G.worldTick);
+
+    // Safety check for physics world in case of stateless backend
+    if (!world) {
+      console.log("CRITICAL ERROR: Physics world is undefined!");
+      return;
+    }
+
     setCurrentG(G);
-    const steps = Math.round(dt / (1000 / PHYSICS_HZ));
+
+    // 2. Bulletproof delta time logic
+    let deltaMs = typeof dt === "number" ? dt : 1000 / 30;
+    if (deltaMs < 1) deltaMs *= 1000; // Convert seconds to ms if needed
+
+    // 3. Guarantee at least 1 step, and cap at 5 to prevent infinite loops
+    let steps = Math.round(deltaMs / (1000 / PHYSICS_HZ));
+    if (isNaN(steps) || steps < 1) steps = 1;
+    if (steps > 5) steps = 5;
 
     for (let i = 0; i < steps; i++) {
       if (G.roundPhase === "intermission") {

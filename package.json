@@ -1,11 +1,11 @@
 {
   "name": "my-shooter-game",
-  "version": "0.1.13",
+  "version": "0.1.15",
   "type": "module",
   "private": true,
   "bordiko": {
-    "gameId": "stickman-brawler",
-    "displayName": "Stickman Brawler",
+    "gameId": "stickman-shooter",
+    "displayName": "Stickman Shooter",
     "minPlayers": 2,
     "maxPlayers": 4,
     "realtime": {
