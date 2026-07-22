@@ -2126,8 +2126,15 @@ export default defineGame<ShooterState>({
   minPlayers: 2,
   maxPlayers: 4,
 
+  // @ts-ignore - Force real-time mode for the production build
+  realtime: {
+    tick: true,
+    tickRate: 30,
+  },
+
   initialActive: (G) => Object.keys(G.players),
 
+  // @ts-ignore
   tick: (G: ShooterState, dt: number, ctx: TickContext) => {
     console.log("REALTIME TICK IS RUNNING", { dt, worldTick: G.worldTick });
     setCurrentG(G);
