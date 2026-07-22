@@ -1,5 +1,6 @@
-import { defineGame, INVALID_MOVE } from "@bordiko/sdk";
+import { defineGame, INVALID_MOVE, type GameResult, type Json } from "@bordiko/sdk";
 import * as planck from "planck";
+import { ARENA_H, ARENA_W, getMap, getNextMapId, type MapId } from "./maps.ts";
 
 export type WeaponId =
   | "auto"
@@ -138,6 +139,14 @@ export interface BodyState {
   angle: number;
 }
 
+export type GameMode = "ffa" | "teams2v2";
+export type RoundPhase = "playing" | "intermission";
+export type TeamId = 0 | 1;
+
+export interface GameConfig {
+  mode?: GameMode;
+}
+
 export interface PlayerState {
   health: number;
   aimAngle: number;
@@ -148,6 +157,7 @@ export interface PlayerState {
   lastFireTick: number;
   torso: BodyState;
   head: BodyState;
+  team?: TeamId;
 }
 
 export interface BulletState {
@@ -221,10 +231,17 @@ export interface ShooterState {
   matchSeed: string;
   scores: Record<string, number>;
   hitEvents: HitEvent[];
+  gameMode: GameMode;
+  teams: Record<string, TeamId>;
+  currentMapId: MapId;
+  currentRound: number;
+  roundPhase: RoundPhase;
+  intermissionTicksLeft: number;
+  lastRoundWinner: string | null;
 }
 
-const ARENA_W = 912;
-const ARENA_H = 500;
+export const ROUNDS_TO_WIN = 3;
+const INTERMISSION_TICKS = 120;
 const FLOOR_Y = ARENA_H;
 const FLOOR_PICKUP_Y = FLOOR_Y - 20;
 const PICKUP_FALL_SPEED = 8;
@@ -272,45 +289,6 @@ const STICK_CROUCH_DROP_PX = 18;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
 
-const PLATFORMS = [
-  { id: 0, x: 63, y: 388, w: 118, h: 12, kind: "static" as const },
-  {
-    id: 1,
-    x: 234,
-    y: 273,
-    w: 118,
-    h: 12,
-    kind: "elevator" as const,
-    vx: 22,
-    minX: 154,
-    maxX: 314,
-  },
-  { id: 2, x: 405, y: 388, w: 118, h: 12, kind: "static" as const },
-  {
-    id: 3,
-    x: 576,
-    y: 273,
-    w: 118,
-    h: 12,
-    kind: "elevator" as const,
-    vx: -22,
-    minX: 496,
-    maxX: 656,
-  },
-  { id: 4, x: 405, y: 158, w: 118, h: 12, kind: "static" as const },
-  {
-    id: 5,
-    x: 234,
-    y: 43,
-    w: 118,
-    h: 12,
-    kind: "elevator" as const,
-    vx: 22,
-    minX: 154,
-    maxX: 314,
-  },
-];
-
 const spawnOnFloor = (x: number) => ({
   x,
   y: FLOOR_Y - PLAYER_HALF_H * SCALE,
@@ -324,8 +302,6 @@ type FixtureUserData =
   | { type: "platform"; id: number }
   | { type: "crate"; id: number }
   | { type: "pickup"; id: number };
-
-type PlatformDef = (typeof PLATFORMS)[number];
 
 let world: planck.World;
 let playerBodies: Record<string, { torso: planck.Body; head: planck.Body }> = {};
@@ -349,6 +325,104 @@ const sharedWorldManifold = new planck.WorldManifold();
 
 function setCurrentG(G: ShooterState) {
   currentG = G;
+}
+
+function parseGameConfig(config?: Json): GameMode {
+  const mode = (config as GameConfig | undefined)?.mode;
+  return mode === "teams2v2" ? "teams2v2" : "ffa";
+}
+
+function initScores(playerIds: string[], gameMode: GameMode): Record<string, number> {
+  if (gameMode === "teams2v2") {
+    return { "0": 0, "1": 0 };
+  }
+  const scores: Record<string, number> = {};
+  for (const id of playerIds) scores[id] = 0;
+  return scores;
+}
+
+function assignTeams(playerIds: string[]): Record<string, TeamId> {
+  const teams: Record<string, TeamId> = {};
+  playerIds.forEach((id, index) => {
+    teams[id] = index < 2 ? 0 : 1;
+  });
+  return teams;
+}
+
+function canDamage(G: ShooterState, attackerId: string, targetId: string): boolean {
+  if (G.gameMode !== "teams2v2") return true;
+  const attackerTeam = G.teams[attackerId];
+  const targetTeam = G.teams[targetId];
+  if (attackerTeam === undefined || targetTeam === undefined) return true;
+  return attackerTeam !== targetTeam;
+}
+
+function detectRoundWinner(G: ShooterState): string | null {
+  if (G.gameMode === "ffa") {
+    const alive = Object.entries(G.players).filter(([, p]) => p.health > 0);
+    if (alive.length === 1) return alive[0][0];
+    return null;
+  }
+
+  const team0Alive = Object.entries(G.players).some(
+    ([id, p]) => G.teams[id] === 0 && p.health > 0,
+  );
+  const team1Alive = Object.entries(G.players).some(
+    ([id, p]) => G.teams[id] === 1 && p.health > 0,
+  );
+  if (!team0Alive && team1Alive) return "1";
+  if (!team1Alive && team0Alive) return "0";
+  return null;
+}
+
+function checkRoundEnd(G: ShooterState) {
+  if (G.roundPhase !== "playing") return;
+
+  const winner = detectRoundWinner(G);
+  if (!winner) return;
+
+  G.scores[winner] = (G.scores[winner] ?? 0) + 1;
+  G.lastRoundWinner = winner;
+
+  if ((G.scores[winner] ?? 0) >= ROUNDS_TO_WIN) return;
+
+  G.roundPhase = "intermission";
+  G.intermissionTicksLeft = INTERMISSION_TICKS;
+}
+
+function startNextRound(G: ShooterState) {
+  G.currentMapId = getNextMapId(G.currentMapId);
+  G.currentRound += 1;
+  G.lastRoundWinner = null;
+  G.roundPhase = "playing";
+  G.intermissionTicksLeft = 0;
+  resetRound(G);
+}
+
+function tickIntermission(G: ShooterState) {
+  if (G.roundPhase !== "intermission") return;
+  G.intermissionTicksLeft -= 1;
+  if (G.intermissionTicksLeft <= 0) {
+    startNextRound(G);
+  }
+}
+
+function buildMatchResult(G: ShooterState): GameResult | void {
+  const maxScore = Math.max(...Object.values(G.scores).map((s) => Number(s)));
+  if (maxScore < ROUNDS_TO_WIN) return;
+
+  if (G.gameMode === "ffa") {
+    const winner = Object.entries(G.scores).find(([, s]) => s >= ROUNDS_TO_WIN)?.[0];
+    if (!winner) return;
+    return { winner, scores: G.scores, reason: "best-of-5" };
+  }
+
+  const winningTeam = Object.entries(G.scores).find(([, s]) => s >= ROUNDS_TO_WIN)?.[0];
+  if (winningTeam == null) return;
+  const winners = Object.entries(G.teams)
+    .filter(([, team]) => String(team) === winningTeam)
+    .map(([id]) => id);
+  return { winners, scores: G.scores, reason: "best-of-5" };
 }
 
 function seededRandom(seed: string, n: number): number {
@@ -397,7 +471,8 @@ function initPlatforms(G: ShooterState) {
     world.destroyBody(body);
   }
   platformBodies = {};
-  G.platforms = PLATFORMS.map((def) => ({
+  const mapDef = getMap(G.currentMapId);
+  G.platforms = mapDef.platforms.map((def) => ({
     id: def.id,
     x: def.x,
     y: def.y,
@@ -1108,6 +1183,7 @@ function processExplosions(G: ShooterState) {
 
     for (const [id, p] of Object.entries(G.players)) {
       if (p.health <= 0 || !playerBodies[id]) continue;
+      if (!canDamage(G, ex.owner, id)) continue;
       const tPos = playerBodies[id].torso.getPosition();
       const dx = tPos.x * SCALE - ex.x;
       const dy = tPos.y * SCALE - ex.y;
@@ -1200,6 +1276,7 @@ function resolveMeleeSwingHits(
 
     for (const [targetId, target] of Object.entries(G.players)) {
       if (targetId === playerId || target.health <= 0 || !playerBodies[targetId]) continue;
+      if (!canDamage(G, playerId, targetId)) continue;
       if (hitIds.includes(targetId)) continue;
 
       const targetBodies = playerBodies[targetId];
@@ -1523,7 +1600,8 @@ function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, n: number) 
 
 function spawnIncomingElevator(G: ShooterState, n: number) {
   const fromLeft = seededRandom(G.matchSeed, G.spawnTick * 41 + n) < 0.5;
-  const yChoices = [158, 273, 388];
+  const mapDef = getMap(G.currentMapId);
+  const yChoices = mapDef.elevatorYLevels;
   const yIdx = Math.floor(seededRandom(G.matchSeed, G.spawnTick * 43 + n) * yChoices.length);
   const y = yChoices[yIdx] ?? 273;
   const id = G.nextPlatformId++;
@@ -1748,6 +1826,7 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
 
   if (otherData?.type === "player" || otherData?.type === "head") {
     if (otherData.id === owner) return;
+    if (!canDamage(G, owner, otherData.id)) return;
     if (!playerBodies[otherData.id]) return;
     pendingBulletDestroys.add(bulletData.id);
     const contactPoint = getContactHitPointPx(contact);
@@ -1838,38 +1917,41 @@ function advanceWorld(G: ShooterState) {
   setCurrentG(G);
   G.hitEvents = [];
   G.worldTick += 1;
-  runSpawnCycle(G);
-  advancePlatformMotion(G);
-  updatePickupDrops(G);
-  world.step(1 / 60);
-  updatePlayerGroundedState();
-  updatePlayerWallContacts();
-  resolvePlayerSideStick();
-  snapPlayersToGround();
-  handleProjectileImpacts(G);
-  processExplosions(G);
-  processPendingHits(G);
-  fixOrphanedPickups(G);
-  updatePickupDrops(G);
-  collectPickupsForPlayers(G);
+  if (G.roundPhase === "playing") {
+    runSpawnCycle(G);
+    advancePlatformMotion(G);
+    updatePickupDrops(G);
+    world.step(1 / 60);
+    updatePlayerGroundedState();
+    updatePlayerWallContacts();
+    resolvePlayerSideStick();
+    snapPlayersToGround();
+    handleProjectileImpacts(G);
+    processExplosions(G);
+    processPendingHits(G);
+    fixOrphanedPickups(G);
+    updatePickupDrops(G);
+    collectPickupsForPlayers(G);
 
-  for (let i = G.bullets.length - 1; i >= 0; i--) {
-    const b = G.bullets[i];
-    const body = bulletBodies[b.id];
-    if (body) {
-      const pos = body.getPosition();
-      if (
-        pos.x * SCALE < -20 ||
-        pos.x * SCALE > ARENA_W + 20 ||
-        pos.y * SCALE > ARENA_H + 20 ||
-        pos.y * SCALE < -20
-      ) {
-        destroyBullet(G, b.id);
+    for (let i = G.bullets.length - 1; i >= 0; i--) {
+      const b = G.bullets[i];
+      const body = bulletBodies[b.id];
+      if (body) {
+        const pos = body.getPosition();
+        if (
+          pos.x * SCALE < -20 ||
+          pos.x * SCALE > ARENA_W + 20 ||
+          pos.y * SCALE > ARENA_H + 20 ||
+          pos.y * SCALE < -20
+        ) {
+          destroyBullet(G, b.id);
+        }
       }
     }
-  }
 
-  syncStateFromPhysics(G);
+    syncStateFromPhysics(G);
+    checkRoundEnd(G);
+  }
 }
 
 function resetRound(G: ShooterState) {
@@ -1884,6 +1966,9 @@ function resetRound(G: ShooterState) {
     world.destroyBody(b);
   }
   for (const b of Object.values(pickupBodies)) {
+    world.destroyBody(b);
+  }
+  for (const b of Object.values(platformBodies)) {
     world.destroyBody(b);
   }
   playerBodies = {};
@@ -1904,16 +1989,12 @@ function resetRound(G: ShooterState) {
   G.worldTick = 0;
   initPlatforms(G);
 
-  const spawns = [
-    spawnOnFloor(114),
-    spawnOnFloor(ARENA_W - 114),
-    spawnOnFloor(342),
-    spawnOnFloor(570),
-  ];
+  const mapDef = getMap(G.currentMapId);
+  const spawns = mapDef.spawns;
 
   let index = 0;
   for (const [id, p] of Object.entries(G.players)) {
-    const spawn = spawns[index % spawns.length];
+    const spawn = spawnOnFloor(spawns[index % spawns.length]);
     p.health = MAX_HEALTH;
     p.crouching = false;
     p.currentWeapon = START_WEAPON;
@@ -1998,6 +2079,11 @@ export default defineGame<ShooterState>({
   initialActive: (G) => Object.keys(G.players),
 
   setup: (ctx) => {
+    const gameMode = parseGameConfig(ctx.config);
+    if (gameMode === "teams2v2" && ctx.numPlayers !== 4) {
+      throw new Error("teams2v2 requires exactly 4 players");
+    }
+
     world = planck.World({ gravity: planck.Vec2(0, GRAVITY) });
     playerBodies = {};
     platformBodies = {};
@@ -2050,15 +2136,13 @@ export default defineGame<ShooterState>({
     );
 
     const players: Record<string, PlayerState> = {};
-    const spawns = [
-      spawnOnFloor(114),
-      spawnOnFloor(ARENA_W - 114),
-      spawnOnFloor(342),
-      spawnOnFloor(570),
-    ];
+    const teams = gameMode === "teams2v2" ? assignTeams(ctx.players) : {};
+    const mapDef = getMap("default");
+    const spawns = mapDef.spawns;
 
     ctx.players.forEach((id, index) => {
-      const spawn = spawns[index % spawns.length];
+      const spawn = spawnOnFloor(spawns[index % spawns.length]);
+      const team = gameMode === "teams2v2" ? teams[id] : undefined;
       players[id] = {
         health: MAX_HEALTH,
         aimAngle: 0,
@@ -2069,6 +2153,7 @@ export default defineGame<ShooterState>({
         lastFireTick: 0,
         torso: { x: spawn.x, y: spawn.y, angle: 0 },
         head: { x: spawn.x, y: spawn.y - HEAD_OFFSET, angle: 0 },
+        team,
       };
       createPlayerPhysics(id, spawn.x, spawn.y);
     });
@@ -2086,8 +2171,15 @@ export default defineGame<ShooterState>({
       spawnTick: 0,
       worldTick: 0,
       matchSeed: ctx.players.slice().sort().join("|"),
-      scores: {},
+      scores: initScores(ctx.players, gameMode),
       hitEvents: [],
+      gameMode,
+      teams,
+      currentMapId: "default",
+      currentRound: 1,
+      roundPhase: "playing",
+      intermissionTicksLeft: 0,
+      lastRoundWinner: null,
     };
     initPlatforms(G);
     syncStateFromPhysics(G);
@@ -2098,6 +2190,11 @@ export default defineGame<ShooterState>({
   moves: {
     move: (G, payload, ctx) => {
       setCurrentG(G);
+      if (G.roundPhase === "intermission") {
+        tickIntermission(G);
+        return;
+      }
+
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
 
@@ -2150,6 +2247,11 @@ export default defineGame<ShooterState>({
     },
     switchWeapon: (G, payload, ctx) => {
       setCurrentG(G);
+      if (G.roundPhase === "intermission") {
+        tickIntermission(G);
+        return;
+      }
+
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
 
@@ -2168,6 +2270,11 @@ export default defineGame<ShooterState>({
     },
     shoot: (G, payload, ctx) => {
       setCurrentG(G);
+      if (G.roundPhase === "intermission") {
+        tickIntermission(G);
+        return;
+      }
+
       const p = G.players[ctx.playerId];
       if (!p || p.health <= 0) return INVALID_MOVE;
 
@@ -2187,7 +2294,12 @@ export default defineGame<ShooterState>({
       advanceWorld(G);
     },
   },
+  endIf: (G) => buildMatchResult(G),
   enumerate: (G, playerId) => {
+    if (G.roundPhase === "intermission") {
+      return [{ type: "move", payload: { action: null, aimAngle: 0, crouching: false } as any }];
+    }
+
     const p = G.players[playerId];
     if (!p || p.health <= 0) return [];
     return [
@@ -2212,6 +2324,17 @@ export default defineGame<ShooterState>({
 export const testUtils = {
   breakPlatform: (G: ShooterState, id: number) => breakPlatform(G, id),
   createPickupBody: (pickup: PickupState) => createPickupBody(pickup),
+  killPlayer: (G: ShooterState, id: string) => {
+    const p = G.players[id];
+    if (!p) return;
+    p.health = 0;
+    destroyPlayerPhysics(id);
+  },
+  tickIntermission: (G: ShooterState) => tickIntermission(G),
+  startNextRound: (G: ShooterState) => startNextRound(G),
+  platformBodyCount: () => Object.keys(platformBodies).length,
+  canDamage: (G: ShooterState, attackerId: string, targetId: string) =>
+    canDamage(G, attackerId, targetId),
   resolveBulletPlayerDamage: (
     targetId: string,
     hitPart: "player" | "head",

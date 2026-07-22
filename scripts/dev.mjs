@@ -52,6 +52,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
   let SEED = "sandbox";
   const clampSeats = (n) => Math.min(Math.max(n, def.minPlayers ?? 2), def.maxPlayers ?? Math.max(def.minPlayers ?? 2, n));
   let seatCount = clampSeats(meta.minPlayers || def.minPlayers || 2);
+  let gameMode = "ffa";
   let seats = [];
   let state = null;
   let history = [];
@@ -65,10 +66,15 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
       return { id, name: "Player " + (i + 1), bot: was ? was.bot : i !== 0 };
     });
   const newMatch = ({ reseed } = {}) => {
+    if (gameMode === "teams2v2") seatCount = 4;
     seatCount = clampSeats(seatCount);
     seats = makeSeats(seatCount, seats);
     if (reseed) SEED = "sandbox-" + Math.abs(history.length * 2654435761 % 1e6).toString(36);
-    state = createMatch(def, { players: seats.map((s) => s.id), seed: SEED });
+    state = createMatch(def, {
+      players: seats.map((s) => s.id),
+      seed: SEED,
+      config: { mode: gameMode },
+    });
     history = [];
   };
   const actorSet = () => (state.flow.active?.length ? state.flow.active.slice() : [state.flow.currentPlayer]);
@@ -111,6 +117,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
   const envelope = (seat) => ({
     type: "state",
     meta: { gameId: meta.gameId ?? def.name, displayName: meta.displayName ?? def.name, minPlayers: def.minPlayers, maxPlayers: def.maxPlayers, hasUI },
+    gameMode,
     seats: seats.map((s) => ({ id: s.id, name: s.name, bot: s.bot })),
     names: Object.fromEntries(seats.map((s) => [s.id, s.name])),
     seed: SEED, auto, actor: actorSet(), history, ...seatView(seat),
@@ -127,7 +134,23 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
       case "auto": { auto = !!body.on; if (auto) scheduleBots(); broadcast(); return { ok: true }; }
       case "step": return { ok: true, stepped: stepBot() };
       case "reset": { newMatch({ reseed: !!body.reseed }); notice("Match reset.", "info"); broadcast(); if (auto) scheduleBots(); return { ok: true }; }
-      case "seats": { seatCount = clampSeats(Number(body.count) || seatCount); newMatch({}); notice(`Table set to ${seatCount} seats.`); broadcast(); return { ok: true }; }
+      case "seats": {
+        if (gameMode === "teams2v2") return { ok: false, error: "2v2 requires exactly 4 seats" };
+        seatCount = clampSeats(Number(body.count) || seatCount);
+        newMatch({});
+        notice(`Table set to ${seatCount} seats.`);
+        broadcast();
+        return { ok: true };
+      }
+      case "mode": {
+        const next = body.mode === "teams2v2" ? "teams2v2" : "ffa";
+        gameMode = next;
+        if (gameMode === "teams2v2") seatCount = 4;
+        newMatch({});
+        notice(`Mode: ${gameMode === "teams2v2" ? "2v2" : "FFA"}`);
+        broadcast();
+        return { ok: true };
+      }
       default: return { ok: false, error: "unknown action" };
     }
   };
@@ -176,7 +199,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
   });
 
   await new Promise((resolve) => server.listen(port, resolve));
-  process.stdout.write(`\n  Bordiko sandbox — ${meta.displayName ?? def.name}\n  seats: ${seatCount}${hasUI ? "   ui.html: yes" : ""}\n  open:  http://localhost:${port}\n\n`);
+  process.stdout.write(`\n  Bordiko sandbox — ${meta.displayName ?? def.name}\n  mode: ${gameMode}   seats: ${seatCount}${hasUI ? "   ui.html: yes" : ""}\n  open:  http://localhost:${port}\n\n`);
 }
 
 const portFlag = process.argv.indexOf("--port");

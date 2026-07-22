@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMatch, applyMove } from "@bordiko/sdk";
-import game, { WEAPON_ORDER, testUtils } from "../src/game.ts";
+import game, { ROUNDS_TO_WIN, WEAPON_ORDER, testUtils } from "../src/game.ts";
 
 const advanceTicks = (m: ReturnType<typeof createMatch>, ticks: number) => {
   let state = m;
@@ -555,4 +555,131 @@ test("shooting aimed at head deals 500 damage", () => {
   }
 
   assert.fail("expected headshot to land");
+});
+
+test("FFA awards round win when opponent is eliminated", () => {
+  let m = createMatch(game, { players: ["p1", "p2"], seed: "round-ffa" });
+  testUtils.killPlayer(m.G, "p2");
+  const r = applyMove(game, m, {
+    type: "move",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false },
+  });
+  assert.ok(r.ok, r.error);
+  m = r.state;
+  assert.equal(m.G.scores["p1"], 1);
+  assert.equal(m.G.roundPhase, "intermission");
+  assert.equal(m.G.lastRoundWinner, "p1");
+});
+
+test("map rotates after intermission", () => {
+  let m = createMatch(game, { players: ["p1", "p2"], seed: "map-rot" });
+  assert.equal(m.G.currentMapId, "default");
+  testUtils.killPlayer(m.G, "p2");
+  m = applyMove(game, m, {
+    type: "move",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false },
+  }).state;
+
+  while (m.G.roundPhase === "intermission") {
+    m = applyMove(game, m, {
+      type: "move",
+      playerId: "p1",
+      payload: { action: null, aimAngle: 0, crouching: false },
+    }).state;
+  }
+
+  assert.equal(m.G.currentMapId, "towers");
+  assert.equal(m.G.currentRound, 2);
+  assert.equal(m.G.players["p1"].health, 1000);
+  assert.equal(m.G.players["p2"].health, 1000);
+});
+
+test("match ends after 3 round wins (best of 5)", () => {
+  let m = createMatch(game, { players: ["p1", "p2"], seed: "match-end" });
+
+  for (let i = 0; i < ROUNDS_TO_WIN; i++) {
+    testUtils.killPlayer(m.G, "p2");
+    m = applyMove(game, m, {
+      type: "move",
+      playerId: "p1",
+      payload: { action: null, aimAngle: 0, crouching: false },
+    }).state;
+
+    if (m.ended) break;
+
+    while (m.G.roundPhase === "intermission") {
+      m = applyMove(game, m, {
+        type: "move",
+        playerId: "p1",
+        payload: { action: null, aimAngle: 0, crouching: false },
+      }).state;
+      if (m.ended) break;
+    }
+  }
+
+  assert.ok(m.ended);
+  assert.equal(m.result?.winner, "p1");
+  assert.equal(m.G.scores["p1"], ROUNDS_TO_WIN);
+});
+
+test("2v2 blocks friendly fire between teammates", () => {
+  const m = createMatch(game, {
+    players: ["p1", "p2", "p3", "p4"],
+    seed: "ff-test",
+    config: { mode: "teams2v2" },
+  });
+  assert.equal(m.G.gameMode, "teams2v2");
+  assert.equal(testUtils.canDamage(m.G, "p1", "p2"), false);
+  assert.equal(testUtils.canDamage(m.G, "p1", "p3"), true);
+  assert.equal(m.G.teams["p1"], 0);
+  assert.equal(m.G.teams["p3"], 1);
+});
+
+test("2v2 awards team win when opposing team is eliminated", () => {
+  let m = createMatch(game, {
+    players: ["p1", "p2", "p3", "p4"],
+    seed: "team-win",
+    config: { mode: "teams2v2" },
+  });
+  testUtils.killPlayer(m.G, "p3");
+  testUtils.killPlayer(m.G, "p4");
+  m = applyMove(game, m, {
+    type: "move",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false },
+  }).state;
+  assert.equal(m.G.scores["0"], 1);
+  assert.equal(m.G.lastRoundWinner, "0");
+  assert.equal(m.G.roundPhase, "intermission");
+});
+
+test("teams2v2 requires exactly 4 players", () => {
+  assert.throws(
+    () => createMatch(game, { players: ["p1", "p2", "p3"], seed: "bad", config: { mode: "teams2v2" } }),
+    /exactly 4 players/,
+  );
+});
+
+test("resetRound removes old platform physics bodies", () => {
+  let m = createMatch(game, { players: ["p1", "p2"], seed: "plat-ghost" });
+  testUtils.breakPlatform(m.G, m.G.platforms[0].id);
+
+  for (let i = 0; i < 500; i++) {
+    m = applyMove(game, m, {
+      type: "move",
+      playerId: "p1",
+      payload: { action: null, aimAngle: 0, crouching: false },
+    }).state;
+  }
+
+  const beforeReset = testUtils.platformBodyCount();
+  assert.ok(beforeReset > 0);
+
+  testUtils.startNextRound(m.G);
+
+  assert.equal(testUtils.platformBodyCount(), m.G.platforms.length);
+  assert.ok(m.G.platforms.every((p) => !p.broken));
+  assert.ok(m.G.platforms.length >= 3);
 });

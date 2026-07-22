@@ -84,6 +84,12 @@
     <div class="ctl">
       <label class="chk"><input type="checkbox" id="auto"> auto-play bots</label>
       <button id="step">Step bot</button>
+      <label class="chk">mode
+        <select id="gamemode">
+          <option value="ffa">FFA</option>
+          <option value="teams2v2">2v2</option>
+        </select>
+      </label>
       <label class="chk">seats <input type="number" id="seatcount" min="2" max="10"></label>
       <button id="reset">Reset</button>
       <button id="reseed">New deal</button>
@@ -141,7 +147,14 @@ function onState(d) {
   renderSeats(d);
   $("auto").checked = d.auto;
   const sc = $("seatcount");
-  if (document.activeElement !== sc) { sc.value = d.seats.length; sc.min = d.meta.minPlayers; sc.max = d.meta.maxPlayers; }
+  const gm = $("gamemode");
+  if (document.activeElement !== sc) {
+    sc.value = d.seats.length;
+    sc.min = d.meta.minPlayers;
+    sc.max = d.meta.maxPlayers;
+    sc.disabled = d.gameMode === "teams2v2";
+  }
+  if (document.activeElement !== gm && d.gameMode) gm.value = d.gameMode;
   renderPlay(d, first);
   renderInspector(d);
   if (d.meta.hasUI) postToIframe();
@@ -284,6 +297,7 @@ $("step").onclick = () => action({ kind: "step" });
 $("reset").onclick = () => action({ kind: "reset" });
 $("reseed").onclick = () => action({ kind: "reset", reseed: true });
 $("seatcount").onchange = (e) => action({ kind: "seats", count: +e.target.value });
+$("gamemode").onchange = (e) => action({ kind: "mode", mode: e.target.value });
 $("tabs").querySelectorAll(".insp-tab").forEach((b) => {
   b.onclick = () => {
     tab = b.dataset.tab;

@@ -1,6 +1,7 @@
 import '@pixi/unsafe-eval';
 import * as PIXI from 'pixi.js';
 import { GUN_PISTOL_B64, GUN_SHOTGUN_B64, GUN_RIFLE_B64 } from './sfx-buffers.js';
+import { MAPS } from './maps.ts';
 
 const ARENA_W = 912;
 const ARENA_H = 500;
@@ -150,7 +151,36 @@ floorGraphics.drawRect(0, FLOOR_Y - 10, ARENA_W, 10);
 floorGraphics.endFill();
 gameContainer.addChild(floorGraphics);
 
-// Containers
+let activeMapThemeId = null;
+
+const applyMapTheme = (mapId) => {
+    const theme = MAPS[mapId]?.theme ?? MAPS.default.theme;
+    if (mapId === activeMapThemeId) return;
+    activeMapThemeId = mapId;
+
+    gridGraphics.clear();
+    gridGraphics.beginFill(theme.background);
+    gridGraphics.drawRect(0, 0, ARENA_W, ARENA_H);
+    gridGraphics.endFill();
+    gridGraphics.lineStyle(2, theme.gridBorder, 1);
+    gridGraphics.drawRect(0, 0, ARENA_W, ARENA_H);
+    gridGraphics.lineStyle(1, theme.gridLine, 1);
+    for (let i = 0; i < ARENA_W; i += 50) {
+        gridGraphics.moveTo(i, 0);
+        gridGraphics.lineTo(i, ARENA_H);
+    }
+    for (let i = 0; i < ARENA_H; i += 50) {
+        gridGraphics.moveTo(0, i);
+        gridGraphics.lineTo(ARENA_W, i);
+    }
+
+    floorGraphics.clear();
+    floorGraphics.beginFill(theme.floor);
+    floorGraphics.drawRect(0, FLOOR_Y - 10, ARENA_W, 10);
+    floorGraphics.endFill();
+};
+
+applyMapTheme('default');
 const platformsContainer = new PIXI.Container();
 const pickupsContainer = new PIXI.Container();
 const bulletsContainer = new PIXI.Container();
@@ -167,24 +197,9 @@ gameContainer.addChild(particlesContainer);
 
 // Platforms drawn each frame from game state (HP fill + border)
 
-// Mirror game.ts PLATFORMS — fallback if state sync omits platforms briefly
-const STATIC_PLATFORMS = [
-  { id: 0, x: 63, y: 388, w: 118, h: 12 },
-  { id: 1, x: 234, y: 273, w: 118, h: 12 },
-  { id: 2, x: 405, y: 388, w: 118, h: 12 },
-  { id: 3, x: 576, y: 273, w: 118, h: 12 },
-  { id: 4, x: 405, y: 158, w: 118, h: 12 },
-  { id: 5, x: 234, y: 43, w: 118, h: 12 },
-];
-
 const getPlatformsForRender = (G) => {
     if (G?.platforms?.length) return G.platforms;
-    return STATIC_PLATFORMS.map((p) => ({
-        ...p,
-        health: 500,
-        maxHealth: 500,
-        broken: false,
-    }));
+    return [];
 };
 
 const drawPlatforms = (platforms) => {
@@ -770,7 +785,71 @@ const Sfx = (() => {
         tone(440, "triangle", 0.08, 0.06, 550);
     };
 
-    return { init, playShoot, playBulletHit, playDeath, playFootstep, playJump, playPickupLand };
+    const playRoundWin = () => {
+        const ac = ensure();
+        if (!ac) return;
+        const t = ac.currentTime;
+        const melody = [
+            { freq: 523.25, at: 0, dur: 0.13, type: "square", vol: 0.09, end: 659.25 },
+            { freq: 659.25, at: 0.11, dur: 0.13, type: "square", vol: 0.1, end: 783.99 },
+            { freq: 783.99, at: 0.23, dur: 0.16, type: "sine", vol: 0.14, end: 987.77 },
+            { freq: 1046.5, at: 0.4, dur: 0.55, type: "triangle", vol: 0.17, end: 1318.5 },
+        ];
+        for (const n of melody) {
+            const osc = ac.createOscillator();
+            const g = ac.createGain();
+            osc.type = n.type;
+            osc.frequency.setValueAtTime(n.freq, t + n.at);
+            osc.frequency.exponentialRampToValueAtTime(Math.max(20, n.end), t + n.at + n.dur);
+            g.gain.setValueAtTime(n.vol, t + n.at);
+            g.gain.exponentialRampToValueAtTime(0.001, t + n.at + n.dur);
+            osc.connect(g);
+            g.connect(master);
+            osc.start(t + n.at);
+            osc.stop(t + n.at + n.dur + 0.02);
+        }
+        const bass = ac.createOscillator();
+        const bassGain = ac.createGain();
+        bass.type = "sine";
+        bass.frequency.setValueAtTime(130.81, t);
+        bass.frequency.exponentialRampToValueAtTime(65, t + 0.55);
+        bassGain.gain.setValueAtTime(0.14, t);
+        bassGain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+        bass.connect(bassGain);
+        bassGain.connect(master);
+        bass.start(t);
+        bass.stop(t + 0.58);
+        noise(0.1, 0.06, 3200);
+    };
+
+    const playMatchWin = () => {
+        const ac = ensure();
+        if (!ac) return;
+        const t = ac.currentTime;
+        const fanfare = [
+            { freq: 392, at: 0, dur: 0.12, type: "square", vol: 0.1, end: 523 },
+            { freq: 523, at: 0.1, dur: 0.12, type: "square", vol: 0.11, end: 659 },
+            { freq: 659, at: 0.2, dur: 0.14, type: "sine", vol: 0.13, end: 784 },
+            { freq: 784, at: 0.34, dur: 0.16, type: "sine", vol: 0.15, end: 988 },
+            { freq: 988, at: 0.5, dur: 0.75, type: "triangle", vol: 0.18, end: 1175 },
+        ];
+        for (const n of fanfare) {
+            const osc = ac.createOscillator();
+            const g = ac.createGain();
+            osc.type = n.type;
+            osc.frequency.setValueAtTime(n.freq, t + n.at);
+            osc.frequency.exponentialRampToValueAtTime(Math.max(20, n.end), t + n.at + n.dur);
+            g.gain.setValueAtTime(n.vol, t + n.at);
+            g.gain.exponentialRampToValueAtTime(0.001, t + n.at + n.dur);
+            osc.connect(g);
+            g.connect(master);
+            osc.start(t + n.at);
+            osc.stop(t + n.at + n.dur + 0.02);
+        }
+        noise(0.14, 0.07, 2800);
+    };
+
+    return { init, playShoot, playBulletHit, playDeath, playFootstep, playJump, playPickupLand, playRoundWin, playMatchWin };
 })();
 
 document.addEventListener("pointerdown", () => Sfx.init(), { once: true });
@@ -782,6 +861,9 @@ let localPlayers = {};
 let localBullets = new Map();
 let particles = [];
 let prevPlatformBroken = {};
+let prevRoundPhase = null;
+let prevLastRoundWinner = null;
+let prevMatchEnded = false;
 
 // Input
 const activeKeys = new Set();
@@ -937,11 +1019,30 @@ window.addEventListener("message", (event) => {
         drawPlatforms(getPlatformsForRender(G));
         drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
 
+        if (latestState.ended && !prevMatchEnded) {
+            Sfx.playMatchWin();
+        }
+        prevMatchEnded = !!latestState.ended;
+
         const curPickupIds = new Set((G?.pickups ?? []).map((p) => p.id));
         const pickupCollected = [...prevPickupIds].some((id) => !curPickupIds.has(id));
         prevPickupIds = curPickupIds;
 
         if (G && G.players) {
+            if (
+                G.roundPhase === "intermission" &&
+                G.lastRoundWinner &&
+                G.lastRoundWinner !== prevLastRoundWinner
+            ) {
+                Sfx.playRoundWin();
+            }
+            if (G.roundPhase === "playing") {
+                prevLastRoundWinner = null;
+            } else if (G.lastRoundWinner) {
+                prevLastRoundWinner = G.lastRoundWinner;
+            }
+            prevRoundPhase = G.roundPhase ?? "playing";
+
             const liveIds = new Set(Object.keys(G.players));
             for (const id of Object.keys(localPlayers)) {
                 if (!liveIds.has(id)) delete localPlayers[id];
@@ -1727,10 +1828,26 @@ const drawSniperLaser = (g, gun) => {
     g.lineTo(mouseX, mouseY);
 };
 
-const stickPalette = (isMe) => ({
-    limb: isMe ? 0x77ccff : 0xffffff,
-    outline: isMe ? 0x143050 : 0x111111,
-});
+const stickPalette = (isMe, team) => {
+    if (team === 0) {
+        return { limb: isMe ? 0x88bbff : 0x6699ff, outline: isMe ? 0x1a4080 : 0x1a3060 };
+    }
+    if (team === 1) {
+        return { limb: isMe ? 0xffaa88 : 0xff8866, outline: isMe ? 0x602818 : 0x502018 };
+    }
+    return {
+        limb: isMe ? 0x77ccff : 0xffffff,
+        outline: isMe ? 0x143050 : 0x111111,
+    };
+};
+
+const formatRoundWinner = (G, names) => {
+    if (!G?.lastRoundWinner) return '';
+    if (G.gameMode === 'teams2v2') {
+        return G.lastRoundWinner === '0' ? 'Team A' : 'Team B';
+    }
+    return (names && names[G.lastRoundWinner]) || G.lastRoundWinner;
+};
 
 const moodSeedFromId = (id) =>
     String(id).split("").reduce((n, c) => n + c.charCodeAt(0), 0);
@@ -2062,7 +2179,7 @@ const drawStickmanLines = (g, p, isMe) => {
     g.clear();
     if (!p || p.health <= 0 || !p.displayTorso || !p.displayHead) return;
 
-    const pal = stickPalette(isMe);
+    const pal = stickPalette(isMe, p.team);
     const gun = getGunPose(p);
     const { tx, ty, hx, hy, neckTop, hipY } = gun;
     const legs = computeLegPositions(p, gun);
@@ -2116,6 +2233,7 @@ app.ticker.add((dt) => {
         if (!latestState) return;
 
         const G = latestState.G;
+        if (G?.currentMapId) applyMapTheme(G.currentMapId);
         drawPlatforms(getPlatformsForRender(G));
         drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
 
@@ -2196,7 +2314,7 @@ app.ticker.add((dt) => {
         }
 
         const smooth = Math.min(1, 0.28 * dt);
-        for (const p of Object.values(localPlayers)) {
+        for (const [id, p] of Object.entries(localPlayers)) {
             if (p.deathCorpse && (p.health <= 0 || !p.torso)) continue;
             if (!p.torso || !p.head) continue;
             initPlayerRenderState(p);
@@ -2212,6 +2330,9 @@ app.ticker.add((dt) => {
             }
             if (p === me && p.walking && p.grounded && !p.crouching && p.health > 0) {
                 Sfx.playFootstep();
+            }
+            if (G?.players?.[id]?.team != null) {
+                p.team = G.players[id].team;
             }
         }
 
@@ -2355,21 +2476,56 @@ app.ticker.add((dt) => {
 
         // Update HUD overall
         if (latestState) {
+            const G = latestState.G;
             const playerInfo = document.getElementById('player-info');
             if (playerInfo) playerInfo.innerText = `Player: ${latestState.playerId}`;
+
+            const modeInfo = document.getElementById('mode-info');
+            if (modeInfo && G) {
+                modeInfo.innerText = G.gameMode === 'teams2v2' ? 'Mode: 2v2' : 'Mode: FFA';
+            }
+
+            const roundInfo = document.getElementById('round-info');
+            if (roundInfo && G) {
+                const mapName = MAPS[G.currentMapId]?.displayName ?? G.currentMapId;
+                roundInfo.innerHTML = `Round ${G.currentRound} — Best of 5<br/><span style="font-size:11px;color:#ccc;">${mapName}</span>`;
+            }
             
             const turnInfo = document.getElementById('turn-info');
-            if (turnInfo) turnInfo.innerText = latestState.yourTurn ? "Your Turn" : "";
+            if (turnInfo) {
+                if (G?.roundPhase === 'intermission') {
+                    turnInfo.innerText = 'Next round...';
+                    turnInfo.style.color = '#ffcc66';
+                } else {
+                    turnInfo.innerText = latestState.yourTurn ? 'Your Turn' : '';
+                    turnInfo.style.color = '#55ff55';
+                }
+            }
 
-            if (latestState.G && latestState.G.scores) {
-                let scoreHtml = "Wins (First to 5):<br/>";
-                for (const [pid, score] of Object.entries(latestState.G.scores)) {
-                    const name = (latestState.names && latestState.names[pid]) || pid;
-                    const color = pid === latestState.playerId ? "#ffffaa" : "#dddddd";
-                    scoreHtml += `<span style="color:${color}">${name}: ${score}</span><br/>`;
+            if (G && G.scores) {
+                let scoreHtml = '';
+                if (G.gameMode === 'teams2v2') {
+                    scoreHtml = `Best of 5 (teams):<br/><span style="color:#6699ff">Team A: ${G.scores['0'] ?? 0}</span> | <span style="color:#ff8866">Team B: ${G.scores['1'] ?? 0}</span>`;
+                } else {
+                    scoreHtml = 'Best of 5:<br/>';
+                    for (const [pid, score] of Object.entries(G.scores)) {
+                        const name = (latestState.names && latestState.names[pid]) || pid;
+                        const color = pid === latestState.playerId ? '#ffffaa' : '#dddddd';
+                        scoreHtml += `<span style="color:${color}">${name}: ${score}</span><br/>`;
+                    }
                 }
                 const scoresInfo = document.getElementById('scores-info');
                 if (scoresInfo) scoresInfo.innerHTML = scoreHtml;
+            }
+
+            const roundEnd = document.getElementById('hud-round-end');
+            if (roundEnd && G) {
+                if (G.roundPhase === 'intermission' && G.lastRoundWinner) {
+                    roundEnd.style.display = 'block';
+                    roundEnd.innerText = `Round ${G.currentRound} — ${formatRoundWinner(G, latestState.names)} wins!`;
+                } else {
+                    roundEnd.style.display = 'none';
+                }
             }
 
             const weaponInfo = document.getElementById('weapon-info');
@@ -2392,12 +2548,17 @@ app.ticker.add((dt) => {
                 const go = document.getElementById('hud-game-over');
                 if (go) {
                     go.style.display = 'block';
-                    let resultText = "Game Over";
+                    let resultText = 'Game Over';
                     if (latestState.result) {
                         if (latestState.result.winner) {
                             resultText = `WINNER: ${(latestState.names && latestState.names[latestState.result.winner]) || latestState.result.winner}`;
+                        } else if (latestState.result.winners?.length) {
+                            const names = latestState.result.winners
+                                .map((id) => (latestState.names && latestState.names[id]) || id)
+                                .join(' & ');
+                            resultText = `WINNERS: ${names}`;
                         } else if (latestState.result.draw) {
-                            resultText = "Draw";
+                            resultText = 'Draw';
                         }
                     }
                     go.innerText = resultText;
