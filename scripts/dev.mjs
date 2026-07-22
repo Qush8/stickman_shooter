@@ -26,7 +26,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
     throw new Error("@bordiko/sdk is not installed here — run `npm install` first");
   }
   const sdk = await import(pathToFileURL(sdkPath).href);
-  const { createMatch, applyMove, getPlayerView, enumerateMovesFor, Rng, seedFromString } = sdk;
+  const { createMatch, applyMove, applyTick, getPlayerView, enumerateMovesFor, Rng, seedFromString } = sdk;
 
   const pkg = JSON.parse(readFileSync(join(projectDir, "package.json"), "utf8"));
   const meta = pkg.bordiko ?? {};
@@ -71,29 +71,12 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
     if (meta.realtime?.tick && def.tick) {
       const rate = meta.realtime.tickRate || 30;
       const ms = 1000 / rate;
-      let tickCount = 0;
       tickTimer = setInterval(() => {
         if (!state || state.ended) return;
-        tickCount++;
-        const rng = new Rng(seedFromString(`${SEED}:tick:${tickCount}`));
-        const ctx = {
-          playerId: state.flow.currentPlayer,
-          random: {
-            float: () => rng.next(),
-            int: (min, max) => Math.floor(rng.next() * (max - min + 1)) + min,
-            bool: (p = 0.5) => rng.next() < p,
-            pick: (arr) => arr[Math.floor(rng.next() * arr.length)],
-            shuffle: (arr) => arr.slice().sort(() => rng.next() - 0.5),
-          },
-          events: {
-            endGame: (result) => { state.ended = true; state.result = result; },
-          },
-        };
-        def.tick(state.G, ms, ctx);
-        if (def.endIf) {
-          const res = def.endIf(state.G, state.flow);
-          if (res) { state.ended = true; state.result = res; }
-        }
+        const ms = 1000 / rate;
+        const result = applyTick(def, state, ms);
+        if (!result.ok) return;
+        state = result.state;
         broadcast();
       }, ms);
     }

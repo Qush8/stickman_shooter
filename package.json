@@ -7,7 +7,7 @@
     "gameId": "stickman-brawler",
     "displayName": "Stickman Brawler",
     "minPlayers": 2,
-    "maxPlayers": 2,
+    "maxPlayers": 4,
     "realtime": {
       "tick": true,
       "tickRate": 30
@@ -18,11 +18,11 @@
     "dev": "node scripts/dev.mjs",
     "build": "npm run build:ui && bordiko build",
     "prepublish:game": "npm run build",
-    "publish:game": "bordiko publish",
+    "publish:game": "node scripts/publish.mjs",
     "test": "node --test \"test/*.test.ts\""
   },
   "dependencies": {
-    "@bordiko/sdk": "^0.1.0",
+    "@bordiko/sdk": "^0.2.0",
     "@pixi/unsafe-eval": "^7.4.3",
     "pixi.js": "^7.4.3",
     "planck": "^1.4.2"

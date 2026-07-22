@@ -4,6 +4,7 @@ import {
   type GameResult,
   type Json,
   type RandomAPI,
+  type TickContext,
 } from "@bordiko/sdk";
 import * as planck from "planck";
 import { ARENA_H, ARENA_W, getMap, getNextMapId, type MapId } from "./maps.ts";
@@ -407,7 +408,11 @@ function checkRoundEnd(G: ShooterState) {
   G.scores[winner] = (G.scores[winner] ?? 0) + 1;
   G.lastRoundWinner = winner;
 
-  if ((G.scores[winner] ?? 0) >= ROUNDS_TO_WIN) return;
+  if ((G.scores[winner] ?? 0) >= ROUNDS_TO_WIN) {
+    G.roundPhase = "intermission";
+    G.intermissionTicksLeft = 0;
+    return;
+  }
 
   G.roundPhase = "intermission";
   G.intermissionTicksLeft = INTERMISSION_TICKS;
@@ -1929,11 +1934,9 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     torso.setLinearVelocity(planck.Vec2(0, torso.getLinearVelocity().y));
   }
 
-  if (data.jumping) {
+    if (data.jumping) {
     const wall = playerWallContact[playerId];
     const standingJump = canPerformStandingJump(playerId, torso, p.crouching);
-
-    console.log("Jump intent:", data.jumping, "Grounded:", standingJump, "Wall:", !!wall);
 
     if (standingJump) {
       applyVerticalJump(torso, playerId, { keepVx: torso.getLinearVelocity().x });
@@ -2066,7 +2069,7 @@ function fireWeapon(
   const weapon = WEAPONS[weaponId];
   if (!weapon) return false;
 
-  if (p.lastFireTick > 0 && G.worldTick - p.lastFireTick < weapon.fireRateTicks) return false;
+  if (p.lastFireTick >= 0 && G.worldTick - p.lastFireTick < weapon.fireRateTicks) return false;
 
   if (weapon.kind === "melee") {
     const torso = bodies.torso;
@@ -2121,12 +2124,12 @@ export default defineGame<ShooterState>({
     categories: ["action"],
   },
   minPlayers: 2,
-  maxPlayers: 2,
+  maxPlayers: 4,
 
   initialActive: (G) => Object.keys(G.players),
 
-  // @ts-ignore - tick is a real-time feature not yet in the types
-  tick: (G: ShooterState, dt: number, ctx: any) => {
+  tick: (G: ShooterState, dt: number, ctx: TickContext) => {
+    console.log("REALTIME TICK IS RUNNING", { dt, worldTick: G.worldTick });
     setCurrentG(G);
     const steps = Math.round(dt / (1000 / PHYSICS_HZ));
 
@@ -2217,7 +2220,7 @@ export default defineGame<ShooterState>({
         crouching: false,
         currentWeapon: START_WEAPON,
         ownedWeapons: defaultOwnedWeapons(),
-        lastFireTick: 0,
+        lastFireTick: -1,
         torso: { x: spawn.x, y: spawn.y, angle: 0 },
         head: { x: spawn.x, y: spawn.y - HEAD_OFFSET, angle: 0 },
         team,
@@ -2259,17 +2262,19 @@ export default defineGame<ShooterState>({
     input: (G, payload, ctx) => {
       setCurrentG(G);
       const p = G.players[ctx.playerId];
-      if (!p || p.health <= 0) return INVALID_MOVE;
+      if (!p || p.health <= 0) return;
 
       const data = payload as unknown as PlayerInput;
       p.input = {
         action: data.action ?? null,
-        jumping: (p.input?.jumping || !!data.jumping),
+        jumping: p.input?.jumping || !!data.jumping,
         aimAngle: typeof data.aimAngle === "number" ? data.aimAngle : p.aimAngle,
         facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
         crouching: !!data.crouching,
         shooting: !!data.shooting,
       };
+      p.aimAngle = p.input.aimAngle;
+      p.facing = p.input.facing;
     },
     switchWeapon: (G, payload, ctx) => {
       setCurrentG(G);

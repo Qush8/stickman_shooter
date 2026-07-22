@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   createMatch,
   applyMove,
+  applyTick,
   type CreateMatchOptions,
   type MatchState,
 } from "@bordiko/sdk";
@@ -19,38 +20,14 @@ const assertMoveOk = (r: { ok: boolean; error?: string }) => {
   assert.ok(r.ok, r.error ?? "move failed");
 };
 
-const advanceTicks = (m: MatchState<ShooterState>, ticks: number) => {
-  let state = { ...m };
-  for (let i = 0; i < ticks; i++) {
-    (game as any).tick!(state.G, 1000 / 60, {
-      playerId: "p1",
-      numPlayers: 2,
-      random: {
-        float: () => 0.5,
-        integer: (min: number, max: number) => Math.floor(0.5 * (max - min + 1)) + min,
-        shuffle: (arr: any[]) => arr,
-        bool: () => true,
-        pick: (arr: any[]) => arr[0],
-      },
-      events: {
-        endGame: (result: any) => {
-          state.ended = true;
-          state.result = result;
-        },
-        endPhase: () => {},
-        endTurn: () => {},
-        setActivePlayers: () => {},
-      },
-      config: {},
-    } as any);
+const TICK_DT_MS = 1000 / 30;
 
-    if (game.endIf) {
-      const result = game.endIf(state.G, {} as any);
-      if (result) {
-        state.ended = true;
-        state.result = result;
-      }
-    }
+const advanceTicks = (m: MatchState<ShooterState>, ticks: number) => {
+  let state = m;
+  for (let i = 0; i < ticks; i++) {
+    const result = applyTick(game, state, TICK_DT_MS);
+    assert.ok(result.ok, result.error ?? "tick failed");
+    state = result.state;
   }
   return state;
 };
@@ -96,8 +73,8 @@ test("jump updates player position upwards", () => {
   assertMoveOk(r);
 
   m = r.state;
-  m = advanceTicks(m, 5); // 5 ticks is enough to move up
-  assert.ok(m.G.players["p1"].torso.y < startY - 10, `Player should have moved up (negative Y). Start Y: ${startY}, End Y: ${m.G.players["p1"].torso.y}`);
+  m = advanceTicks(m, 1);
+  assert.ok(m.G.players["p1"].torso.y < startY - 10, `Player should have moved up after jump tick. Start Y: ${startY}, End Y: ${m.G.players["p1"].torso.y}`);
 });
 
 test("shoot spawns a bullet for winchester", () => {
@@ -569,7 +546,7 @@ test("shooting aimed at head deals 500 damage", () => {
     playerId: "p1",
     payload: { action: "right", aimAngle: 0, crouching: false, shooting: false },
   }).state;
-  m = advanceTicks(m, 85);
+  m = advanceTicks(m, 120);
 
   const p1 = m.G.players["p1"];
   const p2 = m.G.players["p2"];
