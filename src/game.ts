@@ -230,12 +230,15 @@ const FLOOR_PICKUP_Y = FLOOR_Y - 20;
 const PICKUP_FALL_SPEED = 8;
 const SCALE = 30;
 const MAX_HEALTH = 1000;
+const HEADSHOT_HEALTH_FRACTION = 0.5;
+const HEAD_VISUAL_RADIUS_PX = 16;
+const HEAD_HIT_RADIUS_PX = HEAD_VISUAL_RADIUS_PX + 4;
 const BULLET_DAMAGE = 125;
 const MAX_BULLETS_PER_PLAYER = 3;
 const PLAYER_HALF_W = 0.48;
 const PLAYER_HALF_H = 1.06;
 const HEAD_OFFSET = 36;
-const HEAD_RADIUS = 0.46;
+const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
 const MOVE_SPEED = 15;
 const JUMP_IMPULSE = 40;
 const GRAVITY = 97.5;
@@ -535,31 +538,13 @@ function findPlatformIdUnderPickup(G: ShooterState, pickup: PickupState) {
   return undefined;
 }
 
-function settlePickupDrops(G: ShooterState) {
-  for (let i = 0; i < 180; i++) {
-    let moving = false;
-    for (const pickup of G.pickups) {
-      if (pickupHasPlatformSupport(G, pickup)) continue;
-      const goal = pickupGoalY(G, pickup);
-      if (pickup.y < goal - 0.5) {
-        moving = true;
-        break;
-      }
-    }
-    if (!moving) break;
-    updatePickupDrops(G);
-  }
-  updatePickupDrops(G);
-}
-
-function releasePickupsFromPlatform(G: ShooterState, platId: number, plat: PlatformState) {
+function releasePickupsFromPlatform(G: ShooterState, _platId: number, plat: PlatformState) {
   for (const pickup of G.pickups) {
     if (!pickupAffectedByPlatformBreak(pickup, plat)) continue;
     pickup.onPlatformId = undefined;
     pickup.targetY = undefined;
     pickup.fallToFloor = true;
   }
-  settlePickupDrops(G);
 }
 
 function breakPlatform(G: ShooterState, id: number) {
@@ -664,7 +649,8 @@ function createPlayerPhysics(id: string, x: number, y: number) {
     position: planck.Vec2(x / SCALE, y / SCALE),
     fixedRotation: true,
   });
-  torso.createFixture(planck.Box(PLAYER_HALF_W, PLAYER_HALF_H), {
+  // Lower/shorter torso box so head hits register on the head fixture first.
+  torso.createFixture(planck.Box(PLAYER_HALF_W, 0.78, planck.Vec2(0, 0.28)), {
     density: 2.0,
     friction: 0.5,
     restitution: 0.0,
@@ -1524,6 +1510,7 @@ function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, n: number) 
     kind,
     x: plat.x + plat.w / 2,
     y: kind === "weapon" ? plat.y - 58 : targetY,
+    targetY: kind === "weapon" ? targetY : undefined,
     onPlatformId: plat.id,
   };
   if (kind === "weapon") {
@@ -1666,6 +1653,78 @@ function handleProjectileImpacts(G: ShooterState) {
   }
 }
 
+function getContactHitPointPx(contact: planck.Contact): { x: number; y: number } | null {
+  contact.getWorldManifold(sharedWorldManifold);
+  if (sharedWorldManifold.pointCount > 0) {
+    const p = sharedWorldManifold.points[0];
+    return { x: p.x * SCALE, y: p.y * SCALE };
+  }
+  return null;
+}
+
+function isHeadshotHit(targetId: string, hitX: number, hitY: number): boolean {
+  const bodies = playerBodies[targetId];
+  if (!bodies) return false;
+  const hPos = bodies.head.getPosition();
+  const tPos = bodies.torso.getPosition();
+  const hx = hPos.x * SCALE;
+  const hy = hPos.y * SCALE;
+  const ty = tPos.y * SCALE;
+  const headR = HEAD_HIT_RADIUS_PX;
+  const halfW = PLAYER_HALF_W * SCALE;
+
+  if (Math.hypot(hitX - hx, hitY - hy) <= headR) return true;
+
+  // Side torso contacts at head height (matches on-screen stickman head band).
+  const inHeadVerticalBand = hitY >= hy - headR && hitY <= hy + headR + 8;
+  const inReach = Math.abs(hitX - hx) <= headR + halfW + 4;
+  if (inHeadVerticalBand && inReach) return true;
+
+  // Neck / upper chest when the shot visually targets the head but registers on torso.
+  const neckY = ty - STICK_BODY_LEN_PX * 0.42;
+  return hitY <= neckY && Math.abs(hitX - hx) <= headR + halfW + 6;
+}
+
+function bulletHitsHeadZone(targetId: string, bulletBody: planck.Body): boolean {
+  const bodies = playerBodies[targetId];
+  if (!bodies) return false;
+
+  const pos = bulletBody.getPosition();
+  const vel = bulletBody.getLinearVelocity();
+  const bx = pos.x * SCALE;
+  const by = pos.y * SCALE;
+
+  if (isHeadshotHit(targetId, bx, by)) return true;
+
+  const speed = Math.hypot(vel.x, vel.y);
+  if (speed < 0.01) return false;
+
+  const backPx = 14;
+  const px = bx - (vel.x / speed) * backPx;
+  const py = by - (vel.y / speed) * backPx;
+
+  const hPos = bodies.head.getPosition();
+  const hx = hPos.x * SCALE;
+  const hy = hPos.y * SCALE;
+  return distPointToSegment(hx, hy, px, py, bx, by) <= HEAD_HIT_RADIUS_PX;
+}
+
+function resolveBulletPlayerDamage(
+  targetId: string,
+  hitPart: "player" | "head",
+  bulletBody: planck.Body,
+  contactPx: { x: number; y: number } | null,
+  bulletDamage: number,
+): number {
+  const headshot =
+    hitPart === "head" ||
+    bulletHitsHeadZone(targetId, bulletBody) ||
+    (contactPx != null && isHeadshotHit(targetId, contactPx.x, contactPx.y));
+
+  if (headshot) return Math.floor(MAX_HEALTH * HEADSHOT_HEALTH_FRACTION);
+  return bulletDamage;
+}
+
 function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact) {
   const fixtureA = contact.getFixtureA();
   const fixtureB = contact.getFixtureB();
@@ -1691,11 +1750,21 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
     if (otherData.id === owner) return;
     if (!playerBodies[otherData.id]) return;
     pendingBulletDestroys.add(bulletData.id);
+    const contactPoint = getContactHitPointPx(contact);
+    const bulletPxX = bulletPos.x * SCALE;
+    const bulletPxY = bulletPos.y * SCALE;
+    const damage = resolveBulletPlayerDamage(
+      otherData.id,
+      otherData.type,
+      bulletBody,
+      contactPoint,
+      bulletDamage,
+    );
     pendingHits.push({
-      x: bulletPos.x * SCALE,
-      y: bulletPos.y * SCALE,
+      x: contactPoint?.x ?? bulletPxX,
+      y: contactPoint?.y ?? bulletPxY,
       targetId: otherData.id,
-      damage: bulletDamage,
+      damage,
     });
     return;
   }
@@ -1781,7 +1850,6 @@ function advanceWorld(G: ShooterState) {
   processExplosions(G);
   processPendingHits(G);
   fixOrphanedPickups(G);
-  updatePickupDrops(G);
   updatePickupDrops(G);
   collectPickupsForPlayers(G);
 
@@ -1950,6 +2018,12 @@ export default defineGame<ShooterState>({
     world.on("begin-contact", (contact) => {
       if (!currentG) return;
       handleContactPickupCollection(currentG, contact);
+      handleContactWithBulletDamage(currentG, contact);
+    });
+
+    world.on("pre-solve", (contact) => {
+      if (!currentG) return;
+      if (!contact.isTouching()) return;
       handleContactWithBulletDamage(currentG, contact);
     });
 
@@ -2138,4 +2212,15 @@ export default defineGame<ShooterState>({
 export const testUtils = {
   breakPlatform: (G: ShooterState, id: number) => breakPlatform(G, id),
   createPickupBody: (pickup: PickupState) => createPickupBody(pickup),
+  resolveBulletPlayerDamage: (
+    targetId: string,
+    hitPart: "player" | "head",
+    bulletBody: planck.Body,
+    contactPx: { x: number; y: number } | null,
+    bulletDamage: number,
+  ) => resolveBulletPlayerDamage(targetId, hitPart, bulletBody, contactPx, bulletDamage),
+  isHeadshotHit: (targetId: string, hitX: number, hitY: number) =>
+    isHeadshotHit(targetId, hitX, hitY),
+  bulletHitsHeadZone: (targetId: string, bulletBody: planck.Body) =>
+    bulletHitsHeadZone(targetId, bulletBody),
 };

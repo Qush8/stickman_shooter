@@ -3,6 +3,18 @@ import assert from "node:assert/strict";
 import { createMatch, applyMove } from "@bordiko/sdk";
 import game, { WEAPON_ORDER, testUtils } from "../src/game.ts";
 
+const advanceTicks = (m: ReturnType<typeof createMatch>, ticks: number) => {
+  let state = m;
+  for (let i = 0; i < ticks; i++) {
+    state = applyMove(game, state, {
+      type: "move",
+      playerId: "p1",
+      payload: { action: null, aimAngle: 0, crouching: false },
+    }).state;
+  }
+  return state;
+};
+
 test("a player spawns with correct health and weapon", () => {
   const m = createMatch(game, { players: ["p1", "p2"], seed: "t1" });
   assert.equal(m.G.players["p1"].health, 1000);
@@ -155,7 +167,13 @@ test("pickup falls when platform beneath it is destroyed", () => {
 
   testUtils.breakPlatform(m.G, plat!.id);
 
-  const pickup = m.G.pickups.find((p) => p.id === 99);
+  let pickup = m.G.pickups.find((p) => p.id === 99);
+  assert.ok(pickup);
+  assert.equal(pickup!.fallToFloor, true);
+  assert.ok(pickup!.y < 470, "pickup should not teleport to floor instantly");
+
+  m = advanceTicks(m, 40);
+  pickup = m.G.pickups.find((p) => p.id === 99);
   assert.ok(pickup);
   assert.ok(pickup!.y >= 470, `pickup should reach floor, y=${pickup!.y}`);
   assert.equal(pickup!.targetY, undefined);
@@ -180,7 +198,11 @@ test("weapon pickup falls to floor when platform is destroyed", () => {
 
   testUtils.breakPlatform(m.G, plat!.id);
 
-  const pickup = m.G.pickups.find((p) => p.id === 101);
+  let pickup = m.G.pickups.find((p) => p.id === 101);
+  assert.ok(pickup);
+  assert.ok(pickup!.y < 470);
+  m = advanceTicks(m, 40);
+  pickup = m.G.pickups.find((p) => p.id === 101);
   assert.ok(pickup);
   assert.ok(pickup!.y >= 470);
   assert.equal(pickup!.targetY, undefined);
@@ -204,7 +226,11 @@ test("weapon still falling is released when platform breaks", () => {
 
   testUtils.breakPlatform(m.G, plat!.id);
 
-  const pickup = m.G.pickups.find((p) => p.id === 102);
+  let pickup = m.G.pickups.find((p) => p.id === 102);
+  assert.ok(pickup);
+  assert.ok(pickup!.y < 470);
+  m = advanceTicks(m, 40);
+  pickup = m.G.pickups.find((p) => p.id === 102);
   assert.ok(pickup);
   assert.ok(pickup!.y >= 470);
   assert.equal(pickup!.targetY, undefined);
@@ -252,7 +278,11 @@ test("weapon at orphaned height falls when platform breaks", () => {
 
   testUtils.breakPlatform(m.G, plat!.id);
 
-  const pickup = m.G.pickups.find((p) => p.id === 104);
+  let pickup = m.G.pickups.find((p) => p.id === 104);
+  assert.ok(pickup);
+  assert.ok(pickup!.y < 470);
+  m = advanceTicks(m, 40);
+  pickup = m.G.pickups.find((p) => p.id === 104);
   assert.ok(pickup);
   assert.ok(pickup!.y >= 470, `weapon should reach floor, y=${pickup!.y}`);
   assert.equal(pickup!.targetY, undefined);
@@ -293,7 +323,8 @@ test("pickup on static platform falls when static platform breaks", () => {
 
   m.G.pickups.push({
     id: 100,
-    kind: "health",
+    kind: "weapon",
+    weaponId: "auto",
     x: staticPlat!.x + staticPlat!.w / 2,
     y: staticPlat!.y - 20,
     onPlatformId: 999,
@@ -302,11 +333,17 @@ test("pickup on static platform falls when static platform breaks", () => {
 
   testUtils.breakPlatform(m.G, staticPlat!.id);
 
-  const pickup = m.G.pickups.find((p) => p.id === 100);
+  let pickup = m.G.pickups.find((p) => p.id === 100);
   assert.ok(pickup);
-  assert.ok(pickup!.y >= 470);
-  assert.equal(pickup!.targetY, undefined);
-  assert.equal(pickup!.fallToFloor, false);
+  assert.equal(pickup!.fallToFloor, true);
+  assert.ok(pickup!.y < 470, "pickup should not teleport to floor instantly");
+
+  m = advanceTicks(m, 3);
+  pickup = m.G.pickups.find((p) => p.id === 100);
+  if (pickup) {
+    assert.ok(pickup.y > yBefore, "pickup should move downward over ticks");
+    assert.ok(pickup.y < 470);
+  }
 });
 
 test("orphaned pickup falls when linked platform is already broken", () => {
@@ -380,7 +417,11 @@ test("player collects weapon after platform break fall with physics body", () =>
   testUtils.createPickupBody(pickup);
 
   testUtils.breakPlatform(m.G, 1);
-  const fallen = m.G.pickups.find((p) => p.id === 201);
+  let fallen = m.G.pickups.find((p) => p.id === 201);
+  assert.ok(fallen);
+  assert.ok(fallen!.y < 470);
+  m = advanceTicks(m, 40);
+  fallen = m.G.pickups.find((p) => p.id === 201);
   assert.ok(fallen);
   assert.ok(fallen!.y >= 470, `pickup should reach floor, y=${fallen!.y}`);
 
@@ -459,4 +500,59 @@ test("katana damages nearby opponent during slash", () => {
 
   m = r.state;
   assert.ok(m.G.players["p2"].health < hpBefore);
+});
+
+test("headshot in head zone deals 50% max health", () => {
+  const m = createMatch(game, { players: ["p1", "p2"], seed: "headshot" });
+  const p2 = m.G.players["p2"];
+
+  assert.equal(testUtils.isHeadshotHit("p2", p2.head.x, p2.head.y), true);
+
+  const bodyDamage = testUtils.isHeadshotHit("p2", p2.torso.x, p2.torso.y + 24);
+  assert.equal(bodyDamage, false);
+});
+
+test("side torso contact at head height counts as headshot", () => {
+  const m = createMatch(game, { players: ["p1", "p2"], seed: "side-head" });
+  const p2 = m.G.players["p2"];
+  const sideContactX = p2.torso.x - 14;
+
+  assert.equal(testUtils.isHeadshotHit("p2", sideContactX, p2.head.y), true);
+});
+
+test("shooting aimed at head deals 500 damage", () => {
+  let m = createMatch(game, { players: ["p1", "p2"], seed: "t3" });
+  for (let i = 0; i < 85; i++) {
+    m = applyMove(game, m, {
+      type: "move",
+      playerId: "p1",
+      payload: { action: "right", aimAngle: 0, crouching: false },
+    }).state;
+  }
+
+  const p1 = m.G.players["p1"];
+  const p2 = m.G.players["p2"];
+  const aimHead = Math.atan2(p2.head.y - p1.torso.y, p2.torso.x - p1.torso.x);
+  const hpBefore = p2.health;
+
+  m = applyMove(game, m, {
+    type: "shoot",
+    playerId: "p1",
+    payload: { aimAngle: aimHead, facing: 1 },
+  }).state;
+
+  for (let i = 0; i < 120; i++) {
+    const before = m.G.players["p2"].health;
+    m = applyMove(game, m, {
+      type: "move",
+      playerId: "p2",
+      payload: { action: null, aimAngle: 0, crouching: false },
+    }).state;
+    if (m.G.players["p2"].health < before) {
+      assert.equal(before - m.G.players["p2"].health, 500);
+      return;
+    }
+  }
+
+  assert.fail("expected headshot to land");
 });

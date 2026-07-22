@@ -408,42 +408,34 @@ const drawPickups = (pickups, platforms) => {
     const dtSec = Math.min(0.05, (app.ticker.deltaMS || 16) / 1000);
 
     for (const pickup of pickups) {
+        const goal = pickupFallGoal(pickup, plats);
+
         if (!localPickupMeta[pickup.id]) {
             localPickupMeta[pickup.id] = {
-                spawnedAt: Date.now(),
-                wasFalling: false,
                 simY: pickup.y,
-                lastServerY: pickup.y,
+                goalY: goal,
+                wasFalling: pickup.y < goal - 0.5,
+                landFx: false,
             };
         }
 
         const meta = localPickupMeta[pickup.id];
-        const onFloor = pickup.y >= FLOOR_PICKUP_Y - 1;
-        const onPlatform = !onFloor && pickupSupportedAt(pickup.x, pickup.y, plats);
+        meta.goalY = goal;
 
-        const goal = pickupFallGoal(pickup, plats);
-        const serverLead = 20;
-
-        if (onFloor || onPlatform) {
+        // Server moved pickup upward (fresh spawn above platform) — restart from spawn height.
+        if (pickup.y < meta.simY - 2) {
             meta.simY = pickup.y;
-            meta.settled = true;
-            meta.lastServerY = pickup.y;
-        } else {
-            meta.settled = false;
-            if (Math.abs(pickup.y - meta.lastServerY) > 3) {
-                meta.simY = pickup.y;
-            }
-            meta.lastServerY = pickup.y;
-
-            const maxSimY = Math.min(goal, pickup.y + serverLead);
-            meta.simY = Math.max(pickup.y, Math.min(maxSimY, meta.simY));
-            if (meta.simY < maxSimY - 0.5) {
-                meta.simY = Math.min(maxSimY, meta.simY + PICKUP_FALL_PX_SEC * dtSec);
-            }
+            meta.landFx = false;
         }
 
-        const falling = !meta.settled && meta.simY < pickupFallGoal(pickup, plats) - 0.5;
-        const landed = meta.wasFalling && !falling;
+        const falling = meta.simY < meta.goalY - 0.5;
+        if (falling) {
+            meta.simY = Math.min(meta.goalY, meta.simY + PICKUP_FALL_PX_SEC * dtSec);
+        } else {
+            meta.simY += (meta.goalY - meta.simY) * Math.min(1, dtSec * 12);
+        }
+
+        const landed = meta.wasFalling && !falling && meta.simY >= meta.goalY - 0.5;
         if (landed && !meta.landFx) {
             meta.landFx = true;
             createSparkHit(pickup.x, meta.simY, 0.5);
@@ -451,6 +443,7 @@ const drawPickups = (pickups, platforms) => {
         }
         meta.wasFalling = falling;
 
+        const onFloor = meta.simY >= FLOOR_PICKUP_Y - 1;
         const bob = falling || onFloor ? 0 : Math.sin(Date.now() / 280 + pickup.id) * 1.5;
         const drawY = meta.simY + bob;
         const g = new PIXI.Graphics();
@@ -1251,7 +1244,7 @@ const applyVisualRecoilToGun = (gun, p) => {
     return gun;
 };
 
-// Particles & hit effects
+// Hit FX rate limiting
 let hitFxBudget = 0;
 let hitFxResetAt = 0;
 let surfaceHitFxBudget = 0;
