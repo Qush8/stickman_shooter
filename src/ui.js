@@ -1048,7 +1048,6 @@ let prevMatchEnded = false;
 const bordikoHost = connectBordiko();
 const hostMove = bordikoHost.move.bind(bordikoHost);
 bordikoHost.move = (type, payload) => {
-    console.log("[stickman-shooter] -> host move", type, payload);
     hostMove(type, payload);
 };
 
@@ -1076,32 +1075,8 @@ const startHostReadyPulse = () => {
     }, 750);
 };
 
-window.addEventListener(
-    "message",
-    (event) => {
-        const msg = event.data;
-        if (msg && msg.t === "bordiko:state" && msg.state) {
-            console.log("[stickman-shooter] <- host raw state", {
-                moveCount: msg.state.moveCount,
-                playerId: msg.state.playerId,
-            });
-        }
-    },
-    true,
-);
-
-const proposeMove = (type, payload) => {
-    if (!latestState || latestState.ended) return;
-    const G = latestState.G;
-
-    if (!isGameplayInputEnabled(G) && !isIdleTickPhase(G) && !isPreMatchCountdown()) {
-        return;
-    }
-
-    bordikoHost.move(type, payload ?? {});
-};
-
 let lastSentInput = null;
+let lastInputSendTime = 0;
 const AIM_SEND_THRESHOLD = 0.05;
 
 const inputsAreEqual = (a, b) =>
@@ -1114,8 +1089,9 @@ const inputsAreEqual = (a, b) =>
 
 const sendInputIfChanged = (input) => {
     if (lastSentInput && inputsAreEqual(lastSentInput, input)) return false;
-    proposeMove("input", input);
+    bordikoHost.move("input", input);
     lastSentInput = { ...input, jumping: false };
+    lastInputSendTime = Date.now();
     return true;
 };
 
@@ -1140,58 +1116,32 @@ window.addEventListener("mousemove", (e) => {
     mouseY = pt.y;
 });
 
-const buildImmediateMovementInput = (me, overrides = {}) => {
-    const crouching =
-        isKeyPressed("KeyS", "s", "S", "ArrowDown") ||
-        [...activeKeys].some((k) => isCrouchKey(k, k));
-    return buildMovementInput(
-        me,
-        resolveMoveAction(crouching),
-        crouching,
-        overrides.jumping ?? pendingJump,
-        overrides.shooting ?? pointerHeld,
-    );
-};
-
-const flushShootingInput = (shooting) => {
-    const me = latestState ? localPlayers[latestState.playerId] : null;
-    if (!me || me.health <= 0 || !latestState || !isGameplayInputEnabled(latestState.G)) return;
-    sendInputIfChanged(buildImmediateMovementInput(me, { shooting }));
-};
-
-const flushJumpInput = () => {
-    const me = latestState ? localPlayers[latestState.playerId] : null;
-    if (!me || me.health <= 0 || !latestState || !isGameplayInputEnabled(latestState.G)) return;
-    sendInputIfChanged(buildImmediateMovementInput(me, { jumping: true }));
-};
 
 document.addEventListener("pointerdown", (e) => {
     if (!latestState) return;
     if (!isGameplayInputEnabled(latestState.G)) return;
     pointerHeld = true;
     pointerShootingDirty = true;
-    flushShootingInput(true);
 });
 
 document.addEventListener("pointerup", () => {
     if (!pointerHeld) return;
     pointerHeld = false;
     pointerShootingDirty = true;
-    flushShootingInput(false);
 });
 
 const sendSwitchWeapon = (weaponId) => {
     const me = latestState ? localPlayers[latestState.playerId] : null;
     const owned = me?.ownedWeapons ?? ["winchester"];
     if (!owned.includes(weaponId)) return;
-    proposeMove("switchWeapon", { weaponId });
+    bordikoHost.move("switchWeapon", { weaponId });
 };
 
 const sendCycleWeapon = () => {
     const me = latestState ? localPlayers[latestState.playerId] : null;
     const owned = me?.ownedWeapons ?? ["winchester"];
     if (owned.length <= 1) return;
-    proposeMove("switchWeapon", { cycle: true });
+    bordikoHost.move("switchWeapon", { cycle: true });
 };
 
 const getOrderedOwnedWeapons = (playerId) => {
@@ -1209,8 +1159,6 @@ window.addEventListener("keydown", (e) => {
         const me = latestState ? localPlayers[latestState.playerId] : null;
         if (me && me.health > 0 && latestState && isGameplayInputEnabled(latestState.G)) {
             pendingJump = true;
-            flushJumpInput();
-            pendingJump = false;
         }
     }
     if (e.code === "Space" || e.code === "KeyW" || e.code === "KeyS") {
@@ -1251,7 +1199,6 @@ window.addEventListener("keyup", (e) => {
         const me = latestState ? localPlayers[latestState.playerId] : null;
         if (me && me.health > 0 && isGameplayInputEnabled(latestState?.G)) {
             me.vx = 0;
-            flushHorizontalInputRelease(me);
         }
     }
 });
@@ -1261,7 +1208,8 @@ window.addEventListener("blur", () => {
     jumpQueued = false;
     const me = latestState ? localPlayers[latestState.playerId] : null;
     if (me && latestState && isGameplayInputEnabled(latestState.G)) {
-        flushNeutralInput(me);
+        me.vx = 0;
+        pendingJump = false;
     }
 });
 
@@ -1293,16 +1241,6 @@ let prevPickupIds = new Set();
 // Network Sync
 const handleGameState = (state) => {
         hostStateCount += 1;
-        console.log("[stickman-shooter] onGameState", {
-            n: hostStateCount,
-            moveCount: state?.moveCount,
-            playerId: state?.playerId,
-            yourTurn: state?.yourTurn,
-            legalMoves: state?.legalMoves?.length ?? 0,
-            ended: state?.ended,
-            roundPhase: state?.G?.roundPhase,
-            players: state?.G?.players ? Object.keys(state.G.players).length : 0,
-        });
 
         latestState = state;
         fitCanvas();
@@ -1346,8 +1284,8 @@ const handleGameState = (state) => {
                     lp.health = p.health;
                     if (p.torso) lp.displayTorso = { ...p.torso };
                     if (p.head) lp.displayHead = { ...p.head };
-                    lp.torso = p.torso;
-                    lp.head = p.head;
+                    lp.torso = { ...p.torso };
+                    lp.head = { ...p.head };
                 }
             }
             if (
@@ -1427,8 +1365,8 @@ const handleGameState = (state) => {
                     lp.health = p.health;
                     lp.crouching = !!p.crouching;
 
-                    lp.torso = p.torso;
-                    lp.head = p.head;
+                    lp.torso = { ...p.torso };
+                    lp.head = { ...p.head };
 
                     lp.currentWeapon = p.currentWeapon || "winchester";
                     lp.ownedWeapons = p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"];
@@ -1953,29 +1891,6 @@ const buildMovementInput = (me, action, crouching, pendingJump, pointerHeld) => 
     crouching,
     shooting: pointerHeld,
 });
-
-const flushNeutralInput = (me) => {
-    if (!me || me.health <= 0) return;
-    me.vx = 0;
-    pendingJump = false;
-    flushHorizontalInputRelease(me);
-};
-
-const flushHorizontalInputRelease = (me) => {
-    if (!me || me.health <= 0) return;
-    const crouching =
-        isKeyPressed("KeyS", "s", "S", "ArrowDown") ||
-        [...activeKeys].some((k) => isCrouchKey(k, k));
-    sendInputIfChanged(
-        buildMovementInput(
-            me,
-            resolveMoveAction(crouching),
-            crouching,
-            false,
-            pointerHeld,
-        ),
-    );
-};
 
 const drawShadowTeleportStreaks = (g, st) => {
     const { ax, ay, cx, cy, dir, travelEase, bx, by } = st;
@@ -3232,8 +3147,10 @@ app.ticker.add(() => {
                 gameplayActive ? pointerHeld : false,
             );
 
-            if (sendInputIfChanged(input)) {
-                pendingJump = false;
+            if (Date.now() - lastInputSendTime > 33) {
+                if (sendInputIfChanged(input)) {
+                    pendingJump = false;
+                }
             }
         }
 
@@ -3549,7 +3466,6 @@ app.ticker.add(() => {
 const installBordikoGlobals = () => {
     const root = typeof globalThis !== "undefined" ? globalThis : window;
     root.bordikoHost = bordikoHost;
-    root.bordikoProposeMove = proposeMove;
     root.onGameState = handleGameState;
     root.onUpdate = handleGameState;
     root.render = () => {};

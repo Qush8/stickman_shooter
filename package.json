@@ -1,11 +1,11 @@
 {
   "name": "my-shooter-game",
-  "version": "0.1.16",
+  "version": "0.1.33",
   "type": "module",
   "private": true,
   "bordiko": {
-    "gameId": "stickman-shooter",
-    "displayName": "Stickman Shooter",
+    "gameId": "counter-stick",
+    "displayName": "Counter Stick",
     "minPlayers": 2,
     "maxPlayers": 4,
     "board": "custom",

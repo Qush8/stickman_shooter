@@ -6,7 +6,9 @@ import {
   type RandomAPI,
   type TickContext,
 } from "@bordiko/sdk";
+
 import * as planck from "./matter-physics.ts";
+import { getPhysicsInitError } from "./matter-physics.ts";
 import { ARENA_H, ARENA_W, getMap, getNextMapId, type MapId } from "./maps.ts";
 
 export type WeaponId =
@@ -258,6 +260,7 @@ export interface ShooterState {
   intermissionTicksLeft: number;
   lastRoundWinner: string | null;
   matchPhase: MatchPhase;
+  wasmInitError?: string | null;
 }
 
 export const ROUNDS_TO_WIN = 3;
@@ -2173,9 +2176,9 @@ function fireWeapon(
 }
 
 export default defineGame<ShooterState>({
-  name: "stickman-shooter",
+  name: "counter-stick",
   meta: {
-    displayName: "Stickman Shooter",
+    displayName: "Counter Stick",
     categories: ["action"],
   },
   minPlayers: 2,
@@ -2191,28 +2194,39 @@ export default defineGame<ShooterState>({
 
   // @ts-ignore
   tick: (G: ShooterState, dt: number | undefined, ctx: TickContext) => {
-    if (!world) return;
+    try {
+      if (!world) return;
 
-    setCurrentG(G);
+      setCurrentG(G);
 
-    const steps = PHYSICS_STEPS_PER_TICK;
+      const steps = PHYSICS_STEPS_PER_TICK;
 
-    for (let i = 0; i < steps; i++) {
-      if (G.roundPhase === "intermission") {
-        G.intermissionTicksLeft -= 1;
-        if (G.intermissionTicksLeft <= 0) {
-          startNextRound(G);
+      for (let i = 0; i < steps; i++) {
+        if (G.roundPhase === "intermission") {
+          G.intermissionTicksLeft -= 1;
+          if (G.intermissionTicksLeft <= 0) {
+            startNextRound(G);
+          }
+        } else {
+          for (const playerId of Object.keys(G.players)) {
+            applyMovementInput(G, playerId, ctx.random);
+          }
+          advanceWorld(G, ctx.random);
         }
-      } else {
-        for (const playerId of Object.keys(G.players)) {
-          applyMovementInput(G, playerId, ctx.random);
-        }
-        advanceWorld(G, ctx.random);
       }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.stack ?? err.message : String(err);
+      ctx.emit("debug", { message: `WASM CRASH (tick): ${message}` });
     }
   },
 
   setup: (ctx) => {
+    const preflightErr = getPhysicsInitError();
+    if (preflightErr) {
+      throw new Error(`WASM INIT (preflight): ${preflightErr}`);
+    }
+
+    try {
     const gameMode = parseGameConfig(ctx.config);
     if (gameMode === "teams2v2" && ctx.numPlayers !== 4) {
       throw new Error("teams2v2 requires exactly 4 players");
@@ -2324,41 +2338,56 @@ export default defineGame<ShooterState>({
     syncStateFromPhysics(G);
     setCurrentG(G);
     return G;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.stack ?? err.message : String(err);
+      throw new Error(`WASM INIT (setup): ${message}`);
+    }
   },
 
   moves: {
     input: (G, payload, ctx) => {
-      setCurrentG(G);
-      const p = G.players[ctx.playerId];
-      if (!p || p.health <= 0) return;
+      try {
+        setCurrentG(G);
+        const p = G.players[ctx.playerId];
+        if (!p || p.health <= 0) return;
 
-      const data = payload as unknown as PlayerInput;
-      p.input = {
-        action: data.action ?? null,
-        jumping: !!data.jumping,
-        aimAngle: typeof data.aimAngle === "number" ? data.aimAngle : p.aimAngle,
-        facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
-        crouching: !!data.crouching,
-        shooting: !!data.shooting,
-      };
-      p.aimAngle = p.input.aimAngle;
-      p.facing = p.input.facing;
+        const data = payload as unknown as PlayerInput;
+        p.input = {
+          action: data.action ?? null,
+          jumping: !!data.jumping,
+          aimAngle: typeof data.aimAngle === "number" ? data.aimAngle : p.aimAngle,
+          facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
+          crouching: !!data.crouching,
+          shooting: !!data.shooting,
+        };
+        p.aimAngle = p.input.aimAngle;
+        p.facing = p.input.facing;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.log(`WASM CRASH (input): ${message}`);
+      }
     },
     switchWeapon: (G, payload, ctx) => {
-      setCurrentG(G);
-      if (G.roundPhase === "intermission") return;
+      try {
+        setCurrentG(G);
+        if (G.roundPhase === "intermission") return;
 
-      const p = G.players[ctx.playerId];
-      if (!p || p.health <= 0) return INVALID_MOVE;
+        const p = G.players[ctx.playerId];
+        if (!p || p.health <= 0) return INVALID_MOVE;
 
-      const data = payload as { weaponId?: WeaponId; cycle?: boolean };
-      if (data.cycle) {
-        if (p.ownedWeapons.length <= 1) return INVALID_MOVE;
-        cycleOwnedWeapon(p);
-      } else if (data.weaponId && WEAPONS[data.weaponId]) {
-        if (!playerOwnsWeapon(p, data.weaponId)) return INVALID_MOVE;
-        p.currentWeapon = data.weaponId;
-      } else {
+        const data = payload as { weaponId?: WeaponId; cycle?: boolean };
+        if (data.cycle) {
+          if (p.ownedWeapons.length <= 1) return INVALID_MOVE;
+          cycleOwnedWeapon(p);
+        } else if (data.weaponId && WEAPONS[data.weaponId]) {
+          if (!playerOwnsWeapon(p, data.weaponId)) return INVALID_MOVE;
+          p.currentWeapon = data.weaponId;
+        } else {
+          return INVALID_MOVE;
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.log(`WASM CRASH (switchWeapon): ${message}`);
         return INVALID_MOVE;
       }
     },

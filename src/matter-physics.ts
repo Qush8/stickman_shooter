@@ -2,10 +2,38 @@
  * Matter.js physics backend with a Planck/Box2D-shaped API for game.ts.
  * Coordinates are in meter-space (1 unit = SCALE pixels in game state).
  */
-import Matter from "matter-js/build/matter.js";
+import { getWasmInitError, setWasmInitError } from "./wasm-polyfills.ts";
+import Matter, { matterInitError } from "./matter-lib.ts";
 
-const { Engine, World: MatterWorld, Bodies, Body: MatterBody, Constraint, Events, Query, Composite } =
-  Matter;
+let physicsBootstrapError: string | null = matterInitError;
+
+let Engine: typeof Matter.Engine;
+let MatterWorld: typeof Matter.World;
+let Bodies: typeof Matter.Bodies;
+let MatterBody: typeof Matter.Body;
+let Constraint: typeof Matter.Constraint;
+let Events: typeof Matter.Events;
+let Query: typeof Matter.Query;
+let Composite: typeof Matter.Composite;
+
+try {
+  ({ Engine, World: MatterWorld, Bodies, Body: MatterBody, Constraint, Events, Query, Composite } =
+    Matter);
+  if (!Engine?.create) {
+    throw new Error("Matter.js Engine unavailable after bootstrap");
+  }
+} catch (err) {
+  physicsBootstrapError = err instanceof Error ? err.message : String(err);
+  setWasmInitError(`matter-physics: ${physicsBootstrapError}`);
+}
+
+export const getPhysicsInitError = (): string | null =>
+  physicsBootstrapError ?? getWasmInitError();
+
+const assertMatterReady = (): void => {
+  const err = getPhysicsInitError();
+  if (err) throw new Error(`WASM INIT: ${err}`);
+};
 
 export interface Vec2 {
   x: number;
@@ -386,6 +414,7 @@ export class PhysicsWorld {
   private readonly baseGravity: number;
 
   constructor(options: { gravity: Vec2; stepMs?: number }) {
+    assertMatterReady();
     this.stepMs = options.stepMs ?? 1000 / 60;
     this.baseGravity = options.gravity.y;
     // Matter gravity.scale uses force = mass * y * scale; scale ≈ m/s² * 1e-6 matches Planck GRAVITY.
