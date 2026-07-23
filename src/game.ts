@@ -6,7 +6,7 @@ import {
   type RandomAPI,
   type TickContext,
 } from "@bordiko/sdk";
-import * as planck from "planck";
+import * as planck from "./matter-physics.ts";
 import { ARENA_H, ARENA_W, getMap, getNextMapId, type MapId } from "./maps.ts";
 
 export type WeaponId =
@@ -162,8 +162,6 @@ export interface PlayerInput {
   facing: number;
   crouching: boolean;
   shooting: boolean;
-  dodging: boolean;
-  dodgeDir: number;
 }
 
 export interface PlayerState {
@@ -171,12 +169,6 @@ export interface PlayerState {
   aimAngle: number;
   facing: number;
   crouching: boolean;
-  airDodging: boolean;
-  airBoosting: boolean;
-  airDodgeTicks: number;
-  groundDodging: boolean;
-  groundDodgeTicks: number;
-  dodgeDir: number;
   currentWeapon: WeaponId;
   ownedWeapons: WeaponId[];
   lastFireTick: number;
@@ -275,7 +267,8 @@ const FLOOR_PICKUP_Y = FLOOR_Y - 20;
 const PICKUP_FALL_SPEED = 8;
 const SCALE = 30;
 const MAX_HEALTH = 1000;
-const HEADSHOT_HEALTH_FRACTION = 0.5;
+const HEADSHOT_DAMAGE = MAX_HEALTH * 0.5;
+const BODY_BULLET_DAMAGE = MAX_HEALTH * 0.25;
 const HEAD_VISUAL_RADIUS_PX = 14;
 const HEAD_HIT_RADIUS_PX = HEAD_VISUAL_RADIUS_PX + 2;
 const BULLET_DAMAGE = 125;
@@ -284,30 +277,23 @@ const PLAYER_HALF_W = 0.48;
 const PLAYER_HALF_H = 1.06;
 const HEAD_OFFSET = 36;
 const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
-/** Fixed Planck timestep — one move advances one physics tick at 60Hz. */
+/** Fixed physics timestep — one move advances one physics tick at 60Hz. */
 const PHYSICS_HZ = 60;
 const PHYSICS_DT = 1 / PHYSICS_HZ;
+const PHYSICS_STEPS_PER_TICK = PHYSICS_HZ / 30;
 const MOVE_SPEED = 15;
-const DODGE_COOLDOWN_TICKS = 20;
-const GROUND_DODGE_SPEED = 34;
-const GROUND_DODGE_TICKS = 18;
-const AIR_DODGE_SPEED = 28;
-const AIR_DODGE_TICKS = 11;
-const AIR_BOOST_PUSH = 22;
-const AIR_BOOST_TICKS = 9;
-const JUMP_IMPULSE = 40;
+const JUMP_IMPULSE = 34;
+/** Target peak height = jump × this (impulse uses √ratio for energy scaling). */
+const RECOIL_HEIGHT_OF_JUMP = 0.9;
 const GRAVITY = 97.5;
 const WALL_JUMP_IMPULSE_X = 11;
 const BULLET_SPEED = 40;
 const BULLET_GRAVITY_SCALE = 0.62;
-const AIR_RECOIL_FORCE_MUL = 2.5;
-const AIR_RECOIL_VEL_MUL = 0.45;
-const AIR_RECOIL_IMPULSE_MUL = 1.4;
 const FEET_PIXELS = PLAYER_HALF_H * SCALE;
 const GROUNDED_VEL_Y = 12;
 const GROUNDED_GAP = 0.5;
 const STAND_LIFT = 0.14;
-const MAX_BULLET_BOUNCES = 2;
+const MAX_BULLET_BOUNCES = 1;
 const PLATFORM_HITS_TO_BREAK = 4;
 const PLATFORM_MAX_HEALTH = WEAPONS.winchester.damage * PLATFORM_HITS_TO_BREAK;
 const PLATFORM_BORDER_PX = 2;
@@ -349,15 +335,13 @@ let crateBodies: Record<number, planck.Body> = {};
 let pickupBodies: Record<number, planck.Body> = {};
 let bulletBodies: Record<number, planck.Body> = {};
 let bulletBounceCounts: Record<number, number> = {};
+let handledBulletContactsThisStep = new Set<number>();
+let handledBulletPlayerHitsThisStep = new Set<string>();
+let handledBulletWallBounceThisStep = new Set<number>();
 let playerGrounded: Record<string, boolean> = {};
 let playerWallJumpUsed: Record<string, boolean> = {};
 let playerWallContact: Record<string, { nx: number; ny: number } | null> = {};
 let playerJumpGrace: Record<string, number> = {};
-let playerDodgeCooldown: Record<string, number> = {};
-let playerGroundDodgeTicks: Record<string, number> = {};
-let playerDodgeDir: Record<string, number> = {};
-let playerAirDodgeTicks: Record<string, number> = {};
-let playerAirDodgeDir: Record<string, number> = {};
 const pendingBulletDestroys = new Set<number>();
 const pendingHits: HitEvent[] = [];
 const pendingPlatformDamages: { id: number; damage: number; x: number; y: number }[] = [];
@@ -482,18 +466,13 @@ function platformCenterMeters(plat: PlatformState) {
 
 function createPlatformBody(plat: PlatformState) {
   const pos = platformCenterMeters(plat);
-  const pBody =
-    plat.kind === "elevator"
-      ? world.createKinematicBody({ position: pos })
-      : world.createBody({ position: pos });
+  const pBody = world.createBody({ position: pos });
   pBody.createFixture(planck.Box(plat.w / 2 / SCALE, plat.h / 2 / SCALE), {
-    friction: 0.15,
+    friction: 0.35,
+    restitution: 0.05,
     userData: { type: "platform", id: plat.id } satisfies FixtureUserData,
   });
   platformBodies[plat.id] = pBody;
-  if (plat.kind === "elevator" && plat.vx) {
-    pBody.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-  }
 }
 
 function initPlatforms(G: ShooterState) {
@@ -761,40 +740,22 @@ function createPlayerPhysics(id: string, x: number, y: number) {
     userData: { type: "player", id } satisfies FixtureUserData,
   });
 
-  const head = world.createDynamicBody({
+  const head = world.createBody({
     position: planck.Vec2(x / SCALE, (y - HEAD_OFFSET) / SCALE),
-    fixedRotation: true,
   });
   head.createFixture(planck.Circle(HEAD_RADIUS), {
     density: 1.0,
     friction: 0.6,
     restitution: 0.0,
+    isSensor: true,
     userData: { type: "head", id } satisfies FixtureUserData,
   });
-
-  world.createJoint(
-    planck.RevoluteJoint(
-      {
-        lowerAngle: 0,
-        upperAngle: 0,
-        enableLimit: true,
-      },
-      torso,
-      head,
-      head.getPosition(),
-    ),
-  );
 
   playerBodies[id] = { torso, head };
   playerGrounded[id] = true;
   playerWallJumpUsed[id] = false;
   playerWallContact[id] = null;
   playerJumpGrace[id] = 0;
-  playerDodgeCooldown[id] = 0;
-  playerGroundDodgeTicks[id] = 0;
-  playerDodgeDir[id] = 1;
-  playerAirDodgeTicks[id] = 0;
-  playerAirDodgeDir[id] = 0;
 }
 
 function destroyPlayerPhysics(id: string) {
@@ -807,11 +768,6 @@ function destroyPlayerPhysics(id: string) {
   delete playerWallJumpUsed[id];
   delete playerWallContact[id];
   delete playerJumpGrace[id];
-  delete playerDodgeCooldown[id];
-  delete playerGroundDodgeTicks[id];
-  delete playerDodgeDir[id];
-  delete playerAirDodgeTicks[id];
-  delete playerAirDodgeDir[id];
 }
 
 function feetPositionMeters(torso: planck.Body) {
@@ -925,15 +881,7 @@ function measureGrounded(id: string, torso: planck.Body): boolean {
 
 function updatePlayerGroundedState() {
   for (const [id, bodies] of Object.entries(playerBodies)) {
-    const grounded = measureGrounded(id, bodies.torso);
-    playerGrounded[id] = grounded;
-    const p = currentG?.players[id];
-    if (grounded && p && (p.airDodging || p.airBoosting)) {
-      const velY = bodies.torso.getLinearVelocity().y;
-      if (velY >= -1) {
-        endAirDodge(id, p, bodies.torso);
-      }
-    }
+    playerGrounded[id] = measureGrounded(id, bodies.torso);
   }
 }
 
@@ -1037,7 +985,6 @@ function advancePlatformMotion(G: ShooterState) {
     const body = platformBodies[plat.id];
     if (body) {
       body.setTransform(platformCenterMeters(plat), 0);
-      body.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
     }
 
     applyPlatformRiderDelta(G, plat, dx);
@@ -1045,19 +992,19 @@ function advancePlatformMotion(G: ShooterState) {
 }
 
 function snapPlayersToGround() {
-  for (const [, bodies] of Object.entries(playerBodies)) {
+  for (const [id, bodies] of Object.entries(playerBodies)) {
     const torso = bodies.torso;
     const vel = torso.getLinearVelocity();
     if (Math.abs(vel.y) > 12) continue;
 
     const feet = feetPositionMeters(torso);
-    const surfaceHit = raycastStaticGroundBelow(feet.x, feet.y, 0.85);
+    const surfaceHit = raycastStandBelow(feet.x, feet.y, id, 0.85);
     if (surfaceHit === null) continue;
 
     const targetTorsoY = surfaceHit.y - PLAYER_HALF_H - STAND_LIFT;
     const pos = torso.getPosition();
     const dy = targetTorsoY - pos.y;
-    if (dy > -0.12 && dy < 0.45) {
+    if (dy > -0.08 && dy < 0.35) {
       torso.setTransform(planck.Vec2(pos.x, targetTorsoY), 0);
       if (Math.abs(vel.y) < 1.5) {
         torso.setLinearVelocity(planck.Vec2(vel.x, 0));
@@ -1089,190 +1036,6 @@ function applyVerticalJump(
     true,
   );
   playerJumpGrace[playerId] = 8;
-}
-
-function isPlayerDodging(_playerId: string, p: PlayerState | undefined): boolean {
-  if (!p) return false;
-  return (
-    (p.groundDodgeTicks ?? 0) > 0 ||
-    (p.airDodgeTicks ?? 0) > 0 ||
-    !!p.groundDodging ||
-    !!p.airDodging ||
-    !!p.airBoosting
-  );
-}
-
-function resolveDodgeDirFromInput(data: PlayerInput): number {
-  if (data.dodgeDir !== 0) return data.dodgeDir >= 0 ? 1 : -1;
-  if (data.action === "left") return -1;
-  if (data.action === "right") return 1;
-  return data.facing >= 0 ? 1 : -1;
-}
-
-function disablePlayerCollisionDuringDodge(contact: planck.Contact) {
-  const fixtureA = contact.getFixtureA();
-  const fixtureB = contact.getFixtureB();
-  const dataA = getFixtureData(fixtureA);
-  const dataB = getFixtureData(fixtureB);
-
-  const playerA =
-    dataA?.type === "player" || dataA?.type === "head" ? dataA.id : null;
-  const playerB =
-    dataB?.type === "player" || dataB?.type === "head" ? dataB.id : null;
-
-  if (!playerA || !playerB || playerA === playerB) return;
-
-  const pA = currentG?.players[playerA];
-  const pB = currentG?.players[playerB];
-  if (isPlayerDodging(playerA, pA) || isPlayerDodging(playerB, pB)) {
-    contact.setEnabled(false);
-  }
-}
-
-function endGroundDodge(playerId: string, p: PlayerState, torso: planck.Body) {
-  playerGroundDodgeTicks[playerId] = 0;
-  playerDodgeDir[playerId] = 0;
-  p.groundDodging = false;
-  p.groundDodgeTicks = 0;
-  p.dodgeDir = 0;
-  const vy = torso.getLinearVelocity().y;
-  torso.setLinearVelocity(planck.Vec2(0, vy));
-  if (p.input) {
-    p.input.dodgeDir = 0;
-    p.input.dodging = false;
-    p.input.action = null;
-  }
-}
-
-function tickGroundDodgeSlide(playerId: string, p: PlayerState, torso: planck.Body): boolean {
-  let ticks = playerGroundDodgeTicks[playerId] ?? 0;
-  if (ticks <= 0) {
-    if (p.groundDodging) endGroundDodge(playerId, p, torso);
-    return false;
-  }
-
-  if (!isPlayerGrounded(playerId, torso)) {
-    endGroundDodge(playerId, p, torso);
-    return false;
-  }
-
-  const dir = playerDodgeDir[playerId] ?? (p.dodgeDir >= 0 ? 1 : -1);
-  const progress = 1 - ticks / GROUND_DODGE_TICKS;
-  const speedMul = (1 - progress) * (1 - progress);
-  torso.setLinearVelocity(
-    planck.Vec2(dir * GROUND_DODGE_SPEED * speedMul, torso.getLinearVelocity().y),
-  );
-
-  ticks -= 1;
-  playerGroundDodgeTicks[playerId] = ticks;
-  p.groundDodgeTicks = ticks;
-  p.groundDodging = ticks > 0;
-
-  if (ticks <= 0) {
-    endGroundDodge(playerId, p, torso);
-    return false;
-  }
-  return true;
-}
-
-function endAirDodge(playerId: string, p: PlayerState, torso: planck.Body) {
-  playerAirDodgeTicks[playerId] = 0;
-  playerAirDodgeDir[playerId] = 0;
-  p.airDodging = false;
-  p.airBoosting = false;
-  p.airDodgeTicks = 0;
-  p.dodgeDir = 0;
-  const vy = torso.getLinearVelocity().y;
-  torso.setLinearVelocity(planck.Vec2(0, vy));
-  if (p.input) {
-    p.input.dodgeDir = 0;
-    p.input.dodging = false;
-    p.input.action = null;
-  }
-}
-
-function tickAirDodgeSlide(playerId: string, p: PlayerState, torso: planck.Body): boolean {
-  let ticks = playerAirDodgeTicks[playerId] ?? 0;
-  if (ticks <= 0) {
-    if (p.airDodging || p.airBoosting) endAirDodge(playerId, p, torso);
-    return false;
-  }
-
-  const vel = torso.getLinearVelocity();
-
-  if (p.airBoosting) {
-    const progress = 1 - ticks / AIR_BOOST_TICKS;
-    const speedMul = (1 - progress) * (1 - progress);
-    torso.setLinearVelocity(planck.Vec2(vel.x * 0.88, -AIR_BOOST_PUSH * speedMul));
-  } else {
-    const dir = playerAirDodgeDir[playerId] ?? (p.dodgeDir >= 0 ? 1 : -1);
-    const progress = 1 - ticks / AIR_DODGE_TICKS;
-    const speedMul = (1 - progress) * (1 - progress);
-    torso.setLinearVelocity(planck.Vec2(dir * AIR_DODGE_SPEED * speedMul, vel.y));
-  }
-
-  ticks -= 1;
-  playerAirDodgeTicks[playerId] = ticks;
-  p.airDodgeTicks = ticks;
-  if (p.airBoosting) {
-    p.airBoosting = ticks > 0;
-  } else {
-    p.airDodging = ticks > 0;
-  }
-
-  if (ticks <= 0) {
-    endAirDodge(playerId, p, torso);
-    return false;
-  }
-  return true;
-}
-
-function applyGroundDodge(
-  torso: planck.Body,
-  playerId: string,
-  dir: number,
-  p: PlayerState,
-) {
-  torso.setAwake(true);
-  const vy = torso.getLinearVelocity().y;
-  torso.setLinearVelocity(planck.Vec2(dir * GROUND_DODGE_SPEED, Math.min(vy, 0)));
-  playerGroundDodgeTicks[playerId] = GROUND_DODGE_TICKS;
-  playerDodgeDir[playerId] = dir;
-  p.groundDodging = true;
-  p.groundDodgeTicks = GROUND_DODGE_TICKS;
-  p.dodgeDir = dir;
-  p.facing = dir;
-}
-
-function applyAirDodge(
-  torso: planck.Body,
-  playerId: string,
-  dir: number,
-  p: PlayerState,
-) {
-  torso.setAwake(true);
-  const vy = torso.getLinearVelocity().y;
-  torso.setLinearVelocity(planck.Vec2(dir * AIR_DODGE_SPEED, vy));
-  playerJumpGrace[playerId] = 6;
-  p.airDodging = true;
-  p.airBoosting = false;
-  p.airDodgeTicks = AIR_DODGE_TICKS;
-  p.dodgeDir = dir;
-  p.facing = dir;
-  playerAirDodgeTicks[playerId] = AIR_DODGE_TICKS;
-  playerAirDodgeDir[playerId] = dir;
-}
-
-function applyAirBoost(torso: planck.Body, playerId: string, p: PlayerState) {
-  torso.setAwake(true);
-  const vel = torso.getLinearVelocity();
-  torso.setLinearVelocity(planck.Vec2(vel.x * 0.85, -AIR_BOOST_PUSH * 0.55));
-  playerJumpGrace[playerId] = 6;
-  p.airBoosting = true;
-  p.airDodging = false;
-  p.airDodgeTicks = AIR_BOOST_TICKS;
-  playerAirDodgeTicks[playerId] = AIR_BOOST_TICKS;
-  playerAirDodgeDir[playerId] = 0;
 }
 
 function isWallLikeContact(otherFixture: planck.Fixture, selfId: string) {
@@ -1374,10 +1137,6 @@ function resolvePlayerSideStick() {
 
   for (const id of Object.keys(playerJumpGrace)) {
     if (playerJumpGrace[id] > 0) playerJumpGrace[id]--;
-  }
-
-  for (const id of Object.keys(playerDodgeCooldown)) {
-    if (playerDodgeCooldown[id] > 0) playerDodgeCooldown[id]--;
   }
 }
 
@@ -1583,7 +1342,7 @@ function spawnProjectile(
   });
 
   const speed = weapon.speed || BULLET_SPEED;
-  bBody.setLinearVelocity(
+  bBody.setBallisticVelocity(
     planck.Vec2(Math.cos(shotAngle) * speed, Math.sin(shotAngle) * speed),
   );
 
@@ -1608,31 +1367,23 @@ function applyRecoil(
   crouching: boolean,
   weaponId: WeaponId,
 ) {
-  const weapon = WEAPONS[weaponId];
-  const tVel = torso.getLinearVelocity();
-  const baseRecoil = (crouching ? weapon.recoilForce * 0.38 : weapon.recoilForce);
-  const sideways = Math.abs(Math.sin(aimAngle));
-  const groundedMul = onGround ? 1 + sideways * 1.15 : AIR_RECOIL_FORCE_MUL;
-  const recoilForce = baseRecoil * groundedMul;
-  const rx = -Math.cos(aimAngle) * recoilForce;
-  const ry = -Math.sin(aimAngle) * recoilForce;
-  const impulseMul = weapon.recoilImpulseMul ?? 1.4;
-  const velMul = weaponId === "bazooka" ? 0.58 : weaponId === "sniper" ? 0.42 : 0.32;
-  const velYMul = weaponId === "bazooka" ? 0.38 : 0.18;
+  const mass = torso.getMass();
+  const weaponScale =
+    weaponId === "bazooka"
+      ? 1.35
+      : weaponId === "sniper"
+        ? 1.15
+        : weaponId === "winchester_shotgun"
+          ? 0.85
+          : 1.0;
+  let impulseMag = JUMP_IMPULSE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP) * weaponScale;
+  if (crouching && onGround) impulseMag *= 0.45;
 
-  if (onGround) {
-    torso.setLinearVelocity(planck.Vec2(tVel.x + rx * velMul, tVel.y + ry * velYMul));
-    torso.applyLinearImpulse(planck.Vec2(rx * impulseMul, ry * impulseMul), torso.getWorldCenter(), true);
-  } else {
-    torso.setLinearVelocity(
-      planck.Vec2(tVel.x + rx * AIR_RECOIL_VEL_MUL, tVel.y + ry * AIR_RECOIL_VEL_MUL),
-    );
-    torso.applyLinearImpulse(
-      planck.Vec2(rx * AIR_RECOIL_IMPULSE_MUL * (impulseMul * 0.55), ry * AIR_RECOIL_IMPULSE_MUL * (impulseMul * 0.55)),
-      torso.getWorldCenter(),
-      true,
-    );
-  }
+  const ix = -Math.cos(aimAngle) * mass * impulseMag;
+  const iy = -Math.sin(aimAngle) * mass * impulseMag;
+
+  torso.setAwake(true);
+  torso.applyLinearImpulse(planck.Vec2(ix, iy), torso.getWorldCenter(), true);
 }
 
 function getPickupCollectY(pickup: PickupState) {
@@ -1718,26 +1469,10 @@ function pickupBodyOverlapsPlayer(bodies: { torso: planck.Body; head: planck.Bod
   const pickBody = pickupBodies[pickupId];
   if (!pickBody) return false;
 
-  const pickFixture = pickBody.getFixtureList();
-  if (!pickFixture) return false;
-
-  for (const part of [bodies.torso, bodies.head]) {
-    for (let fixture = part.getFixtureList(); fixture; fixture = fixture.getNext()) {
-      if (
-        planck.testOverlap(
-          fixture.getShape(),
-          0,
-          pickFixture.getShape(),
-          0,
-          fixture.getBody().getTransform(),
-          pickBody.getTransform(),
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return (
+    planck.testBodyOverlap(bodies.torso, pickBody) ||
+    planck.testBodyOverlap(bodies.head, pickBody)
+  );
 }
 
 function collectPickupsForPlayers(G: ShooterState) {
@@ -1998,14 +1733,41 @@ function bulletHitsHeadZone(targetId: string, bulletBody: planck.Body): boolean 
   const speed = Math.hypot(vel.x, vel.y);
   if (speed < 0.01) return false;
 
-  const backPx = 8;
-  const px = bx - (vel.x / speed) * backPx;
-  const py = by - (vel.y / speed) * backPx;
-
   const hPos = bodies.head.getPosition();
   const hx = hPos.x * SCALE;
   const hy = hPos.y * SCALE;
-  return distPointToSegment(hx, hy, px, py, bx, by) <= HEAD_HIT_RADIUS_PX;
+  const nx = vel.x / speed;
+  const ny = vel.y / speed;
+
+  // Longer backtrack so point-blank torso contacts still count head line hits.
+  const backPx = 88;
+  const fwdPx = 14;
+  const x1 = bx - nx * backPx;
+  const y1 = by - ny * backPx;
+  const x2 = bx + nx * fwdPx;
+  const y2 = by + ny * fwdPx;
+
+  if (distPointToSegment(hx, hy, x1, y1, x2, y2) <= HEAD_HIT_RADIUS_PX + 2) {
+    return true;
+  }
+
+  const torsoPos = bodies.torso.getPosition();
+  const tx = torsoPos.x * SCALE;
+  const ty = torsoPos.y * SCALE;
+  const toHeadX = hx - tx;
+  const toHeadY = hy - ty;
+  const toHeadLen = Math.hypot(toHeadX, toHeadY) || 1;
+  const aimDot = (nx * toHeadX + ny * toHeadY) / toHeadLen;
+  const closeRange = Math.hypot(bx - hx, by - hy) <= HEAD_HIT_RADIUS_PX + PLAYER_HALF_W * SCALE + 18;
+
+  return closeRange && aimDot > 0.55;
+}
+
+function headHitPointPx(targetId: string): { x: number; y: number } | null {
+  const bodies = playerBodies[targetId];
+  if (!bodies) return null;
+  const hPos = bodies.head.getPosition();
+  return { x: hPos.x * SCALE, y: hPos.y * SCALE };
 }
 
 function resolveBulletPlayerDamage(
@@ -2022,14 +1784,18 @@ function resolveBulletPlayerDamage(
 
   if (headshot) {
     return {
-      damage: Math.floor(MAX_HEALTH * HEADSHOT_HEALTH_FRACTION),
+      damage: HEADSHOT_DAMAGE,
       isHeadshot: true,
     };
   }
-  return { damage: bulletDamage, isHeadshot: false };
+  return { damage: BODY_BULLET_DAMAGE, isHeadshot: false };
 }
 
 function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact) {
+  const contactId = contact.getId();
+  if (handledBulletContactsThisStep.has(contactId)) return;
+  handledBulletContactsThisStep.add(contactId);
+
   const fixtureA = contact.getFixtureA();
   const fixtureB = contact.getFixtureB();
   const dataA = getFixtureData(fixtureA);
@@ -2052,8 +1818,13 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
 
   if (otherData?.type === "player" || otherData?.type === "head") {
     if (otherData.id === owner) return;
+    const target = G.players[otherData.id];
+    if (!target || target.health <= 0) return;
+    if (G.roundPhase !== "playing") return;
     if (!canDamage(G, owner, otherData.id)) return;
     if (!playerBodies[otherData.id]) return;
+    if (handledBulletPlayerHitsThisStep.has(String(bulletData.id))) return;
+    handledBulletPlayerHitsThisStep.add(String(bulletData.id));
     pendingBulletDestroys.add(bulletData.id);
     const contactPoint = getContactHitPointPx(contact);
     const bulletPxX = bulletPos.x * SCALE;
@@ -2065,9 +1836,10 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
       contactPoint,
       bulletDamage,
     );
+    const headPoint = isHeadshot ? headHitPointPx(otherData.id) : null;
     pendingHits.push({
-      x: contactPoint?.x ?? bulletPxX,
-      y: contactPoint?.y ?? bulletPxY,
+      x: headPoint?.x ?? contactPoint?.x ?? bulletPxX,
+      y: headPoint?.y ?? contactPoint?.y ?? bulletPxY,
       targetId: otherData.id,
       damage,
       isHeadshot,
@@ -2104,6 +1876,9 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
       return;
     }
 
+    if (handledBulletWallBounceThisStep.has(bulletData.id)) return;
+    handledBulletWallBounceThisStep.add(bulletData.id);
+
     const bounces = bulletBounceCounts[bulletData.id] ?? 0;
     pendingHits.push({
       x: bulletPos.x * SCALE,
@@ -2124,18 +1899,25 @@ function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact)
 
     let nx = sharedWorldManifold.normal.x;
     let ny = sharedWorldManifold.normal.y;
+    if (Math.hypot(nx, ny) < 0.01) {
+      nx = 0;
+      ny = bulletPos.y * SCALE >= FLOOR_Y - 2 ? -1 : 1;
+    }
     const dot = vel.x * nx + vel.y * ny;
     if (dot > 0) {
       nx = -nx;
       ny = -ny;
     }
     const reflectDot = vel.x * nx + vel.y * ny;
-    const bounce = 0.68;
-    bulletBody.setLinearVelocity(
-      planck.Vec2(
-        (vel.x - 2 * reflectDot * nx) * bounce,
-        (vel.y - 2 * reflectDot * ny) * bounce,
-      ),
+    const speed = Math.hypot(vel.x, vel.y);
+    const bounce = speed > 28 ? 0.72 : speed > 12 ? 0.58 : 0.42;
+    const rvx = (vel.x - 2 * reflectDot * nx) * bounce;
+    const rvy = (vel.y - 2 * reflectDot * ny) * bounce;
+    bulletBody.setBallisticVelocity(planck.Vec2(rvx, rvy));
+    const pos = bulletBody.getPosition();
+    bulletBody.setTransform(
+      planck.Vec2(pos.x - nx * 0.06, pos.y - ny * 0.06),
+      bulletBody.getAngle(),
     );
   }
 }
@@ -2153,16 +1935,8 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
   const grounded = isPlayerGrounded(playerId, torso);
   p.crouching = crouching && grounded;
   const speedMul = p.crouching ? 0.45 : 1;
-  const dodgeTicks = playerGroundDodgeTicks[playerId] ?? 0;
-  const airDodgeTicks = playerAirDodgeTicks[playerId] ?? 0;
-  const dodgingSlide = dodgeTicks > 0;
-  const airSliding = airDodgeTicks > 0;
 
-  if (dodgingSlide) {
-    tickGroundDodgeSlide(playerId, p, torso);
-  } else if (airSliding) {
-    tickAirDodgeSlide(playerId, p, torso);
-  } else if (data.action === "left") {
+  if (data.action === "left") {
     torso.setLinearVelocity(planck.Vec2(-MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
   } else if (data.action === "right") {
     torso.setLinearVelocity(planck.Vec2(MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
@@ -2172,7 +1946,7 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     torso.setLinearVelocity(planck.Vec2(0, torso.getLinearVelocity().y));
   }
 
-    if (data.jumping) {
+  if (data.jumping) {
     const wall = playerWallContact[playerId];
     const standingJump = canPerformStandingJump(playerId, torso, p.crouching);
 
@@ -2189,48 +1963,11 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     data.jumping = false;
   }
 
-  if (data.dodging) {
-    if (
-      (playerDodgeCooldown[playerId] ?? 0) <= 0 &&
-      !p.crouching &&
-      dodgeTicks <= 0 &&
-      airDodgeTicks <= 0 &&
-      !p.groundDodging &&
-      !p.airDodging &&
-      !p.airBoosting
-    ) {
-      const onGround = isPlayerGrounded(playerId, torso);
-      const velY = torso.getLinearVelocity().y;
-      const dodgeDir = resolveDodgeDirFromInput(data);
-      p.facing = dodgeDir;
-      data.facing = dodgeDir;
-
-      if (onGround) {
-        applyGroundDodge(torso, playerId, dodgeDir, p);
-        data.action = null;
-      } else if (velY < -0.8) {
-        applyAirBoost(torso, playerId, p);
-        data.action = null;
-      } else {
-        applyAirDodge(torso, playerId, dodgeDir, p);
-        data.action = null;
-      }
-
-      playerDodgeCooldown[playerId] = DODGE_COOLDOWN_TICKS;
-    }
-    data.dodging = false;
-    data.dodgeDir = 0;
-  }
-
   if (data.shooting) {
     fireWeapon(G, playerId, data.aimAngle, data.facing, random);
   }
 
-  const stillDodging =
-    (playerGroundDodgeTicks[playerId] ?? 0) > 0 ||
-    (playerAirDodgeTicks[playerId] ?? 0) > 0;
   if (
-    !stillDodging &&
     data.action !== "left" &&
     data.action !== "right" &&
     data.action !== "crouch" &&
@@ -2243,16 +1980,31 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
   }
 }
 
+function syncHeadBodiesFromTorso() {
+  for (const [, bodies] of Object.entries(playerBodies)) {
+    const tPos = bodies.torso.getPosition();
+    bodies.head.setTransform(
+      planck.Vec2(tPos.x, tPos.y - HEAD_OFFSET / SCALE),
+      0,
+    );
+  }
+}
+
 function advanceWorld(G: ShooterState, random: RandomAPI) {
   setCurrentG(G);
   G.hitEvents = [];
   G.worldTick += 1;
 
   if (G.roundPhase === "playing") {
+    handledBulletContactsThisStep.clear();
+    handledBulletPlayerHitsThisStep.clear();
+    handledBulletWallBounceThisStep.clear();
     runSpawnCycle(G, random);
     advancePlatformMotion(G);
     updatePickupDrops(G);
+    syncHeadBodiesFromTorso();
     world.step(PHYSICS_DT);
+    syncHeadBodiesFromTorso();
     updatePlayerGroundedState();
     updatePlayerWallContacts();
     resolvePlayerSideStick();
@@ -2308,21 +2060,24 @@ function resetRound(G: ShooterState) {
   pickupBodies = {};
   bulletBodies = {};
   bulletBounceCounts = {};
+  handledBulletContactsThisStep.clear();
+  handledBulletPlayerHitsThisStep.clear();
+  handledBulletWallBounceThisStep.clear();
   playerGrounded = {};
   playerWallJumpUsed = {};
   playerWallContact = {};
   playerJumpGrace = {};
-  playerDodgeCooldown = {};
-  playerGroundDodgeTicks = {};
-  playerDodgeDir = {};
-  playerAirDodgeTicks = {};
-  playerAirDodgeDir = {};
   G.bullets = [];
   G.crates = [];
   G.pickups = [];
   G.hitEvents = [];
   G.spawnTick = 0;
   G.worldTick = 0;
+  pendingHits.length = 0;
+  pendingPlatformDamages.length = 0;
+  pendingCrateDamages.length = 0;
+  pendingExplosions.length = 0;
+  pendingBulletDestroys.clear();
   initPlatforms(G);
 
   const mapDef = getMap(G.currentMapId);
@@ -2333,15 +2088,17 @@ function resetRound(G: ShooterState) {
     const spawn = spawnOnFloor(spawns[index % spawns.length]);
     p.health = MAX_HEALTH;
     p.crouching = false;
-    p.airDodging = false;
-    p.airBoosting = false;
-    p.airDodgeTicks = 0;
-    p.groundDodging = false;
-    p.groundDodgeTicks = 0;
-    p.dodgeDir = 0;
     p.currentWeapon = START_WEAPON;
     p.ownedWeapons = defaultOwnedWeapons();
     p.lastFireTick = 0;
+    p.input = {
+      action: null,
+      jumping: false,
+      aimAngle: p.aimAngle,
+      facing: p.facing,
+      crouching: false,
+      shooting: false,
+    };
     createPlayerPhysics(id, spawn.x, spawn.y);
     index++;
   }
@@ -2438,14 +2195,7 @@ export default defineGame<ShooterState>({
 
     setCurrentG(G);
 
-    // Bulletproof delta time logic
-    let deltaMs = typeof dt === "number" ? dt : 1000 / 30;
-    if (deltaMs < 1) deltaMs *= 1000; // Convert seconds to ms if needed
-
-    // 3. Guarantee at least 1 step, and cap at 5 to prevent infinite loops
-    let steps = Math.round(deltaMs / (1000 / PHYSICS_HZ));
-    if (isNaN(steps) || steps < 1) steps = 1;
-    if (steps > 5) steps = 5;
+    const steps = PHYSICS_STEPS_PER_TICK;
 
     for (let i = 0; i < steps; i++) {
       if (G.roundPhase === "intermission") {
@@ -2468,22 +2218,20 @@ export default defineGame<ShooterState>({
       throw new Error("teams2v2 requires exactly 4 players");
     }
 
-    world = planck.World({ gravity: planck.Vec2(0, GRAVITY) });
+    world = new planck.World({ gravity: planck.Vec2(0, GRAVITY) });
     playerBodies = {};
     platformBodies = {};
     crateBodies = {};
     pickupBodies = {};
     bulletBodies = {};
     bulletBounceCounts = {};
+    handledBulletContactsThisStep.clear();
+    handledBulletPlayerHitsThisStep.clear();
+    handledBulletWallBounceThisStep.clear();
     playerGrounded = {};
     playerWallJumpUsed = {};
     playerWallContact = {};
     playerJumpGrace = {};
-    playerDodgeCooldown = {};
-    playerGroundDodgeTicks = {};
-    playerDodgeDir = {};
-    playerAirDodgeTicks = {};
-    playerAirDodgeDir = {};
     pendingHits.length = 0;
     pendingPlatformDamages.length = 0;
     pendingCrateDamages.length = 0;
@@ -2496,34 +2244,34 @@ export default defineGame<ShooterState>({
       handleContactWithBulletDamage(currentG, contact);
     });
 
-    world.on("pre-solve", (contact) => {
-      if (!currentG) return;
-      if (!contact.isTouching()) return;
-      disablePlayerCollisionDuringDodge(contact);
-      handleContactWithBulletDamage(currentG, contact);
-    });
+    const addGroundEdge = (
+      v1: planck.Vec2,
+      v2: planck.Vec2,
+      opts: { friction?: number; restitution?: number; userData?: FixtureUserData },
+    ) => {
+      const edge = world.createBody();
+      edge.createFixture(planck.Edge(v1, v2), opts);
+    };
 
-    const ground = world.createBody();
-    ground.createFixture(
-      planck.Edge(planck.Vec2(0, FLOOR_Y / SCALE), planck.Vec2(ARENA_W / SCALE, FLOOR_Y / SCALE)),
+    addGroundEdge(
+      planck.Vec2(0, FLOOR_Y / SCALE),
+      planck.Vec2(ARENA_W / SCALE, FLOOR_Y / SCALE),
       { friction: 1.0, userData: { type: "ground" } satisfies FixtureUserData },
     );
-    ground.createFixture(planck.Edge(planck.Vec2(0, 0), planck.Vec2(0, ARENA_H / SCALE)), {
+    addGroundEdge(planck.Vec2(0, 0), planck.Vec2(0, ARENA_H / SCALE), {
       friction: 0.0,
       userData: { type: "ground" } satisfies FixtureUserData,
     });
-    ground.createFixture(
-      planck.Edge(planck.Vec2(ARENA_W / SCALE, 0), planck.Vec2(ARENA_W / SCALE, ARENA_H / SCALE)),
+    addGroundEdge(
+      planck.Vec2(ARENA_W / SCALE, 0),
+      planck.Vec2(ARENA_W / SCALE, ARENA_H / SCALE),
       { friction: 0.0, userData: { type: "ground" } satisfies FixtureUserData },
     );
-    ground.createFixture(
-      planck.Edge(planck.Vec2(0, 0), planck.Vec2(ARENA_W / SCALE, 0)),
-      {
-        friction: 0.2,
-        restitution: 0.12,
-        userData: { type: "ground" } satisfies FixtureUserData,
-      },
-    );
+    addGroundEdge(planck.Vec2(0, 0), planck.Vec2(ARENA_W / SCALE, 0), {
+      friction: 0.2,
+      restitution: 0.12,
+      userData: { type: "ground" } satisfies FixtureUserData,
+    });
 
     const players: Record<string, PlayerState> = {};
     const teams = gameMode === "teams2v2" ? assignTeams(ctx.players) : {};
@@ -2538,12 +2286,6 @@ export default defineGame<ShooterState>({
         aimAngle: 0,
         facing: 1,
         crouching: false,
-        airDodging: false,
-        airBoosting: false,
-        airDodgeTicks: 0,
-        groundDodging: false,
-        groundDodgeTicks: 0,
-        dodgeDir: 0,
         currentWeapon: START_WEAPON,
         ownedWeapons: defaultOwnedWeapons(),
         lastFireTick: -1,
@@ -2598,13 +2340,6 @@ export default defineGame<ShooterState>({
         facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
         crouching: !!data.crouching,
         shooting: !!data.shooting,
-        dodging: !!data.dodging,
-        dodgeDir:
-          typeof data.dodgeDir === "number" && data.dodgeDir !== 0
-            ? data.dodgeDir >= 0
-              ? 1
-              : -1
-            : 0,
       };
       p.aimAngle = p.input.aimAngle;
       p.facing = p.input.facing;
@@ -2643,8 +2378,6 @@ export default defineGame<ShooterState>({
           facing: p.facing,
           crouching: false,
           shooting: false,
-          dodging: false,
-          dodgeDir: 0,
         },
       },
     ];

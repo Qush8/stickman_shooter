@@ -24,10 +24,11 @@
   },
   "dependencies": {
     "@bordiko/sdk": "^0.2.0",
-    "planck": "^1.4.2"
+    "matter-js": "^0.20.0"
   },
   "devDependencies": {
     "@bordiko/cli": "^0.1.0",
+    "@types/matter-js": "^0.20.2",
     "@types/node": "^26.1.1",
     "esbuild": "^0.28.1"
   }
