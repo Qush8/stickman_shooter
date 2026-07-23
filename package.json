@@ -8,6 +8,7 @@
     "displayName": "Stickman Shooter",
     "minPlayers": 2,
     "maxPlayers": 4,
+    "board": "custom",
     "realtime": {
       "tick": true,
       "tickRate": 30

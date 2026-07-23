@@ -1144,7 +1144,8 @@ window.addEventListener("keydown", (e) => {
         lastDodgeQueuedAt = now;
         dodgeQueued = true;
         if (isGameplayInputEnabled(latestState?.G)) {
-            const dir = resolveDodgeFacing(me);
+            const dir = resolveDodgeDir(me);
+            me.facing = dir;
             const crouching =
                 isKeyPressed("KeyS", "s", "S", "ArrowDown") ||
                 [...activeKeys].some((k) => isCrouchKey(k, k));
@@ -1199,13 +1200,24 @@ window.addEventListener("keyup", (e) => {
     if (e.key) activeKeys.delete(e.key.toLowerCase());
     if (isDodgeKey(e.code)) {
         pendingDodgeDir = 0;
+        pendingDodge = false;
     }
-    if (isMoveKey(e.code)) {
+    if (isMoveKey(e.code) || isDodgeKey(e.code)) {
         const me = latestState ? localPlayers[latestState.playerId] : null;
         if (me && me.health > 0 && isGameplayInputEnabled(latestState?.G)) {
             me.vx = 0;
             flushHorizontalInputRelease(me);
         }
+    }
+});
+
+window.addEventListener("blur", () => {
+    activeKeys.clear();
+    jumpQueued = false;
+    dodgeQueued = false;
+    const me = latestState ? localPlayers[latestState.playerId] : null;
+    if (me && latestState && isGameplayInputEnabled(latestState.G)) {
+        flushNeutralInput(me);
     }
 });
 
@@ -1920,7 +1932,15 @@ const SHADOW_DASH = {
 
 const DODGE_COOLDOWN_MS = Math.ceil(((20 + 18) / 60) * 1000);
 
-const resolveDodgeFacing = (p) => (p?.facing >= 0 ? 1 : -1);
+const resolveDodgeDir = (p) => {
+    const action = resolveHorizontalAction();
+    if (action === "left") return -1;
+    if (action === "right") return 1;
+    if (p?.facing != null) return p.facing >= 0 ? 1 : -1;
+    return 1;
+};
+
+const resolveDodgeFacing = (p) => resolveDodgeDir(p);
 
 const isClientDodgeActive = (p) => p.clientDodge?.active && (p.clientDodge.ticks ?? 0) > 0;
 
@@ -2064,12 +2084,12 @@ const finishShadowTeleport = (p, impactFlash = false) => {
 
 const clearDodgeMotionState = (p) => finishShadowTeleport(p, false);
 
-const resolveClientDodgeKind = (p, dir) => {
-    const facingDir = resolveDodgeFacing(p);
+const resolveClientDodgeKind = (p) => {
+    const dir = resolveDodgeDir(p);
     const airborne = !!p.airborne || Math.abs(p.vy ?? 0) > 0.85 || !p.grounded;
-    if (!airborne) return { kind: "ground", dir: facingDir };
-    if ((p.vy ?? 0) < -0.5) return { kind: "boost", dir: facingDir };
-    return { kind: "air", dir: facingDir };
+    if (!airborne) return { kind: "ground", dir };
+    if ((p.vy ?? 0) < -0.5) return { kind: "boost", dir };
+    return { kind: "air", dir };
 };
 
 const beginShadowTeleportOrigin = (p, kind, dir) => {
@@ -2190,7 +2210,7 @@ const buildTravelGhostPose = (st) => {
 
 const pushShadowAfterimage = (st) => {
     if (st.phase !== "travel") return;
-    const lagT = Math.max(0, st.travelEase - 0.05 - Math.random() * 0.04);
+    const lagT = Math.max(0, st.travelEase - 0.07);
     const lagSt = {
         ...st,
         cx: st.ax + (st.bx - st.ax) * lagT,
@@ -2268,6 +2288,16 @@ const buildMovementInput = (me, action, crouching, pendingJump, pendingDodge, do
         dodging: pendingDodge,
         dodgeDir: pendingDodge ? dodgeDirForInput : 0,
     };
+};
+
+const flushNeutralInput = (me) => {
+    if (!me || me.health <= 0) return;
+    me.vx = 0;
+    pendingJump = false;
+    pendingDodge = false;
+    pendingDodgeDir = 0;
+    dodgeQueued = false;
+    flushHorizontalInputRelease(me);
 };
 
 const flushHorizontalInputRelease = (me) => {
@@ -2370,6 +2400,10 @@ const lerpPlayerDisplay = (p, dt, isMe, baseSmooth) => {
 
     p.displayTorso = lerpBody(p.displayTorso, targetTorso, t);
     p.displayHead = lerpBody(p.displayHead, targetHead, t);
+    // Keep head vertically aligned with torso — no physics wobble tilt
+    p.displayHead.x = p.displayTorso.x;
+    p.displayHead.angle = 0;
+    p.displayTorso.angle = 0;
 };
 
 const getShadowTeleportPose = (p) => {
@@ -2490,7 +2524,7 @@ const getStickPose = (p) => {
     return {
         tx,
         ty,
-        hx: p.displayHead.x,
+        hx,
         hy: crouch ? hy + drop * 0.12 : hy,
         neckTop,
         hipY,
@@ -3588,7 +3622,11 @@ app.ticker.add(() => {
                 dodgeQueued = false;
             }
 
-            dodgeDirForInput = pendingDodge ? resolveDodgeFacing(me) : 0;
+            dodgeDirForInput = pendingDodge ? resolveDodgeDir(me) : 0;
+
+            if (pendingDodge) {
+                me.facing = dodgeDirForInput;
+            }
 
             const pose = getStickPose(me);
             me.aimAngle = Math.atan2(mouseY - pose.neckTop, mouseX - me.displayTorso.x);
@@ -3657,21 +3695,10 @@ app.ticker.add(() => {
                     dodgeDirForInput,
                     pointerHeld,
                 );
-                
-                if (!lastSentInput || 
-                    lastSentInput.action !== input.action || 
-                    lastSentInput.jumping !== input.jumping || 
-                    lastSentInput.facing !== input.facing || 
-                    lastSentInput.crouching !== input.crouching || 
-                    lastSentInput.shooting !== input.shooting || 
-                    lastSentInput.dodging !== input.dodging ||
-                    lastSentInput.dodgeDir !== input.dodgeDir ||
-                    Math.abs(lastSentInput.aimAngle - input.aimAngle) > 0.05
-                ) {
-                    proposeMove("input", input);
-                    lastSentInput = { ...input };
-                }
-                
+
+                proposeMove("input", input);
+                lastSentInput = { ...input };
+
                 pendingJump = false;
                 pendingDodge = false;
                 pendingDodgeDir = 0;

@@ -763,6 +763,7 @@ function createPlayerPhysics(id: string, x: number, y: number) {
 
   const head = world.createDynamicBody({
     position: planck.Vec2(x / SCALE, (y - HEAD_OFFSET) / SCALE),
+    fixedRotation: true,
   });
   head.createFixture(planck.Circle(HEAD_RADIUS), {
     density: 1.0,
@@ -774,8 +775,8 @@ function createPlayerPhysics(id: string, x: number, y: number) {
   world.createJoint(
     planck.RevoluteJoint(
       {
-        lowerAngle: -0.2,
-        upperAngle: 0.2,
+        lowerAngle: 0,
+        upperAngle: 0,
         enableLimit: true,
       },
       torso,
@@ -1090,15 +1091,22 @@ function applyVerticalJump(
   playerJumpGrace[playerId] = 8;
 }
 
-function isPlayerDodging(playerId: string, p: PlayerState | undefined): boolean {
+function isPlayerDodging(_playerId: string, p: PlayerState | undefined): boolean {
   if (!p) return false;
   return (
-    (playerGroundDodgeTicks[playerId] ?? 0) > 0 ||
-    (playerAirDodgeTicks[playerId] ?? 0) > 0 ||
+    (p.groundDodgeTicks ?? 0) > 0 ||
+    (p.airDodgeTicks ?? 0) > 0 ||
     !!p.groundDodging ||
     !!p.airDodging ||
     !!p.airBoosting
   );
+}
+
+function resolveDodgeDirFromInput(data: PlayerInput): number {
+  if (data.dodgeDir !== 0) return data.dodgeDir >= 0 ? 1 : -1;
+  if (data.action === "left") return -1;
+  if (data.action === "right") return 1;
+  return data.facing >= 0 ? 1 : -1;
 }
 
 function disablePlayerCollisionDuringDodge(contact: planck.Contact) {
@@ -2193,16 +2201,18 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     ) {
       const onGround = isPlayerGrounded(playerId, torso);
       const velY = torso.getLinearVelocity().y;
-      const facingDir = data.facing >= 0 ? 1 : -1;
+      const dodgeDir = resolveDodgeDirFromInput(data);
+      p.facing = dodgeDir;
+      data.facing = dodgeDir;
 
       if (onGround) {
-        applyGroundDodge(torso, playerId, facingDir, p);
+        applyGroundDodge(torso, playerId, dodgeDir, p);
         data.action = null;
       } else if (velY < -0.8) {
         applyAirBoost(torso, playerId, p);
         data.action = null;
       } else {
-        applyAirDodge(torso, playerId, facingDir, p);
+        applyAirDodge(torso, playerId, dodgeDir, p);
         data.action = null;
       }
 
@@ -2424,18 +2434,11 @@ export default defineGame<ShooterState>({
 
   // @ts-ignore
   tick: (G: ShooterState, dt: number | undefined, ctx: TickContext) => {
-    // 1. Safe logging (WASM safe, string only)
-    console.log("REALTIME TICK IS RUNNING. worldTick: " + G.worldTick);
-
-    // Safety check for physics world in case of stateless backend
-    if (!world) {
-      console.log("CRITICAL ERROR: Physics world is undefined!");
-      return;
-    }
+    if (!world) return;
 
     setCurrentG(G);
 
-    // 2. Bulletproof delta time logic
+    // Bulletproof delta time logic
     let deltaMs = typeof dt === "number" ? dt : 1000 / 30;
     if (deltaMs < 1) deltaMs *= 1000; // Convert seconds to ms if needed
 
@@ -2590,7 +2593,7 @@ export default defineGame<ShooterState>({
       const data = payload as unknown as PlayerInput;
       p.input = {
         action: data.action ?? null,
-        jumping: p.input?.jumping || !!data.jumping,
+        jumping: !!data.jumping,
         aimAngle: typeof data.aimAngle === "number" ? data.aimAngle : p.aimAngle,
         facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
         crouching: !!data.crouching,
@@ -2626,6 +2629,26 @@ export default defineGame<ShooterState>({
     },
   },
   endIf: (G) => buildMatchResult(G),
+
+  enumerate: (G, playerId) => {
+    const p = G.players[playerId];
+    if (!p || p.health <= 0 || G.roundPhase === "intermission") return [];
+    return [
+      {
+        type: "input",
+        payload: {
+          action: null,
+          jumping: false,
+          aimAngle: p.aimAngle,
+          facing: p.facing,
+          crouching: false,
+          shooting: false,
+          dodging: false,
+          dodgeDir: 0,
+        },
+      },
+    ];
+  },
 });
 
 export const testUtils = {
