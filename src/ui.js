@@ -112,6 +112,10 @@ const KATANA_EQUIP_MS = 300;
 let recoilShake = 0;
 let recoilShakeX = 0;
 let recoilShakeY = 0;
+let dodgeShakeBoost = 0;
+const shadowAfterimages = [];
+let dodgeGhostGraphics = null;
+let dodgeInputFlushPending = false;
 
 const SHOOT_FACE_MS = 2000;
 const CORPSE_FALL_MS = 260;
@@ -200,6 +204,8 @@ const laserContainer = new Container();
 
 gameContainer.addChild(platformsContainer);
 gameContainer.addChild(pickupsContainer);
+const dodgeGhostContainer = new Container();
+gameContainer.addChild(dodgeGhostContainer);
 gameContainer.addChild(playersContainer);
 gameContainer.addChild(bulletsContainer);
 gameContainer.addChild(laserContainer);
@@ -1081,6 +1087,7 @@ const activeKeys = new Set();
 let mouseX = 0;
 let mouseY = 0;
 let jumpQueued = false;
+let dodgeQueued = false;
 let pointerHeld = false;
 
 const isJumpKey = (code) =>
@@ -1088,6 +1095,9 @@ const isJumpKey = (code) =>
 
 const isCrouchKey = (code, key) =>
   code === "KeyS" || code === "ArrowDown" || key === "s";
+
+const isDodgeKey = (code) =>
+  code === "ShiftLeft" || code === "ShiftRight";
 
 window.addEventListener("mousemove", (e) => {
     const pt = clientToArena(e.clientX, e.clientY);
@@ -1131,6 +1141,41 @@ window.addEventListener("keydown", (e) => {
     if (isJumpKey(e.code) && !e.repeat) {
         jumpQueued = true;
     }
+    if (isDodgeKey(e.code) && !e.repeat) {
+        const now = Date.now();
+        if (now - lastDodgeQueuedAt < DODGE_QUEUE_MS) return;
+        const me = latestState ? localPlayers[latestState.playerId] : null;
+        if (!me || !canStartNewDodge(me)) return;
+        lastDodgeQueuedAt = now;
+        dodgeQueued = true;
+        if (isGameplayInputEnabled(latestState?.G)) {
+            const dir = resolveDodgeFacing(me);
+            const crouching =
+                isKeyPressed("KeyS", "s", "S", "ArrowDown") ||
+                [...activeKeys].some((k) => isCrouchKey(k, k));
+            proposeMove("input", {
+                action: null,
+                jumping: false,
+                aimAngle: me.aimAngle ?? 0,
+                facing: me.facing ?? 1,
+                crouching,
+                shooting: pointerHeld,
+                dodging: true,
+                dodgeDir: dir,
+            });
+            lastSentInput = {
+                action: null,
+                jumping: false,
+                aimAngle: me.aimAngle ?? 0,
+                facing: me.facing ?? 1,
+                crouching,
+                shooting: pointerHeld,
+                dodging: true,
+                dodgeDir: dir,
+            };
+        }
+        e.preventDefault();
+    }
     if (e.code === "Space" || e.code === "KeyW" || e.code === "KeyS") {
         e.preventDefault();
     }
@@ -1157,7 +1202,36 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("keyup", (e) => {
     activeKeys.delete(e.code);
     if (e.key) activeKeys.delete(e.key.toLowerCase());
+    if (isDodgeKey(e.code)) {
+        pendingDodgeDir = 0;
+    }
+    if (isMoveKey(e.code)) {
+        const me = latestState ? localPlayers[latestState.playerId] : null;
+        if (me && me.health > 0 && isGameplayInputEnabled(latestState?.G)) {
+            me.vx = 0;
+            flushHorizontalInputRelease(me);
+        }
+    }
 });
+
+const isMoveKey = (code) =>
+    code === "KeyA" ||
+    code === "KeyD" ||
+    code === "ArrowLeft" ||
+    code === "ArrowRight";
+
+const resolveHorizontalAction = () => {
+    if (isKeyPressed("KeyA", "a", "A", "ა", "ArrowLeft")) return "left";
+    if (isKeyPressed("KeyD", "d", "D", "დ", "ArrowRight")) return "right";
+    return null;
+};
+
+const resolveMoveAction = (crouching) => {
+    const horizontal = resolveHorizontalAction();
+    if (horizontal) return horizontal;
+    if (crouching) return "crouch";
+    return null;
+};
 
 function isKeyPressed(...k) {
     return k.some(key => activeKeys.has(key));
@@ -1248,6 +1322,15 @@ const handleGameState = (state) => {
                         walking: false,
                         airborne: false,
                         crouching: !!p.crouching,
+                        airDodging: !!p.airDodging,
+                        airBoosting: !!p.airBoosting,
+                        airDodgeTicks: p.airDodgeTicks ?? 0,
+                        groundDodging: !!p.groundDodging,
+                        groundDodgeTicks: p.groundDodgeTicks ?? 0,
+                        dodgeDir: 0,
+                        wasGroundDodging: false,
+                        clientDodge: null,
+                        dodgeTrailTimer: 0,
                         currentWeapon: p.currentWeapon || "winchester",
                         ownedWeapons: p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"],
                         faceExpr: "serious",
@@ -1279,12 +1362,67 @@ const handleGameState = (state) => {
 
                     lp.vx = p.torso.x - prevX;
                     lp.vy = p.torso.y - prevY;
+                    if (
+                        id === latestState.playerId &&
+                        !lp.groundDodging &&
+                        !lp.airDodging &&
+                        !lp.airBoosting &&
+                        !resolveHorizontalAction()
+                    ) {
+                        lp.vx = 0;
+                    }
                     lp.health = p.health;
                     lp.crouching = !!p.crouching;
-                    lp.currentWeapon = p.currentWeapon || "winchester";
-                    lp.ownedWeapons = p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"];
+                    const wasAirDodging = !!lp.airDodging;
+                    const wasAirBoosting = !!lp.airBoosting;
+                    const wasGroundDodging = !!lp.groundDodging;
+                    lp.airDodging = !!p.airDodging;
+                    lp.airBoosting = !!p.airBoosting;
+                    lp.airDodgeTicks = p.airDodgeTicks ?? 0;
+                    lp.groundDodging = !!p.groundDodging;
+                    lp.groundDodgeTicks = p.groundDodgeTicks ?? 0;
+                    lp.dodgeDir =
+                        p.groundDodging || p.airDodging || p.airBoosting
+                            ? (p.dodgeDir ?? lp.facing ?? 1)
+                            : 0;
+
+                    // Apply authoritative body before dodge origin/end so snap uses final server position
                     lp.torso = p.torso;
                     lp.head = p.head;
+
+                    if (lp.groundDodging && !wasGroundDodging) {
+                        beginShadowTeleportOrigin(lp, "ground", lp.dodgeDir ?? lp.facing ?? 1);
+                        if (id === latestState.playerId) markDodgeCooldown(lp);
+                        if (id !== latestState.playerId) {
+                            createShadowDashBurst(lp, "ground", lp.dodgeDir ?? 1, false);
+                        }
+                    }
+                    if (lp.airDodging && !wasAirDodging) {
+                        beginShadowTeleportOrigin(lp, "air", lp.dodgeDir ?? lp.facing ?? 1);
+                        if (id === latestState.playerId) markDodgeCooldown(lp);
+                        if (id !== latestState.playerId) {
+                            createShadowDashBurst(lp, "air", lp.dodgeDir ?? 1, false);
+                        }
+                    }
+                    if (lp.airBoosting && !wasAirBoosting) {
+                        beginShadowTeleportOrigin(lp, "boost", lp.facing ?? 1);
+                        if (id === latestState.playerId) markDodgeCooldown(lp);
+                        if (id !== latestState.playerId) {
+                            createShadowDashBurst(lp, "boost", lp.facing ?? 1, false);
+                        }
+                    }
+                    if ((wasGroundDodging || wasAirDodging || wasAirBoosting) &&
+                        !lp.groundDodging && !lp.airDodging && !lp.airBoosting) {
+                        finishShadowTeleport(lp, id === latestState.playerId);
+                        lp.dodgeDir = 0;
+                        if (id === latestState.playerId) {
+                            dodgeInputFlushPending = true;
+                        }
+                    }
+                    lp.wasGroundDodging = lp.groundDodging;
+                    reconcileClientDodge(lp, p);
+                    lp.currentWeapon = p.currentWeapon || "winchester";
+                    lp.ownedWeapons = p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"];
                     lp.lastFireTick = p.lastFireTick ?? 0;
 
                     if (p.currentWeapon === "katana" && prevWeapon !== "katana" && pickupCollected) {
@@ -1430,9 +1568,17 @@ function createMuzzleFlash(x, y, weaponId = "winchester") {
 
 const triggerRecoilShake = (weaponId) => {
     const power = WEAPON_RECOIL_SHAKE[weaponId] ?? 0.75;
-    recoilShake = power;
+    recoilShake = Math.max(recoilShake, power);
     recoilShakeX = (Math.random() - 0.5) * power;
     recoilShakeY = (Math.random() - 0.5) * power * 0.6;
+};
+
+const triggerDodgeShake = (kind, dir = 1) => {
+    const power = kind === "ground" ? 3.2 : kind === "air" ? 2.1 : 1.7;
+    recoilShake = Math.max(recoilShake, power);
+    dodgeShakeBoost = Math.max(dodgeShakeBoost, power);
+    recoilShakeX = dir * power * (0.5 + Math.random() * 0.3);
+    recoilShakeY = (Math.random() - 0.5) * power * 0.45;
 };
 
 const initWeaponRecoil = (p) => {
@@ -1696,16 +1842,16 @@ function createPlayerHitEffect(x, y, isHeadshot = false) {
 }
 
 function createHeadshotMarker(x, y) {
-    const txt = new Text('HS', {
+    const txt = new Text('HEADSHOT', {
         fontFamily: 'Arial Black, Impact, sans-serif',
-        fontSize: 9,
+        fontSize: 8,
         fontWeight: '900',
         fill: 0xffeedd,
         stroke: 0x660011,
         strokeThickness: 2,
     });
     txt.anchor.set(0.5, 0.5);
-    txt.position.set(x, y - 12);
+    txt.position.set(x, y - 14);
 
     particlesContainer.addChild(txt);
     particles.push({
@@ -1713,10 +1859,10 @@ function createHeadshotMarker(x, y) {
         vx: 0,
         vy: -0.55,
         life: 1,
-        lifeDecay: 0.028,
+        lifeDecay: 0.022,
         gravityMul: 0,
-        isBlood: true,
-        isText: false,
+        isBlood: false,
+        isText: true,
     });
 }
 
@@ -1740,18 +1886,623 @@ function createHitBurst(x, y) {
 // Stickman drawing + animation helpers
 const VISUAL_STAND_LIFT = 5;
 
+const GROUND_DODGE_ANIM_TICKS = 18;
+const AIR_DODGE_ANIM_TICKS = 11;
+const AIR_BOOST_ANIM_TICKS = 9;
+
+const smoothStep = (t) => {
+    const x = Math.max(0, Math.min(1, t));
+    return x * x * (3 - 2 * x);
+};
+
+const dodgeAnimProgress = (ticks, maxTicks) => {
+    if (ticks <= 0) return 0;
+    return smoothStep(1 - ticks / maxTicks);
+};
+
+const dodgeAnimPeak = (ticks, maxTicks) => {
+    const ease = dodgeAnimProgress(ticks, maxTicks);
+    return Math.sin(ease * Math.PI);
+};
+
+const CLIENT_DODGE_DIST = {
+    ground: 111,
+    air: 59,
+    boost: 39,
+};
+
+const ST_WINDUP = 0.14;
+const ST_TRAVEL_END = 0.82;
+
+const SHADOW_DASH = {
+    core: 0x08050f,
+    edge: 0x1a1030,
+    rim: 0x5a4a9a,
+    streak: 0x2a1848,
+    cyan: 0x00e5ff,
+    magenta: 0xff2070,
+};
+
+const DODGE_COOLDOWN_MS = Math.ceil(((20 + 18) / 60) * 1000);
+
+const resolveDodgeFacing = (p) => (p?.facing >= 0 ? 1 : -1);
+
+const isClientDodgeActive = (p) => p.clientDodge?.active && (p.clientDodge.ticks ?? 0) > 0;
+
+const markDodgeCooldown = (p) => {
+    p.dodgeCooldownUntil = Date.now() + DODGE_COOLDOWN_MS;
+};
+
+const getClientDodgeMaxTicks = (kind) => {
+    if (kind === "ground") return GROUND_DODGE_ANIM_TICKS;
+    if (kind === "boost") return AIR_BOOST_ANIM_TICKS;
+    return AIR_DODGE_ANIM_TICKS;
+};
+
+const canStartNewDodge = (p) => {
+    if (!p || p.health <= 0) return false;
+    if (isClientDodgeActive(p)) return false;
+    if (isServerDodgeActive(p)) return false;
+    if (getShadowTeleportState(p).active) return false;
+    if (p.dodgeCooldownUntil && Date.now() < p.dodgeCooldownUntil) return false;
+    return true;
+};
+
+const getShadowTeleportState = (p) => {
+    const cd = p.clientDodge;
+    let progress = 0;
+    let active = false;
+    let dir = p.facing ?? 1;
+    let kind = "ground";
+    let ax = p.stAx ?? p.torso?.x ?? p.displayTorso?.x ?? 0;
+    let ay = p.stAy ?? p.torso?.y ?? p.displayTorso?.y ?? 0;
+    let dist = CLIENT_DODGE_DIST.ground;
+
+    if (cd?.active && cd.ticks > 0) {
+        active = true;
+        progress = Math.max(0, Math.min(1, 1 - cd.ticks / cd.maxTicks));
+        dir = cd.dir ?? dir;
+        kind = cd.kind ?? "ground";
+        ax = cd.ax ?? ax;
+        ay = cd.ay ?? ay;
+        dist = cd.distTarget ?? CLIENT_DODGE_DIST[kind] ?? 92;
+    } else if ((p.groundDodgeTicks ?? 0) > 0 && p.groundDodging) {
+        active = true;
+        kind = "ground";
+        dir = p.dodgeDir !== 0 ? p.dodgeDir : dir;
+        progress = Math.max(0, Math.min(1, 1 - (p.groundDodgeTicks ?? 0) / GROUND_DODGE_ANIM_TICKS));
+        dist = CLIENT_DODGE_DIST.ground;
+    } else if ((p.airDodgeTicks ?? 0) > 0 && (p.airDodging || p.airBoosting)) {
+        active = true;
+        kind = p.airBoosting ? "boost" : "air";
+        dir = p.dodgeDir !== 0 ? p.dodgeDir : dir;
+        const maxT = p.airBoosting ? AIR_BOOST_ANIM_TICKS : AIR_DODGE_ANIM_TICKS;
+        progress = Math.max(0, Math.min(1, 1 - (p.airDodgeTicks ?? 0) / maxT));
+        dist = CLIENT_DODGE_DIST[kind];
+    }
+
+    if (!active) {
+        return {
+            active: false,
+            phase: null,
+            progress: 0,
+            dir,
+            kind,
+            ax,
+            ay,
+            bx: ax,
+            by: ay,
+            travelEase: 0,
+            matT: 0,
+        };
+    }
+
+    let bx = ax + dir * (kind === "boost" ? 0 : dist);
+    let by = ay + (kind === "boost" ? -dist : 0);
+    const serverSlide =
+        ((p.groundDodgeTicks ?? 0) > 0 && p.groundDodging) ||
+        ((p.airDodgeTicks ?? 0) > 0 && (p.airDodging || p.airBoosting));
+    if (serverSlide && p.torso) {
+        bx = p.torso.x;
+        by = p.torso.y;
+    }
+
+    let phase = "windup";
+    if (progress >= ST_TRAVEL_END) phase = "materialize";
+    else if (progress >= ST_WINDUP) phase = "travel";
+
+    const travelT =
+        phase === "travel"
+            ? (progress - ST_WINDUP) / (ST_TRAVEL_END - ST_WINDUP)
+            : phase === "materialize"
+              ? 1
+              : 0;
+    const travelEase = smoothStep(Math.min(1, travelT));
+    const matT =
+        phase === "materialize" ? (progress - ST_TRAVEL_END) / (1 - ST_TRAVEL_END) : 0;
+    let cx = ax + (bx - ax) * travelEase;
+    let cy = ay + (by - ay) * travelEase;
+    if (serverSlide && p.torso && phase === "travel") {
+        cx = p.torso.x;
+        cy = p.torso.y;
+    }
+
+    return { active, phase, progress, dir, kind, ax, ay, bx, by, cx, cy, travelEase, matT, dist };
+};
+
+const isDodgeMotionLocked = (p) => {
+    const st = getShadowTeleportState(p);
+    if (st.active && (st.phase === "windup" || st.phase === "travel")) return true;
+    if ((p.groundDodgeTicks ?? 0) > 0 && p.groundDodging) return true;
+    if ((p.airDodgeTicks ?? 0) > 0 && (p.airDodging || p.airBoosting)) return true;
+    return false;
+};
+
+const isServerDodgeActive = (p) =>
+    (p.groundDodgeTicks ?? 0) > 0 ||
+    (p.airDodgeTicks ?? 0) > 0 ||
+    !!p.groundDodging ||
+    !!p.airDodging ||
+    !!p.airBoosting;
+
+const finishShadowTeleport = (p, impactFlash = false) => {
+    if (!p) return;
+    p.clientDodge = null;
+    p.dodgeTrailTimer = 0;
+    p.dodgeDir = 0;
+    p.vx = 0;
+    if (impactFlash) p.shadowFlash = 0.95;
+    if (!isServerDodgeActive(p)) {
+        p.groundDodging = false;
+        p.groundDodgeTicks = 0;
+        p.airDodging = false;
+        p.airBoosting = false;
+        p.airDodgeTicks = 0;
+    }
+    if (p.torso && p.head) {
+        p.displayTorso = { ...p.torso };
+        p.displayHead = { ...p.head };
+    }
+    p.stAx = null;
+    p.stAy = null;
+};
+
+const clearDodgeMotionState = (p) => finishShadowTeleport(p, false);
+
+const resolveClientDodgeKind = (p, dir) => {
+    const facingDir = resolveDodgeFacing(p);
+    const airborne = !!p.airborne || Math.abs(p.vy ?? 0) > 0.85 || !p.grounded;
+    if (!airborne) return { kind: "ground", dir: facingDir };
+    if ((p.vy ?? 0) < -0.5) return { kind: "boost", dir: facingDir };
+    return { kind: "air", dir: facingDir };
+};
+
+const beginShadowTeleportOrigin = (p, kind, dir) => {
+    const ax = p.torso?.x ?? p.displayTorso?.x ?? 0;
+    const ay = p.torso?.y ?? p.displayTorso?.y ?? 0;
+    p.stAx = ax;
+    p.stAy = ay;
+    p.stKind = kind;
+    p.stDir = dir;
+    return { ax, ay };
+};
+
+const createShadowDashBurst = (p, kind, dir, shake = false) => {
+    p.shadowFlash = 0.35;
+    if (shake) triggerDodgeShake(kind, dir);
+};
+
+const startClientDodgePrediction = (p) => {
+    if (!canStartNewDodge(p)) return;
+    const { kind, dir: resolvedDir } = resolveClientDodgeKind(p);
+    const maxTicks = getClientDodgeMaxTicks(kind);
+    const { ax, ay } = beginShadowTeleportOrigin(p, kind, resolvedDir);
+    markDodgeCooldown(p);
+    p.clientDodge = {
+        active: true,
+        awaitingConfirm: true,
+        kind,
+        dir: resolvedDir,
+        ticks: maxTicks,
+        maxTicks,
+        ax,
+        ay,
+        distTarget:
+            kind === "ground"
+                ? CLIENT_DODGE_DIST.ground
+                : kind === "air"
+                  ? CLIENT_DODGE_DIST.air
+                  : 0,
+        vertTarget: kind === "boost" ? CLIENT_DODGE_DIST.boost : 0,
+    };
+    createShadowDashBurst(p, kind, resolvedDir, true);
+};
+
+const reconcileClientDodge = (p, sp) => {
+    if (!p || !sp) return;
+    const cd = p.clientDodge;
+    const serverSliding =
+        (sp.groundDodgeTicks ?? 0) > 0 ||
+        (sp.airDodgeTicks ?? 0) > 0;
+
+    if (serverSliding) {
+        if (cd?.awaitingConfirm) p.clientDodge = null;
+        p.groundDodging = !!sp.groundDodging;
+        p.groundDodgeTicks = sp.groundDodgeTicks ?? 0;
+        p.airDodging = !!sp.airDodging;
+        p.airBoosting = !!sp.airBoosting;
+        p.airDodgeTicks = sp.airDodgeTicks ?? 0;
+        if (sp.dodgeDir) p.dodgeDir = sp.dodgeDir;
+        if (p.stAx == null) beginShadowTeleportOrigin(p, sp.airBoosting ? "boost" : sp.airDodging ? "air" : "ground", p.dodgeDir || p.facing || 1);
+        return;
+    }
+
+    if (cd?.active && cd.ticks > 0) return;
+
+    p.groundDodging = !!sp.groundDodging;
+    p.groundDodgeTicks = sp.groundDodgeTicks ?? 0;
+    p.airDodging = !!sp.airDodging;
+    p.airBoosting = !!sp.airBoosting;
+    p.airDodgeTicks = sp.airDodgeTicks ?? 0;
+    p.dodgeDir = 0;
+    if (cd && !cd.active) p.clientDodge = null;
+};
+
+const tickClientDodge = (p, dt) => {
+    const cd = p.clientDodge;
+    if (!cd?.active) return;
+    cd.ticks -= dt;
+    if (cd.ticks <= 0) {
+        cd.active = false;
+        p.clientDodge = null;
+        p.shadowFlash = Math.max(p.shadowFlash ?? 0, 0.95);
+    }
+};
+
+const ensureDodgeGhostGraphics = () => {
+    if (!dodgeGhostGraphics) {
+        dodgeGhostGraphics = new Graphics();
+        dodgeGhostContainer.addChild(dodgeGhostGraphics);
+    }
+    return dodgeGhostGraphics;
+};
+
+const buildTravelGhostPose = (st) => {
+    const tx = st.cx;
+    const ty = st.cy;
+    const hipY = ty + FEET_OFF * 0.08;
+    const footY = ty + FEET_OFF * 0.25;
+    const hx = tx;
+    const hy = ty - STICK.bodyLen * 0.42;
+    const neckTop = hy + STICK.headR + 2;
+    const s = STICK.footSpread;
+    return {
+        tx,
+        ty,
+        hx,
+        hy,
+        neckTop,
+        hipY,
+        footY,
+        lFootX: tx - s,
+        lFootY: footY,
+        rFootX: tx + s,
+        rFootY: footY,
+        lKneeX: tx - s * 0.55,
+        lKneeY: hipY + 5,
+        rKneeX: tx + s * 0.55,
+        rKneeY: hipY + 5,
+    };
+};
+
+const pushShadowAfterimage = (st) => {
+    if (st.phase !== "travel") return;
+    const lagT = Math.max(0, st.travelEase - 0.05 - Math.random() * 0.04);
+    const lagSt = {
+        ...st,
+        cx: st.ax + (st.bx - st.ax) * lagT,
+        cy: st.ay + (st.by - st.ay) * lagT,
+    };
+    shadowAfterimages.push({
+        ...buildTravelGhostPose(lagSt),
+        life: 1,
+        maxLife: 1,
+        alpha: 0.38 + st.travelEase * 0.42,
+    });
+    while (shadowAfterimages.length > 24) shadowAfterimages.shift();
+};
+
+const tickShadowAfterimages = (dt) => {
+    const decay = 0.042 * dt;
+    for (let i = shadowAfterimages.length - 1; i >= 0; i--) {
+        shadowAfterimages[i].life -= decay;
+        if (shadowAfterimages[i].life <= 0) shadowAfterimages.splice(i, 1);
+    }
+};
+
+const drawShadowAfterimageSilhouette = (g, ghost) => {
+    const t = Math.max(0, ghost.life / ghost.maxLife);
+    const a = ghost.alpha * t * t;
+    if (a <= 0.02) return;
+
+    const { tx, ty, hx, hy, neckTop, hipY } = ghost;
+    g.lineStyle(4.2, SHADOW_DASH.core, a * 0.9, 0.5, true);
+    g.moveTo(hx, hy + STICK.headR);
+    g.lineTo(hx, neckTop);
+    g.lineTo(tx, neckTop);
+    g.lineTo(tx, ty);
+    g.lineTo(tx, hipY);
+    drawLegWithKnee(g, tx - STICK.hipSpread * 0.55, hipY, ghost.lKneeX, ghost.lKneeY, ghost.lFootX, ghost.lFootY);
+    drawLegWithKnee(g, tx + STICK.hipSpread * 0.55, hipY, ghost.rKneeX, ghost.rKneeY, ghost.rFootX, ghost.rFootY);
+    g.lineStyle(2, SHADOW_DASH.edge, a * 0.45, 0.5, true);
+    g.moveTo(tx, neckTop + 2);
+    g.lineTo(tx - 8, hipY + 2);
+    g.moveTo(tx, neckTop + 2);
+    g.lineTo(tx + 8, neckTop + 4);
+    g.beginFill(SHADOW_DASH.core, a * 0.32);
+    g.drawCircle(hx, hy, STICK.headR * 0.92);
+    g.endFill();
+};
+
+const drawAllShadowAfterimages = () => {
+    const g = ensureDodgeGhostGraphics();
+    g.clear();
+    for (const ghost of shadowAfterimages) {
+        drawShadowAfterimageSilhouette(g, ghost);
+    }
+};
+
+const tickShadowAfterimageSpawns = (p, dt) => {
+    const st = getShadowTeleportState(p);
+    if (st.phase !== "travel") return;
+    p.dodgeTrailTimer = (p.dodgeTrailTimer ?? 0) - dt * 0.11;
+    if (p.dodgeTrailTimer <= 0) {
+        pushShadowAfterimage(st);
+        p.dodgeTrailTimer = 0.55;
+    }
+};
+
+const buildMovementInput = (me, action, crouching, pendingJump, pendingDodge, dodgeDirForInput, pointerHeld) => {
+    const dodgeLocked = me && isDodgeMotionLocked(me);
+    const moveAction = dodgeLocked ? null : action;
+    return {
+        action: moveAction,
+        jumping: pendingJump,
+        aimAngle: me?.aimAngle ?? 0,
+        facing: me?.facing ?? 1,
+        crouching,
+        shooting: pointerHeld,
+        dodging: pendingDodge,
+        dodgeDir: pendingDodge ? dodgeDirForInput : 0,
+    };
+};
+
+const flushHorizontalInputRelease = (me) => {
+    if (!me || me.health <= 0) return;
+    const crouching =
+        isKeyPressed("KeyS", "s", "S", "ArrowDown") ||
+        [...activeKeys].some((k) => isCrouchKey(k, k));
+    const input = buildMovementInput(
+        me,
+        resolveMoveAction(crouching),
+        crouching,
+        false,
+        false,
+        0,
+        pointerHeld,
+    );
+    proposeMove("input", input);
+    lastSentInput = { ...input };
+    pendingDodge = false;
+    pendingDodgeDir = 0;
+};
+
+const flushDodgeInputRelease = (me) => {
+    if (!me || me.health <= 0) return;
+    me.vx = 0;
+    flushHorizontalInputRelease(me);
+    dodgeInputFlushPending = false;
+};
+
+const drawShadowTeleportStreaks = (g, st) => {
+    const { ax, ay, cx, cy, dir, travelEase, bx, by } = st;
+    const streakLen = Math.hypot(cx - ax, cy - ay);
+    const layers = 6 + Math.floor(travelEase * 5);
+    for (let i = 0; i < layers; i++) {
+        const t = i / Math.max(1, layers - 1);
+        const sx = ax + (cx - ax) * t;
+        const sy = ay + (cy - ay) * t + (i - layers / 2) * 1.8;
+        const alpha = (0.12 + travelEase * 0.42) * (1 - t * 0.35);
+        g.lineStyle(3.2 - i * 0.25, SHADOW_DASH.streak, alpha, 0.5, true);
+        g.moveTo(sx - dir * streakLen * 0.12, sy - 2);
+        g.lineTo(sx + dir * (10 + travelEase * 22), sy + 1);
+        g.lineStyle(1.2, SHADOW_DASH.rim, alpha * 0.55, 0.5, true);
+        g.moveTo(sx - dir * 4, sy + 3);
+        g.lineTo(sx + dir * 16, sy + 3);
+    }
+    g.lineStyle(4, SHADOW_DASH.edge, 0.35 + travelEase * 0.35, 0.5, true);
+    g.moveTo(cx - dir * 18, cy - 8);
+    g.lineTo(cx + dir * 10, cy + 6);
+    g.lineStyle(2, SHADOW_DASH.cyan, 0.22 * travelEase, 0.5, true);
+    g.moveTo(bx - dir * 6, by - 4);
+    g.lineTo(bx + dir * 4, by + 4);
+};
+
+const drawMaterializeFlash = (g, bx, by, intensity) => {
+    if (intensity <= 0.03) return;
+    g.lineStyle(2.5, SHADOW_DASH.cyan, intensity * 0.55, 0.5, true);
+    g.drawCircle(bx, by, 5 + intensity * 14);
+    g.lineStyle(1.8, SHADOW_DASH.magenta, intensity * 0.4, 0.5, true);
+    g.drawCircle(bx, by - 2, 3 + intensity * 8);
+    g.lineStyle(1, 0xffffff, intensity * 0.25, 0.5, true);
+    g.drawCircle(bx, by, 2 + intensity * 4);
+};
+
+const getDodgeAnimTicks = (p, kind) => {
+    const cd = p.clientDodge;
+    if (isClientDodgeActive(p) && cd.kind === kind) {
+        return Math.max(0, cd.ticks);
+    }
+    if (kind === "ground") return p.groundDodgeTicks ?? 0;
+    return p.airDodgeTicks ?? 0;
+};
+
+const lerpPlayerDisplay = (p, dt, isMe, baseSmooth) => {
+    const st = getShadowTeleportState(p);
+    let targetTorso = p.torso;
+    const hdx = (p.head?.x ?? 0) - (p.torso?.x ?? 0);
+    const hdy = (p.head?.y ?? 0) - (p.torso?.y ?? 0);
+
+    if (st.active) {
+        targetTorso = { ...p.torso };
+    }
+
+    const targetHead = {
+        ...p.head,
+        x: targetTorso.x + hdx,
+        y: targetTorso.y + hdy,
+    };
+
+    let t = st.active
+        ? Math.min(1, (st.phase === "travel" ? 0.82 : 0.65) * dt)
+        : baseSmooth;
+
+    const snapDist = Math.hypot(
+        (p.displayTorso?.x ?? 0) - targetTorso.x,
+        (p.displayTorso?.y ?? 0) - targetTorso.y,
+    );
+    if (!st.active && snapDist > 20) {
+        t = Math.min(1, 0.65 * dt);
+    }
+
+    p.displayTorso = lerpBody(p.displayTorso, targetTorso, t);
+    p.displayHead = lerpBody(p.displayHead, targetHead, t);
+};
+
+const getShadowTeleportPose = (p) => {
+    const st = getShadowTeleportState(p);
+    if (!st.active) return null;
+
+    const { phase, dir, ax, ay, bx, by, travelEase, matT } = st;
+    const tx0 = p.displayTorso.x;
+    const ty0 = p.displayTorso.y;
+
+    if (phase === "windup") {
+        const windT = st.progress / ST_WINDUP;
+        const squat = smoothStep(Math.min(1, windT)) * 24;
+        const tx = ax;
+        const ty = ay + squat * 0.12;
+        const hx = ax;
+        const hy = ty - STICK.bodyLen * 0.52;
+        return {
+            tx,
+            ty,
+            hx,
+            hy,
+            neckTop: hy + STICK.headR + 2,
+            hipY: ty + FEET_OFF * 0.06 + squat * 0.55,
+            footY: ty + FEET_OFF * 0.32 + squat * 0.1,
+            crouch: true,
+            drop: squat,
+            shadowTeleport: true,
+            stPhase: "windup",
+            stState: st,
+            dodgeDir: dir,
+            f: dir,
+        };
+    }
+
+    if (phase === "travel") {
+        const hx = st.cx;
+        const hy = st.cy - STICK.bodyLen * 0.42;
+        return {
+            tx: st.cx,
+            ty: st.cy,
+            hx,
+            hy,
+            neckTop: hy + STICK.headR + 2,
+            hipY: st.cy + FEET_OFF * 0.08,
+            footY: st.cy + FEET_OFF * 0.25,
+            shadowTeleport: true,
+            stPhase: "travel",
+            stState: st,
+            dodgeDir: dir,
+            travelEase,
+            f: dir,
+        };
+    }
+
+    const reform = smoothStep(matT);
+    const tx = bx + (tx0 - bx) * reform;
+    const ty = by + (ty0 - by) * reform;
+    const targetHx = p.displayHead.x;
+    const targetHy = p.displayHead.y;
+    return {
+        tx,
+        ty,
+        hx: bx + (targetHx - bx) * reform,
+        hy: by + (targetHy - by) * reform - STICK.bodyLen * 0.42 * (1 - reform),
+        neckTop: ty - STICK.bodyLen * 0.44 * reform,
+        hipY: ty + FEET_OFF * 0.14,
+        footY: ty + FEET_OFF - VISUAL_STAND_LIFT,
+        shadowTeleport: true,
+        stPhase: "materialize",
+        stState: st,
+        dodgeDir: dir,
+        matT,
+        matFlash: (1 - matT) * 0.95,
+        f: dir,
+    };
+};
+
+const isShadowTeleportActive = (p) => getShadowTeleportState(p).active;
+
+const isGroundDodgeActive = (p) => isShadowTeleportActive(p) || (!!(p.groundDodgeTicks ?? 0) && !!p.groundDodging);
+
+const isAirDashActive = (p) =>
+    isShadowTeleportActive(p) ||
+    (!!(p.airDodgeTicks ?? 0) && (!!p.airDodging || !!p.airBoosting));
+
+const isDodgeVisualActive = (p) => isShadowTeleportActive(p);
+
+const getDodgeJuicePeak = (p) => {
+    const st = getShadowTeleportState(p);
+    if (!st.active) return p.shadowFlash ?? 0;
+    if (st.phase === "windup") return st.progress / ST_WINDUP;
+    if (st.phase === "travel") return st.travelEase;
+    return (1 - st.matT) * 0.95;
+};
+
 const getStickPose = (p) => {
-    const tx = p.displayTorso.x + (p.recoilTorsoOffX ?? 0);
-    const ty = p.displayTorso.y + (p.recoilTorsoOffY ?? 0);
+    const teleportPose = getShadowTeleportPose(p);
+    if (teleportPose) return teleportPose;
+    const dodgeVisual = isShadowTeleportActive(p) || isServerDodgeActive(p);
+    const recoilX = dodgeVisual ? 0 : (p.recoilTorsoOffX ?? 0);
+    const recoilY = dodgeVisual ? 0 : (p.recoilTorsoOffY ?? 0);
+    const tx = p.displayTorso.x + recoilX;
+    const ty = p.displayTorso.y + recoilY;
     const crouch = !!p.crouching && p.grounded;
     const drop = crouch ? STICK.crouchDrop : 0;
     const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
+    const f = p.facing || 1;
     const footY = ty + FEET_OFF - standLift;
     const hipY = ty + FEET_OFF * 0.18 + drop * 0.28 - standLift * 0.4;
     const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.38;
     const hx = p.displayHead.x;
     const hy = crouch ? p.displayHead.y + drop * 0.58 : p.displayHead.y;
-    return { tx, ty, hx, hy, neckTop, hipY, footY, crouch, drop };
+    return {
+        tx,
+        ty,
+        hx,
+        hy,
+        neckTop,
+        hipY,
+        footY,
+        crouch,
+        drop,
+        dive: false,
+        f,
+    };
 };
 
 const getGunPose = (p) => {
@@ -1760,6 +2511,33 @@ const getGunPose = (p) => {
     const f = p.facing || 1;
     const weaponId = p.currentWeapon || "winchester";
     const barrel = WEAPON_BARREL[weaponId] ?? GUN.barrel;
+
+    if (pose.shadowTeleport) {
+        const dir = pose.dodgeDir ?? pose.f ?? 1;
+        const shoulderX = pose.tx;
+        const shoulderY = pose.neckTop + 2;
+        const handX = shoulderX + dir * 6;
+        const handY = shoulderY + 2;
+        const backHandX = pose.tx - dir * 4;
+        const backHandY = pose.neckTop + 8;
+        return applyVisualRecoilToGun({
+            ...pose,
+            aim: dir >= 0 ? 0 : Math.PI,
+            f: dir,
+            shoulderX,
+            shoulderY,
+            handX,
+            handY,
+            muzzleX: handX + dir * barrel * 0.35,
+            muzzleY: handY,
+            backHandX,
+            backHandY,
+            weaponId,
+            barrel,
+            carryStyle: "twoHand",
+        }, p);
+    }
+
     const cos = Math.cos(aim);
     const sin = Math.sin(aim);
     const px = -sin;
@@ -2270,6 +3048,16 @@ const tickFaceExpr = (p, dt) => {
 
     if (p.faceTimer > 0) return;
 
+    if (isGroundDodgeActive(p)) {
+        p.faceExpr = "serious";
+        return;
+    }
+
+    if (isAirDashActive(p)) {
+        p.faceExpr = "serious";
+        return;
+    }
+
     if (p.airborne) {
         p.faceExpr = "jump";
         return;
@@ -2390,31 +3178,50 @@ const initPlayerRenderState = (p) => {
     if (p.katanaSwing == null) p.katanaSwing = 0;
     if (p.katanaEquip == null) p.katanaEquip = 1;
     if (p.lastFireTick == null) p.lastFireTick = 0;
+    if (p.clientDodge == null) p.clientDodge = null;
+    if (p.dodgeTrailTimer == null) p.dodgeTrailTimer = 0;
+    if (p.shadowFlash == null) p.shadowFlash = 0;
+    if (p.dodgeCooldownUntil == null) p.dodgeCooldownUntil = 0;
 };
 
-const updatePlayerMotionState = (p, action) => {
+const updatePlayerMotionState = (p, action, isLocalInput = false) => {
     p.airborne = Math.abs(p.vy) > 0.85;
     p.grounded = !p.airborne;
+    const dodgeMoving = isServerDodgeActive(p) || isShadowTeleportActive(p);
+    const keyedMove = action === "left" || action === "right";
     p.walking =
         p.grounded &&
-        (Math.abs(p.vx) > 0.4 || action === "left" || action === "right");
+        !dodgeMoving &&
+        (isLocalInput ? keyedMove : keyedMove || Math.abs(p.vx) > 0.4);
 
-    if (action === "left") p.facing = -1;
+    if (isDodgeMotionLocked(p)) {
+        const st = getShadowTeleportState(p);
+        if (st.active && (st.phase === "windup" || st.phase === "travel")) {
+            p.facing = st.dir;
+        } else if (p.dodgeDir !== 0) {
+            p.facing = p.dodgeDir;
+        }
+    } else if (action === "left") p.facing = -1;
     else if (action === "right") p.facing = 1;
-    else if (Math.abs(p.vx) > 0.2) p.facing = p.vx >= 0 ? 1 : -1;
+    else if (!isLocalInput && Math.abs(p.vx) > 0.2) p.facing = p.vx >= 0 ? 1 : -1;
 
-    p.walkDir = p.facing || 1;
+    const stLock = getShadowTeleportState(p);
+    p.walkDir =
+        stLock.active && (stLock.phase === "windup" || stLock.phase === "travel")
+            ? stLock.dir
+            : p.facing || 1;
 
     if (p.walking) {
         const speed = p.crouching ? 0.21 : 0.36;
-        p.walkPhase += speed * Math.max(1, Math.abs(p.vx) * 0.12);
+        const walkMul = isLocalInput ? 1 : Math.max(1, Math.abs(p.vx) * 0.12);
+        p.walkPhase += speed * walkMul;
     }
 };
 
 const lerpBody = (from, to, t) => ({
     x: from.x + (to.x - from.x) * t,
     y: from.y + (to.y - from.y) * t,
-    angle: from.angle + (to.angle - from.angle) * t,
+    angle: 0,
 });
 
 const computeKnee = (hipX, hipY, footX, footY, facing, bendAmt = 1) => {
@@ -2441,7 +3248,31 @@ const computeLegPositions = (p, pose) => {
     let lBend = 0.55;
     let rBend = 0.55;
 
-    if (p.airborne) {
+    if (pose.shadowTeleport) {
+        const dir = pose.dodgeDir ?? p.facing ?? 1;
+        if (pose.stPhase === "windup") {
+            const squat = (pose.drop ?? 0) / 24;
+            lFootX = tx - s * 0.7;
+            lFootY = footY + 4 + squat * 4;
+            rFootX = tx + s * 0.7;
+            rFootY = footY + 4 + squat * 4;
+            lBend = 1.6 + squat;
+            rBend = 1.6 + squat;
+        } else if (pose.stPhase === "travel") {
+            lFootX = tx - s;
+            lFootY = footY;
+            rFootX = tx + s;
+            rFootY = footY;
+            lBend = 0.45;
+            rBend = 0.45;
+        } else {
+            const reform = smoothStep(pose.matT ?? 0);
+            lFootX = tx - s * reform;
+            rFootX = tx + s * reform;
+            lBend = 0.55 + (1 - reform) * 0.8;
+            rBend = 0.55 + (1 - reform) * 0.8;
+        }
+    } else if (p.airborne) {
         lFootX = tx - s * 0.85 * f;
         lFootY = footY - 8;
         rFootX = tx + s * 1.05 * f;
@@ -2496,18 +3327,109 @@ const drawLegWithKnee = (g, hipX, hipY, kneeX, kneeY, footX, footY) => {
     g.lineTo(footX, footY);
 };
 
+const drawShadowAberrationFlash = (g, gun, legs, peak, dir) => {
+    if (peak <= 0.04) return;
+    const split = 1.5 + peak * 5;
+    const drawOffsetBody = (ox, oy, col, alpha) => {
+        g.lineStyle(STICK.lineW, col, alpha, 0.5, true);
+        g.drawCircle(gun.hx + ox, gun.hy + oy, STICK.headR * 0.92);
+        g.moveTo(gun.hx + ox, gun.hy + STICK.headR * 0.35 + oy);
+        g.lineTo(gun.hx + ox, gun.neckTop + oy);
+        g.lineTo((gun.tx ?? gun.torsoX) + ox, gun.neckTop + oy);
+        g.lineTo((gun.tx ?? gun.torsoX) + ox, (gun.ty ?? gun.torsoY) + oy);
+        g.lineTo((gun.tx ?? gun.torsoX) + ox, gun.hipY + oy);
+        drawLegWithKnee(
+            g,
+            (gun.tx ?? gun.torsoX) - STICK.hipSpread * 0.45 + ox,
+            gun.hipY + oy,
+            legs.lKneeX + ox,
+            legs.lKneeY + oy,
+            legs.lFootX + ox,
+            legs.lFootY + oy,
+        );
+        drawLegWithKnee(
+            g,
+            (gun.tx ?? gun.torsoX) + STICK.hipSpread * 0.45 + ox,
+            gun.hipY + oy,
+            legs.rKneeX + ox,
+            legs.rKneeY + oy,
+            legs.rFootX + ox,
+            legs.rFootY + oy,
+        );
+    };
+    drawOffsetBody(-dir * split, 0, SHADOW_DASH.cyan, peak * 0.22);
+    drawOffsetBody(dir * split, 0, SHADOW_DASH.magenta, peak * 0.2);
+    g.lineStyle(3, SHADOW_DASH.edge, peak * 0.18, 0.5, true);
+    g.drawCircle(gun.hx, gun.hy, STICK.headR + peak * 4);
+};
+
 const drawStickmanLines = (g, p, isMe) => {
     g.clear();
     if (!p || p.health <= 0 || !p.displayTorso || !p.displayHead) return;
 
     const pal = stickPalette(isMe, p.team);
     const gun = getGunPose(p);
+    const st = gun.stState ?? getShadowTeleportState(p);
     const { tx, ty, hx, hy, neckTop, hipY } = gun;
     const legs = computeLegPositions(p, gun);
+    const flashPeak = Math.max(getDodgeJuicePeak(p), p.shadowFlash ?? 0);
+    const dashDir = gun.dodgeDir ?? gun.f ?? p.facing ?? 1;
+
+    if (gun.stPhase === "travel" && st.active) {
+        drawShadowTeleportStreaks(g, st);
+        const drawDashBody = (lineW, col, alpha) => {
+            g.lineStyle(lineW, col, alpha, 0.5, true);
+            g.drawCircle(hx, hy, STICK.headR);
+            g.moveTo(hx, hy + STICK.headR);
+            g.lineTo(hx, neckTop);
+            g.lineTo(tx, neckTop);
+            g.lineTo(tx, ty);
+            g.lineTo(tx, hipY);
+            drawLegWithKnee(g, tx - STICK.hipSpread * 0.55, hipY, legs.lKneeX, legs.lKneeY, legs.lFootX, legs.lFootY);
+            drawLegWithKnee(g, tx + STICK.hipSpread * 0.55, hipY, legs.rKneeX, legs.rKneeY, legs.rFootX, legs.rFootY);
+        };
+        drawDashBody(STICK.outlineW + 1, SHADOW_DASH.core, 0.75);
+        drawDashBody(STICK.lineW, SHADOW_DASH.edge, 0.92);
+        return;
+    }
+
+    if (gun.stPhase === "materialize" && st.active) {
+        drawMaterializeFlash(g, st.bx, st.by, gun.matFlash ?? flashPeak);
+    }
 
     const drawBody = (lineW, col, alpha) => {
         g.lineStyle(lineW, col, alpha, 0.5, true);
         g.drawCircle(hx, hy, STICK.headR);
+        if (gun.shadowTeleport && gun.stPhase === "windup") {
+            const squat = (gun.drop ?? 0) / 24;
+            g.moveTo(hx, hy + STICK.headR * 0.4);
+            g.lineTo(hx, neckTop);
+            g.lineTo(tx, neckTop);
+            g.lineTo(tx, ty + squat * 0.08);
+            g.lineTo(tx, hipY + squat * 0.12);
+            g.moveTo(tx, neckTop + 2);
+            g.lineTo(gun.backHandX, gun.backHandY);
+            g.moveTo(gun.shoulderX, gun.shoulderY);
+            g.lineTo(gun.handX, gun.handY);
+            drawLegWithKnee(g, tx - STICK.hipSpread * 0.55, hipY, legs.lKneeX, legs.lKneeY, legs.lFootX, legs.lFootY);
+            drawLegWithKnee(g, tx + STICK.hipSpread * 0.55, hipY, legs.rKneeX, legs.rKneeY, legs.rFootX, legs.rFootY);
+            return;
+        }
+        if (gun.shadowTeleport && gun.stPhase === "materialize") {
+            const reform = smoothStep(gun.matT ?? 0);
+            g.moveTo(hx, hy + STICK.headR);
+            g.lineTo(hx, neckTop);
+            g.lineTo(tx, neckTop);
+            g.lineTo(tx, ty);
+            g.lineTo(tx, hipY);
+            g.moveTo(tx, neckTop + 2);
+            g.lineTo(gun.backHandX, gun.backHandY);
+            g.moveTo(gun.shoulderX, gun.shoulderY);
+            g.lineTo(gun.handX, gun.handY);
+            drawLegWithKnee(g, tx - STICK.hipSpread * reform, hipY, legs.lKneeX, legs.lKneeY, legs.lFootX, legs.lFootY);
+            drawLegWithKnee(g, tx + STICK.hipSpread * reform, hipY, legs.rKneeX, legs.rKneeY, legs.rFootX, legs.rFootY);
+            return;
+        }
         g.moveTo(hx, hy + STICK.headR);
         g.lineTo(hx, neckTop);
         g.lineTo(tx, neckTop);
@@ -2541,6 +3463,7 @@ const drawStickmanFills = (g, p, isMe) => {
     if (!p || p.health <= 0 || !p.displayTorso || !p.displayHead) return;
 
     const gun = getGunPose(p);
+    if (gun.stPhase === "travel") return;
     drawFace(g, gun.hx, gun.hy, gun.f, p.faceExpr || "serious", isMe);
 };
 
@@ -2550,6 +3473,10 @@ let lastSentInput = null;
 const SEND_MOVE_MS = 16;
 let laserGraphics = null;
 let pendingJump = false;
+let pendingDodge = false;
+let pendingDodgeDir = 0;
+let lastDodgeQueuedAt = 0;
+const DODGE_QUEUE_MS = 280;
 
 app.ticker.add(() => {
     try {
@@ -2575,30 +3502,53 @@ app.ticker.add(() => {
         const me = localPlayers[latestState.playerId];
         if (me && G?.players?.[latestState.playerId]) {
             me.currentWeapon = G.players[latestState.playerId].currentWeapon || "winchester";
+            reconcileClientDodge(me, G.players[latestState.playerId]);
         }
+
+        let dodgeDirForInput = 0;
         
         if (me && me.health > 0 && me.torso && gameplayActive) {
-            if (isKeyPressed("KeyA", "a", "A", "ა", "ArrowLeft")) action = "left";
-            else if (isKeyPressed("KeyD", "d", "D", "დ", "ArrowRight")) action = "right";
-            else if (crouching) action = "crouch";
+            action = resolveMoveAction(crouching);
 
             if (jumpQueued) {
                 pendingJump = true;
                 jumpQueued = false;
                 Sfx.playJump();
             }
+            if (dodgeQueued) {
+                if (canStartNewDodge(me)) {
+                    pendingDodge = true;
+                    startClientDodgePrediction(me);
+                }
+                dodgeQueued = false;
+            }
+
+            dodgeDirForInput = pendingDodge ? resolveDodgeFacing(me) : 0;
 
             const pose = getStickPose(me);
             me.aimAngle = Math.atan2(mouseY - pose.neckTop, mouseX - me.displayTorso.x);
 
-            if (action === "left") me.facing = -1;
-            else if (action === "right") me.facing = 1;
+            if (!isDodgeMotionLocked(me)) {
+                if (action === "left") me.facing = -1;
+                else if (action === "right") me.facing = 1;
+            }
+
+            if (!resolveHorizontalAction() && !isDodgeMotionLocked(me) && !isServerDodgeActive(me)) {
+                me.vx = 0;
+            }
         } else {
             jumpQueued = false;
+            dodgeQueued = false;
             pendingJump = false;
+            pendingDodge = false;
+            pendingDodgeDir = 0;
         }
 
         const now = Date.now();
+
+        if (dodgeInputFlushPending && me && gameplayActive) {
+            flushDodgeInputRelease(me);
+        }
 
         if (me && me.health > 0 && me.currentWeapon === "sniper" && gameplayActive) {
             if (!laserGraphics) {
@@ -2612,14 +3562,7 @@ app.ticker.add(() => {
 
         if (now - lastMoveSent >= SEND_MOVE_MS) {
             if (isPreMatchCountdown() || isIdleTickPhase(G)) {
-                const input = {
-                    action: null,
-                    jumping: false,
-                    aimAngle: me?.aimAngle ?? 0,
-                    facing: me?.facing ?? 1,
-                    crouching: false,
-                    shooting: false,
-                };
+                const input = buildMovementInput(me, null, false, false, false, 0, false);
                 
                 if (!lastSentInput || 
                     lastSentInput.action !== input.action || 
@@ -2627,6 +3570,8 @@ app.ticker.add(() => {
                     lastSentInput.facing !== input.facing || 
                     lastSentInput.crouching !== input.crouching || 
                     lastSentInput.shooting !== input.shooting || 
+                    lastSentInput.dodging !== input.dodging ||
+                    lastSentInput.dodgeDir !== input.dodgeDir ||
                     Math.abs(lastSentInput.aimAngle - input.aimAngle) > 0.05
                 ) {
                     proposeMove("input", input);
@@ -2634,16 +3579,19 @@ app.ticker.add(() => {
                 }
                 
                 pendingJump = false;
+                pendingDodge = false;
+                pendingDodgeDir = 0;
                 lastMoveSent = now;
             } else if (gameplayActive) {
-                const input = {
+                const input = buildMovementInput(
+                    me,
                     action,
-                    jumping: pendingJump,
-                    aimAngle: me?.aimAngle ?? 0,
-                    facing: me?.facing ?? 1,
                     crouching,
-                    shooting: pointerHeld,
-                };
+                    pendingJump,
+                    pendingDodge,
+                    dodgeDirForInput,
+                    pointerHeld,
+                );
                 
                 if (!lastSentInput || 
                     lastSentInput.action !== input.action || 
@@ -2651,6 +3599,8 @@ app.ticker.add(() => {
                     lastSentInput.facing !== input.facing || 
                     lastSentInput.crouching !== input.crouching || 
                     lastSentInput.shooting !== input.shooting || 
+                    lastSentInput.dodging !== input.dodging ||
+                    lastSentInput.dodgeDir !== input.dodgeDir ||
                     Math.abs(lastSentInput.aimAngle - input.aimAngle) > 0.05
                 ) {
                     proposeMove("input", input);
@@ -2658,18 +3608,23 @@ app.ticker.add(() => {
                 }
                 
                 pendingJump = false;
+                pendingDodge = false;
+                pendingDodgeDir = 0;
                 lastMoveSent = now;
             }
         }
 
         if (recoilShake > 0.05) {
             recoilShake *= 0.82;
+            dodgeShakeBoost *= 0.86;
+            const shakeMul = 0.35 + Math.min(0.4, dodgeShakeBoost * 0.11);
             gameContainer.position.set(
-                viewOffsetX + recoilShakeX * recoilShake * 0.35,
-                viewOffsetY + recoilShakeY * recoilShake * 0.35,
+                viewOffsetX + recoilShakeX * recoilShake * shakeMul,
+                viewOffsetY + recoilShakeY * recoilShake * shakeMul,
             );
         } else {
             recoilShake = 0;
+            dodgeShakeBoost = 0;
             gameContainer.position.set(viewOffsetX, viewOffsetY);
         }
 
@@ -2690,9 +3645,20 @@ app.ticker.add(() => {
             tickWeaponRecoil(p, dt);
             tickKatanaSwing(p);
             tickKatanaEquip(p);
-            p.displayTorso = lerpBody(p.displayTorso, p.torso, smooth);
-            p.displayHead = lerpBody(p.displayHead, p.head, smooth);
-            updatePlayerMotionState(p, p === me && gameplayActive ? action : null);
+            if (p === me) tickClientDodge(p, dt);
+            tickShadowAfterimageSpawns(p, dt);
+            lerpPlayerDisplay(p, dt, p === me, smooth);
+            if ((p.shadowFlash ?? 0) > 0) {
+                p.shadowFlash = Math.max(0, p.shadowFlash - 0.09 * dt);
+            }
+            if (!isShadowTeleportActive(p) && !isDodgeMotionLocked(p) && !isServerDodgeActive(p)) {
+                p.dodgeDir = 0;
+            }
+            updatePlayerMotionState(
+                p,
+                p === me && gameplayActive ? action : null,
+                p === me && gameplayActive,
+            );
             tickFaceExpr(p, dt);
             if (p === me) {
                 p.crouching = crouching && p.grounded;
@@ -2804,6 +3770,9 @@ app.ticker.add(() => {
             ring.g.lineStyle(0.9 * ring.life, 0xffffff, ring.life * 0.5);
             ring.g.drawCircle(0, 0, r * 0.55);
         }
+
+        tickShadowAfterimages(dt);
+        drawAllShadowAfterimages();
 
         // Update Players
         for (const [id, p] of Object.entries(localPlayers)) {

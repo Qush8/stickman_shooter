@@ -162,6 +162,8 @@ export interface PlayerInput {
   facing: number;
   crouching: boolean;
   shooting: boolean;
+  dodging: boolean;
+  dodgeDir: number;
 }
 
 export interface PlayerState {
@@ -169,6 +171,12 @@ export interface PlayerState {
   aimAngle: number;
   facing: number;
   crouching: boolean;
+  airDodging: boolean;
+  airBoosting: boolean;
+  airDodgeTicks: number;
+  groundDodging: boolean;
+  groundDodgeTicks: number;
+  dodgeDir: number;
   currentWeapon: WeaponId;
   ownedWeapons: WeaponId[];
   lastFireTick: number;
@@ -280,6 +288,13 @@ const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
 const PHYSICS_HZ = 60;
 const PHYSICS_DT = 1 / PHYSICS_HZ;
 const MOVE_SPEED = 15;
+const DODGE_COOLDOWN_TICKS = 20;
+const GROUND_DODGE_SPEED = 34;
+const GROUND_DODGE_TICKS = 18;
+const AIR_DODGE_SPEED = 28;
+const AIR_DODGE_TICKS = 11;
+const AIR_BOOST_PUSH = 22;
+const AIR_BOOST_TICKS = 9;
 const JUMP_IMPULSE = 40;
 const GRAVITY = 97.5;
 const WALL_JUMP_IMPULSE_X = 11;
@@ -338,6 +353,11 @@ let playerGrounded: Record<string, boolean> = {};
 let playerWallJumpUsed: Record<string, boolean> = {};
 let playerWallContact: Record<string, { nx: number; ny: number } | null> = {};
 let playerJumpGrace: Record<string, number> = {};
+let playerDodgeCooldown: Record<string, number> = {};
+let playerGroundDodgeTicks: Record<string, number> = {};
+let playerDodgeDir: Record<string, number> = {};
+let playerAirDodgeTicks: Record<string, number> = {};
+let playerAirDodgeDir: Record<string, number> = {};
 const pendingBulletDestroys = new Set<number>();
 const pendingHits: HitEvent[] = [];
 const pendingPlatformDamages: { id: number; damage: number; x: number; y: number }[] = [];
@@ -769,6 +789,11 @@ function createPlayerPhysics(id: string, x: number, y: number) {
   playerWallJumpUsed[id] = false;
   playerWallContact[id] = null;
   playerJumpGrace[id] = 0;
+  playerDodgeCooldown[id] = 0;
+  playerGroundDodgeTicks[id] = 0;
+  playerDodgeDir[id] = 1;
+  playerAirDodgeTicks[id] = 0;
+  playerAirDodgeDir[id] = 0;
 }
 
 function destroyPlayerPhysics(id: string) {
@@ -781,6 +806,11 @@ function destroyPlayerPhysics(id: string) {
   delete playerWallJumpUsed[id];
   delete playerWallContact[id];
   delete playerJumpGrace[id];
+  delete playerDodgeCooldown[id];
+  delete playerGroundDodgeTicks[id];
+  delete playerDodgeDir[id];
+  delete playerAirDodgeTicks[id];
+  delete playerAirDodgeDir[id];
 }
 
 function feetPositionMeters(torso: planck.Body) {
@@ -894,7 +924,15 @@ function measureGrounded(id: string, torso: planck.Body): boolean {
 
 function updatePlayerGroundedState() {
   for (const [id, bodies] of Object.entries(playerBodies)) {
-    playerGrounded[id] = measureGrounded(id, bodies.torso);
+    const grounded = measureGrounded(id, bodies.torso);
+    playerGrounded[id] = grounded;
+    const p = currentG?.players[id];
+    if (grounded && p && (p.airDodging || p.airBoosting)) {
+      const velY = bodies.torso.getLinearVelocity().y;
+      if (velY >= -1) {
+        endAirDodge(id, p, bodies.torso);
+      }
+    }
   }
 }
 
@@ -1052,6 +1090,183 @@ function applyVerticalJump(
   playerJumpGrace[playerId] = 8;
 }
 
+function isPlayerDodging(playerId: string, p: PlayerState | undefined): boolean {
+  if (!p) return false;
+  return (
+    (playerGroundDodgeTicks[playerId] ?? 0) > 0 ||
+    (playerAirDodgeTicks[playerId] ?? 0) > 0 ||
+    !!p.groundDodging ||
+    !!p.airDodging ||
+    !!p.airBoosting
+  );
+}
+
+function disablePlayerCollisionDuringDodge(contact: planck.Contact) {
+  const fixtureA = contact.getFixtureA();
+  const fixtureB = contact.getFixtureB();
+  const dataA = getFixtureData(fixtureA);
+  const dataB = getFixtureData(fixtureB);
+
+  const playerA =
+    dataA?.type === "player" || dataA?.type === "head" ? dataA.id : null;
+  const playerB =
+    dataB?.type === "player" || dataB?.type === "head" ? dataB.id : null;
+
+  if (!playerA || !playerB || playerA === playerB) return;
+
+  const pA = currentG?.players[playerA];
+  const pB = currentG?.players[playerB];
+  if (isPlayerDodging(playerA, pA) || isPlayerDodging(playerB, pB)) {
+    contact.setEnabled(false);
+  }
+}
+
+function endGroundDodge(playerId: string, p: PlayerState, torso: planck.Body) {
+  playerGroundDodgeTicks[playerId] = 0;
+  playerDodgeDir[playerId] = 0;
+  p.groundDodging = false;
+  p.groundDodgeTicks = 0;
+  p.dodgeDir = 0;
+  const vy = torso.getLinearVelocity().y;
+  torso.setLinearVelocity(planck.Vec2(0, vy));
+  if (p.input) {
+    p.input.dodgeDir = 0;
+    p.input.dodging = false;
+    p.input.action = null;
+  }
+}
+
+function tickGroundDodgeSlide(playerId: string, p: PlayerState, torso: planck.Body): boolean {
+  let ticks = playerGroundDodgeTicks[playerId] ?? 0;
+  if (ticks <= 0) {
+    if (p.groundDodging) endGroundDodge(playerId, p, torso);
+    return false;
+  }
+
+  if (!isPlayerGrounded(playerId, torso)) {
+    endGroundDodge(playerId, p, torso);
+    return false;
+  }
+
+  const dir = playerDodgeDir[playerId] ?? (p.dodgeDir >= 0 ? 1 : -1);
+  const progress = 1 - ticks / GROUND_DODGE_TICKS;
+  const speedMul = (1 - progress) * (1 - progress);
+  torso.setLinearVelocity(
+    planck.Vec2(dir * GROUND_DODGE_SPEED * speedMul, torso.getLinearVelocity().y),
+  );
+
+  ticks -= 1;
+  playerGroundDodgeTicks[playerId] = ticks;
+  p.groundDodgeTicks = ticks;
+  p.groundDodging = ticks > 0;
+
+  if (ticks <= 0) {
+    endGroundDodge(playerId, p, torso);
+    return false;
+  }
+  return true;
+}
+
+function endAirDodge(playerId: string, p: PlayerState, torso: planck.Body) {
+  playerAirDodgeTicks[playerId] = 0;
+  playerAirDodgeDir[playerId] = 0;
+  p.airDodging = false;
+  p.airBoosting = false;
+  p.airDodgeTicks = 0;
+  p.dodgeDir = 0;
+  const vy = torso.getLinearVelocity().y;
+  torso.setLinearVelocity(planck.Vec2(0, vy));
+  if (p.input) {
+    p.input.dodgeDir = 0;
+    p.input.dodging = false;
+    p.input.action = null;
+  }
+}
+
+function tickAirDodgeSlide(playerId: string, p: PlayerState, torso: planck.Body): boolean {
+  let ticks = playerAirDodgeTicks[playerId] ?? 0;
+  if (ticks <= 0) {
+    if (p.airDodging || p.airBoosting) endAirDodge(playerId, p, torso);
+    return false;
+  }
+
+  const vel = torso.getLinearVelocity();
+
+  if (p.airBoosting) {
+    const progress = 1 - ticks / AIR_BOOST_TICKS;
+    const speedMul = (1 - progress) * (1 - progress);
+    torso.setLinearVelocity(planck.Vec2(vel.x * 0.88, -AIR_BOOST_PUSH * speedMul));
+  } else {
+    const dir = playerAirDodgeDir[playerId] ?? (p.dodgeDir >= 0 ? 1 : -1);
+    const progress = 1 - ticks / AIR_DODGE_TICKS;
+    const speedMul = (1 - progress) * (1 - progress);
+    torso.setLinearVelocity(planck.Vec2(dir * AIR_DODGE_SPEED * speedMul, vel.y));
+  }
+
+  ticks -= 1;
+  playerAirDodgeTicks[playerId] = ticks;
+  p.airDodgeTicks = ticks;
+  if (p.airBoosting) {
+    p.airBoosting = ticks > 0;
+  } else {
+    p.airDodging = ticks > 0;
+  }
+
+  if (ticks <= 0) {
+    endAirDodge(playerId, p, torso);
+    return false;
+  }
+  return true;
+}
+
+function applyGroundDodge(
+  torso: planck.Body,
+  playerId: string,
+  dir: number,
+  p: PlayerState,
+) {
+  torso.setAwake(true);
+  const vy = torso.getLinearVelocity().y;
+  torso.setLinearVelocity(planck.Vec2(dir * GROUND_DODGE_SPEED, Math.min(vy, 0)));
+  playerGroundDodgeTicks[playerId] = GROUND_DODGE_TICKS;
+  playerDodgeDir[playerId] = dir;
+  p.groundDodging = true;
+  p.groundDodgeTicks = GROUND_DODGE_TICKS;
+  p.dodgeDir = dir;
+  p.facing = dir;
+}
+
+function applyAirDodge(
+  torso: planck.Body,
+  playerId: string,
+  dir: number,
+  p: PlayerState,
+) {
+  torso.setAwake(true);
+  const vy = torso.getLinearVelocity().y;
+  torso.setLinearVelocity(planck.Vec2(dir * AIR_DODGE_SPEED, vy));
+  playerJumpGrace[playerId] = 6;
+  p.airDodging = true;
+  p.airBoosting = false;
+  p.airDodgeTicks = AIR_DODGE_TICKS;
+  p.dodgeDir = dir;
+  p.facing = dir;
+  playerAirDodgeTicks[playerId] = AIR_DODGE_TICKS;
+  playerAirDodgeDir[playerId] = dir;
+}
+
+function applyAirBoost(torso: planck.Body, playerId: string, p: PlayerState) {
+  torso.setAwake(true);
+  const vel = torso.getLinearVelocity();
+  torso.setLinearVelocity(planck.Vec2(vel.x * 0.85, -AIR_BOOST_PUSH * 0.55));
+  playerJumpGrace[playerId] = 6;
+  p.airBoosting = true;
+  p.airDodging = false;
+  p.airDodgeTicks = AIR_BOOST_TICKS;
+  playerAirDodgeTicks[playerId] = AIR_BOOST_TICKS;
+  playerAirDodgeDir[playerId] = 0;
+}
+
 function isWallLikeContact(otherFixture: planck.Fixture, selfId: string) {
   const data = getFixtureData(otherFixture);
   const body = otherFixture.getBody();
@@ -1152,16 +1367,22 @@ function resolvePlayerSideStick() {
   for (const id of Object.keys(playerJumpGrace)) {
     if (playerJumpGrace[id] > 0) playerJumpGrace[id]--;
   }
+
+  for (const id of Object.keys(playerDodgeCooldown)) {
+    if (playerDodgeCooldown[id] > 0) playerDodgeCooldown[id]--;
+  }
 }
 
 function syncStateFromPhysics(G: ShooterState) {
   for (const [id, p] of Object.entries(G.players)) {
     const bodies = playerBodies[id];
     if (bodies) {
+      bodies.torso.setAngle(0);
+      bodies.head.setAngle(0);
       const tPos = bodies.torso.getPosition();
       const hPos = bodies.head.getPosition();
-      p.torso = { x: tPos.x * SCALE, y: tPos.y * SCALE, angle: bodies.torso.getAngle() };
-      p.head = { x: hPos.x * SCALE, y: hPos.y * SCALE, angle: bodies.head.getAngle() };
+      p.torso = { x: tPos.x * SCALE, y: tPos.y * SCALE, angle: 0 };
+      p.head = { x: hPos.x * SCALE, y: hPos.y * SCALE, angle: 0 };
     }
   }
 
@@ -1921,10 +2142,19 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
   torso.setAwake(true);
   const vel = torso.getLinearVelocity();
   const crouching = data.crouching === true || data.action === "crouch";
-  p.crouching = crouching && isPlayerGrounded(playerId, torso);
+  const grounded = isPlayerGrounded(playerId, torso);
+  p.crouching = crouching && grounded;
   const speedMul = p.crouching ? 0.45 : 1;
+  const dodgeTicks = playerGroundDodgeTicks[playerId] ?? 0;
+  const airDodgeTicks = playerAirDodgeTicks[playerId] ?? 0;
+  const dodgingSlide = dodgeTicks > 0;
+  const airSliding = airDodgeTicks > 0;
 
-  if (data.action === "left") {
+  if (dodgingSlide) {
+    tickGroundDodgeSlide(playerId, p, torso);
+  } else if (airSliding) {
+    tickAirDodgeSlide(playerId, p, torso);
+  } else if (data.action === "left") {
     torso.setLinearVelocity(planck.Vec2(-MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
   } else if (data.action === "right") {
     torso.setLinearVelocity(planck.Vec2(MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
@@ -1951,8 +2181,55 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     data.jumping = false;
   }
 
+  if (data.dodging) {
+    if (
+      (playerDodgeCooldown[playerId] ?? 0) <= 0 &&
+      !p.crouching &&
+      dodgeTicks <= 0 &&
+      airDodgeTicks <= 0 &&
+      !p.groundDodging &&
+      !p.airDodging &&
+      !p.airBoosting
+    ) {
+      const onGround = isPlayerGrounded(playerId, torso);
+      const velY = torso.getLinearVelocity().y;
+      const facingDir = data.facing >= 0 ? 1 : -1;
+
+      if (onGround) {
+        applyGroundDodge(torso, playerId, facingDir, p);
+        data.action = null;
+      } else if (velY < -0.8) {
+        applyAirBoost(torso, playerId, p);
+        data.action = null;
+      } else {
+        applyAirDodge(torso, playerId, facingDir, p);
+        data.action = null;
+      }
+
+      playerDodgeCooldown[playerId] = DODGE_COOLDOWN_TICKS;
+    }
+    data.dodging = false;
+    data.dodgeDir = 0;
+  }
+
   if (data.shooting) {
     fireWeapon(G, playerId, data.aimAngle, data.facing, random);
+  }
+
+  const stillDodging =
+    (playerGroundDodgeTicks[playerId] ?? 0) > 0 ||
+    (playerAirDodgeTicks[playerId] ?? 0) > 0;
+  if (
+    !stillDodging &&
+    data.action !== "left" &&
+    data.action !== "right" &&
+    data.action !== "crouch" &&
+    !(crouching && !data.action)
+  ) {
+    const vy = torso.getLinearVelocity().y;
+    if (Math.abs(torso.getLinearVelocity().x) > 0.05) {
+      torso.setLinearVelocity(planck.Vec2(0, vy));
+    }
   }
 }
 
@@ -2025,6 +2302,11 @@ function resetRound(G: ShooterState) {
   playerWallJumpUsed = {};
   playerWallContact = {};
   playerJumpGrace = {};
+  playerDodgeCooldown = {};
+  playerGroundDodgeTicks = {};
+  playerDodgeDir = {};
+  playerAirDodgeTicks = {};
+  playerAirDodgeDir = {};
   G.bullets = [];
   G.crates = [];
   G.pickups = [];
@@ -2041,6 +2323,12 @@ function resetRound(G: ShooterState) {
     const spawn = spawnOnFloor(spawns[index % spawns.length]);
     p.health = MAX_HEALTH;
     p.crouching = false;
+    p.airDodging = false;
+    p.airBoosting = false;
+    p.airDodgeTicks = 0;
+    p.groundDodging = false;
+    p.groundDodgeTicks = 0;
+    p.dodgeDir = 0;
     p.currentWeapon = START_WEAPON;
     p.ownedWeapons = defaultOwnedWeapons();
     p.lastFireTick = 0;
@@ -2188,6 +2476,11 @@ export default defineGame<ShooterState>({
     playerWallJumpUsed = {};
     playerWallContact = {};
     playerJumpGrace = {};
+    playerDodgeCooldown = {};
+    playerGroundDodgeTicks = {};
+    playerDodgeDir = {};
+    playerAirDodgeTicks = {};
+    playerAirDodgeDir = {};
     pendingHits.length = 0;
     pendingPlatformDamages.length = 0;
     pendingCrateDamages.length = 0;
@@ -2203,6 +2496,7 @@ export default defineGame<ShooterState>({
     world.on("pre-solve", (contact) => {
       if (!currentG) return;
       if (!contact.isTouching()) return;
+      disablePlayerCollisionDuringDodge(contact);
       handleContactWithBulletDamage(currentG, contact);
     });
 
@@ -2241,6 +2535,12 @@ export default defineGame<ShooterState>({
         aimAngle: 0,
         facing: 1,
         crouching: false,
+        airDodging: false,
+        airBoosting: false,
+        airDodgeTicks: 0,
+        groundDodging: false,
+        groundDodgeTicks: 0,
+        dodgeDir: 0,
         currentWeapon: START_WEAPON,
         ownedWeapons: defaultOwnedWeapons(),
         lastFireTick: -1,
@@ -2295,6 +2595,13 @@ export default defineGame<ShooterState>({
         facing: typeof data.facing === "number" ? (data.facing >= 0 ? 1 : -1) : p.facing,
         crouching: !!data.crouching,
         shooting: !!data.shooting,
+        dodging: !!data.dodging,
+        dodgeDir:
+          typeof data.dodgeDir === "number" && data.dodgeDir !== 0
+            ? data.dodgeDir >= 0
+              ? 1
+              : -1
+            : 0,
       };
       p.aimAngle = p.input.aimAngle;
       p.facing = p.input.facing;
