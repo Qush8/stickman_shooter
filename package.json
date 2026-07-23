@@ -23,8 +23,6 @@
   },
   "dependencies": {
     "@bordiko/sdk": "^0.2.0",
-    "@pixi/unsafe-eval": "^7.4.3",
-    "pixi.js": "^7.4.3",
     "planck": "^1.4.2"
   },
   "devDependencies": {

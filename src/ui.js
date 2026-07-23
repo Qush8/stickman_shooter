@@ -1,9 +1,4 @@
-import '@pixi/unsafe-eval';
-import { Application } from '@pixi/app';
-import { Container } from '@pixi/display';
-import { Graphics, LINE_CAP } from '@pixi/graphics';
-import { Text } from '@pixi/text';
-import { BLEND_MODES } from '@pixi/constants';
+import { Application, Container, Graphics, Text, LINE_CAP } from './canvas-renderer.js';
 import { connectBordiko } from '@bordiko/sdk/ui';
 
 import { GUN_PISTOL_B64, GUN_SHOTGUN_B64, GUN_RIFLE_B64 } from './sfx-buffers.js';
@@ -23,19 +18,20 @@ let viewOffsetY = 0;
 const PLATFORM_BORDER = 2;
 
 const STICK = {
-  headR: 16,
-  lineW: 7,
-  outlineW: 12,
-  limbFillW: 11,
-  bodyLen: 44,
-  hipSpread: 4,
-  footW: 16,
-  footSpread: 5,
-  armLen: 28,
-  stride: 11,
-  lift: 6,
-  crouchDrop: 46,
-  kneeBend: 10,
+  headR: 14,
+  lineW: 2.5,
+  outlineW: 3.5,
+  neckLen: 5,
+  limbFillW: 10,
+  bodyLen: 39,
+  hipSpread: 3.5,
+  footW: 14,
+  footSpread: 4.5,
+  armLen: 25,
+  stride: 10,
+  lift: 5,
+  crouchDrop: 40,
+  kneeBend: 9,
 };
 
 const GUN = {
@@ -120,13 +116,12 @@ let dodgeInputFlushPending = false;
 const SHOOT_FACE_MS = 2000;
 const CORPSE_FALL_MS = 260;
 
-// PixiJS Setup — renderer fills container; gameContainer scales the fixed arena
+// Canvas 2D setup — renderer fills container; gameContainer scales the fixed arena
 const gameContainerEl = document.getElementById('game-container');
 const app = new Application({
     backgroundColor: 0x2c2c2c,
     antialias: true,
     resolution: Math.min(window.devicePixelRatio || 1, 2),
-    autoDensity: true,
 });
 app.view.style.display = 'block';
 app.view.style.width = '100%';
@@ -1539,7 +1534,7 @@ function spawnParticle(x, y, vx, vy, color, size, lifeDecay, gravityMul = 0.5, i
     g.drawCircle(0, 0, size);
     g.endFill();
     g.position.set(x, y);
-    if (!isBlood && additive) g.blendMode = BLEND_MODES.ADD;
+    if (!isBlood && additive) g.blendMode = 'add';
     particlesContainer.addChild(g);
     particles.push({
         mesh: g,
@@ -2172,9 +2167,7 @@ const buildTravelGhostPose = (st) => {
     const ty = st.cy;
     const hipY = ty + FEET_OFF * 0.08;
     const footY = ty + FEET_OFF * 0.25;
-    const hx = tx;
-    const hy = ty - STICK.bodyLen * 0.42;
-    const neckTop = hy + STICK.headR + 2;
+    const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty);
     const s = STICK.footSpread;
     return {
         tx,
@@ -2227,7 +2220,7 @@ const drawShadowAfterimageSilhouette = (g, ghost) => {
 
     const { tx, ty, hx, hy, neckTop, hipY } = ghost;
     g.lineStyle(4.2, SHADOW_DASH.core, a * 0.9, 0.5, true);
-    g.moveTo(hx, hy + STICK.headR);
+    g.moveTo(hx, hy + STICK_HEAD_FILL_R());
     g.lineTo(hx, neckTop);
     g.lineTo(tx, neckTop);
     g.lineTo(tx, ty);
@@ -2392,14 +2385,13 @@ const getShadowTeleportPose = (p) => {
         const squat = smoothStep(Math.min(1, windT)) * 24;
         const tx = ax;
         const ty = ay + squat * 0.12;
-        const hx = ax;
-        const hy = ty - STICK.bodyLen * 0.52;
+        const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty, squat * 0.35);
         return {
             tx,
             ty,
             hx,
             hy,
-            neckTop: hy + STICK.headR + 2,
+            neckTop,
             hipY: ty + FEET_OFF * 0.06 + squat * 0.55,
             footY: ty + FEET_OFF * 0.32 + squat * 0.1,
             crouch: true,
@@ -2413,14 +2405,13 @@ const getShadowTeleportPose = (p) => {
     }
 
     if (phase === "travel") {
-        const hx = st.cx;
-        const hy = st.cy - STICK.bodyLen * 0.42;
+        const { hx, hy, neckTop } = stickHeadNeckFromTorso(st.cx, st.cy);
         return {
             tx: st.cx,
             ty: st.cy,
             hx,
             hy,
-            neckTop: hy + STICK.headR + 2,
+            neckTop,
             hipY: st.cy + FEET_OFF * 0.08,
             footY: st.cy + FEET_OFF * 0.25,
             shadowTeleport: true,
@@ -2435,14 +2426,14 @@ const getShadowTeleportPose = (p) => {
     const reform = smoothStep(matT);
     const tx = bx + (tx0 - bx) * reform;
     const ty = by + (ty0 - by) * reform;
-    const targetHx = p.displayHead.x;
-    const targetHy = p.displayHead.y;
+    const landed = stickHeadNeckFromTorso(tx, ty);
+    const dash = stickHeadNeckFromTorso(bx, by);
     return {
         tx,
         ty,
-        hx: bx + (targetHx - bx) * reform,
-        hy: by + (targetHy - by) * reform - STICK.bodyLen * 0.42 * (1 - reform),
-        neckTop: ty - STICK.bodyLen * 0.44 * reform,
+        hx: dash.hx + (landed.hx - dash.hx) * reform,
+        hy: dash.hy + (landed.hy - dash.hy) * reform,
+        neckTop: dash.neckTop + (landed.neckTop - dash.neckTop) * reform,
         hipY: ty + FEET_OFF * 0.14,
         footY: ty + FEET_OFF - VISUAL_STAND_LIFT,
         shadowTeleport: true,
@@ -2473,6 +2464,14 @@ const getDodgeJuicePeak = (p) => {
     return (1 - st.matT) * 0.95;
 };
 
+const STICK_HEAD_FILL_R = () => STICK.headR - 1.2;
+
+const stickHeadNeckFromTorso = (tx, ty, drop = 0) => {
+    const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.38;
+    const hy = neckTop - STICK_HEAD_FILL_R() - STICK.neckLen;
+    return { hx: tx, hy, neckTop };
+};
+
 const getStickPose = (p) => {
     const teleportPose = getShadowTeleportPose(p);
     if (teleportPose) return teleportPose;
@@ -2487,14 +2486,12 @@ const getStickPose = (p) => {
     const f = p.facing || 1;
     const footY = ty + FEET_OFF - standLift;
     const hipY = ty + FEET_OFF * 0.18 + drop * 0.28 - standLift * 0.4;
-    const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.38;
-    const hx = p.displayHead.x;
-    const hy = crouch ? p.displayHead.y + drop * 0.58 : p.displayHead.y;
+    const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty, drop);
     return {
         tx,
         ty,
-        hx,
-        hy,
+        hx: p.displayHead.x,
+        hy: crouch ? hy + drop * 0.12 : hy,
         neckTop,
         hipY,
         footY,
@@ -2965,8 +2962,8 @@ const getCorpsePose = (p) => {
 };
 
 const drawDeadFace = (g, hx, hy, isMe, alpha = 1) => {
-    g.beginFill(isMe ? 0xb8dcff : 0xffffff, alpha);
-    g.drawCircle(hx, hy, STICK.headR - 1.5);
+    g.beginFill(isMe ? 0xc8e8ff : 0xffffff, alpha);
+    g.drawCircle(hx, hy, STICK_HEAD_FILL_R());
     g.endFill();
 
     const ink = 0x111111;
@@ -3071,94 +3068,164 @@ const tickFaceExpr = (p, dt) => {
 };
 
 const drawFace = (g, hx, hy, facing, expr, isMe) => {
-    g.beginFill(isMe ? 0xb8dcff : 0xffffff, 1);
-    g.drawCircle(hx, hy, STICK.headR - 1.5);
+    const headR = STICK_HEAD_FILL_R();
+    const skinLight = isMe ? 0xc8e8ff : 0xffffff;
+    const skinShadow = isMe ? 0x9ec8ef : 0xe8e8ee;
+
+    g.beginFill(skinShadow, 1);
+    g.drawCircle(hx, hy + headR * 0.08, headR);
+    g.endFill();
+    g.beginFill(skinLight, 1);
+    g.drawCircle(hx, hy - headR * 0.04, headR);
+    g.endFill();
+    g.beginFill(0xffffff, 0.22);
+    g.drawEllipse(hx - headR * 0.28, hy - headR * 0.38, headR * 0.22, headR * 0.14);
     g.endFill();
 
-    const ink = 0x000000;
-    const eyeGap = 4.2;
-    const eyeY = hy - 1;
-    const lineW = 2.2;
+    const ink = 0x222230;
+    const eyeGap = headR * 0.3;
+    const eyeY = hy - headR * 0.12;
+    const mouthY = hy + headR * 0.34;
+    const s = headR / 14.8;
 
-    g.lineStyle(lineW, ink, 1, 0.5, true);
+    const drawEyes = (style = "normal") => {
+        const drawCuteEye = (ex, ey, pupilR, open = 1) => {
+            g.beginFill(0xffffff, 1);
+            g.drawEllipse(ex, ey, 2.1 * s * open, 2.6 * s);
+            g.endFill();
+            g.beginFill(ink, 1);
+            g.drawCircle(ex, ey + 0.25 * s, pupilR * s);
+            g.endFill();
+            g.beginFill(0xffffff, 0.95);
+            g.drawCircle(ex + 0.65 * s, ey - 0.55 * s, 0.55 * s);
+            g.endFill();
+        };
+
+        if (style === "wide") {
+            drawCuteEye(hx - eyeGap, eyeY, 1.35, 1.15);
+            drawCuteEye(hx + eyeGap, eyeY, 1.35, 1.15);
+            return;
+        }
+        if (style === "squint") {
+            g.lineStyle(1.6 * s, ink, 1, 0.5, true);
+            g.moveTo(hx - eyeGap - 2.8 * s, eyeY);
+            g.quadraticCurveTo(hx - eyeGap, eyeY + 1.6 * s, hx - eyeGap + 2.8 * s, eyeY);
+            g.moveTo(hx + eyeGap - 2.8 * s, eyeY);
+            g.quadraticCurveTo(hx + eyeGap, eyeY + 1.6 * s, hx + eyeGap + 2.8 * s, eyeY);
+            return;
+        }
+        if (style === "x") {
+            g.lineStyle(1.5 * s, ink, 1, 0.5, true);
+            const d = 2 * s;
+            g.moveTo(hx - eyeGap - d, eyeY - d);
+            g.lineTo(hx - eyeGap + d, eyeY + d);
+            g.moveTo(hx - eyeGap + d, eyeY - d);
+            g.lineTo(hx - eyeGap - d, eyeY + d);
+            g.moveTo(hx + eyeGap - d, eyeY - d);
+            g.lineTo(hx + eyeGap + d, eyeY + d);
+            g.moveTo(hx + eyeGap + d, eyeY - d);
+            g.lineTo(hx + eyeGap - d, eyeY + d);
+            return;
+        }
+        if (style === "dizzy") {
+            g.lineStyle(1.4 * s, ink, 0.85, 0.5, true);
+            g.drawCircle(hx - eyeGap, eyeY, 2 * s);
+            g.drawCircle(hx + eyeGap, eyeY, 2 * s);
+            g.moveTo(hx - eyeGap, eyeY - 2 * s);
+            g.lineTo(hx - eyeGap, eyeY + 2 * s);
+            g.moveTo(hx + eyeGap, eyeY - 2 * s);
+            g.lineTo(hx + eyeGap, eyeY + 2 * s);
+            return;
+        }
+        drawCuteEye(hx - eyeGap, eyeY, 1.15);
+        drawCuteEye(hx + eyeGap, eyeY, 1.15);
+    };
+
+    const drawBrows = (kind = "neutral") => {
+        g.lineStyle(1.4 * s, ink, 1, 0.5, true);
+        if (kind === "angry") {
+            g.moveTo(hx - eyeGap - 3 * s, eyeY - 3.2 * s);
+            g.lineTo(hx - eyeGap + 1.8 * s, eyeY - 1.8 * s);
+            g.moveTo(hx + eyeGap + 3 * s, eyeY - 3.2 * s);
+            g.lineTo(hx + eyeGap - 1.8 * s, eyeY - 1.8 * s);
+        }
+    };
+
+    const drawMouth = (kind = "neutral") => {
+        g.lineStyle(1.35 * s, ink, 1, 0.5, true);
+        if (kind === "smile") {
+            g.beginFill(0xff8899, 0.18);
+            g.moveTo(hx - 3.2 * s, mouthY);
+            g.quadraticCurveTo(hx, mouthY + 3.2 * s, hx + 3.2 * s, mouthY);
+            g.closePath();
+            g.endFill();
+            g.lineStyle(1.35 * s, ink, 1, 0.5, true);
+            g.moveTo(hx - 3.2 * s, mouthY);
+            g.quadraticCurveTo(hx, mouthY + 3.2 * s, hx + 3.2 * s, mouthY);
+        } else if (kind === "open") {
+            g.beginFill(0x5a3038, 0.9);
+            g.drawEllipse(hx, mouthY + 0.8 * s, 2.2 * s, 1.8 * s);
+            g.endFill();
+            g.lineStyle(1.2 * s, ink, 1, 0.5, true);
+            g.drawEllipse(hx, mouthY + 0.8 * s, 2.2 * s, 1.8 * s);
+        } else if (kind === "frown") {
+            g.moveTo(hx - 2.8 * s, mouthY + 1.2 * s);
+            g.quadraticCurveTo(hx, mouthY - 1 * s, hx + 2.8 * s, mouthY + 1.2 * s);
+        } else if (kind === "wavy") {
+            g.moveTo(hx - 3 * s, mouthY);
+            g.quadraticCurveTo(hx - 1.2 * s, mouthY + 1.6 * s, hx, mouthY);
+            g.quadraticCurveTo(hx + 1.2 * s, mouthY - 1.6 * s, hx + 3 * s, mouthY);
+        } else if (kind === "grit") {
+            g.moveTo(hx - 2.5 * s, mouthY + 0.4 * s);
+            g.lineTo(hx - 0.8 * s, mouthY + 1.2 * s);
+            g.lineTo(hx + 0.8 * s, mouthY + 0.4 * s);
+            g.lineTo(hx + 2.5 * s, mouthY + 1.2 * s);
+        } else {
+            g.moveTo(hx - 2.2 * s, mouthY + 0.5 * s);
+            g.quadraticCurveTo(hx, mouthY + 1.1 * s, hx + 2.2 * s, mouthY + 0.5 * s);
+        }
+    };
+
+    if (expr === "smile" || expr === "jump") {
+        g.beginFill(isMe ? 0xff99aa : 0xffaab8, 0.22);
+        g.drawCircle(hx - headR * 0.42, hy + headR * 0.18, headR * 0.16);
+        g.drawCircle(hx + headR * 0.42, hy + headR * 0.18, headR * 0.16);
+        g.endFill();
+    }
 
     if (expr === "shoot") {
-        g.moveTo(hx - eyeGap - 2.5, eyeY - 2.5);
-        g.lineTo(hx - eyeGap + 3.5, eyeY + 1.5);
-        g.moveTo(hx + eyeGap - 3.5, eyeY + 1.5);
-        g.lineTo(hx + eyeGap + 2.5, eyeY - 2.5);
-        g.moveTo(hx - 3.5, hy + 5);
-        g.lineTo(hx - 1.2, hy + 7.5);
-        g.lineTo(hx + 1.2, hy + 7.5);
-        g.lineTo(hx + 3.5, hy + 5);
+        drawEyes("squint");
+        drawMouth("grit");
         return;
     }
-
     if (expr === "dazed") {
-        g.moveTo(hx - eyeGap - 3.2, eyeY + 0.5);
-        g.lineTo(hx - eyeGap + 3.2, eyeY - 0.5);
-        g.moveTo(hx + eyeGap - 3.2, eyeY - 0.5);
-        g.lineTo(hx + eyeGap + 3.2, eyeY + 0.5);
-        g.moveTo(hx - 4.2, hy + 5.2);
-        g.quadraticCurveTo(hx - 2.2, hy + 7.4, hx, hy + 5.1);
-        g.quadraticCurveTo(hx + 2.2, hy + 2.8, hx + 4.2, hy + 5.2);
+        drawEyes("dizzy");
+        drawMouth("wavy");
         return;
     }
-
     if (expr === "hurt") {
-        g.moveTo(hx - eyeGap - 2.5, eyeY - 2.5);
-        g.lineTo(hx - eyeGap + 2.5, eyeY + 2.5);
-        g.moveTo(hx - eyeGap + 2.5, eyeY - 2.5);
-        g.lineTo(hx - eyeGap - 2.5, eyeY + 2.5);
-        g.moveTo(hx + eyeGap - 2.5, eyeY - 2.5);
-        g.lineTo(hx + eyeGap + 2.5, eyeY + 2.5);
-        g.moveTo(hx + eyeGap + 2.5, eyeY - 2.5);
-        g.lineTo(hx + eyeGap - 2.5, eyeY + 2.5);
-        g.moveTo(hx - 4.5, hy + 6);
-        g.quadraticCurveTo(hx, hy + 8.5, hx + 4.5, hy + 6);
+        drawEyes("x");
+        drawMouth("frown");
         return;
     }
-
     if (expr === "jump") {
-        g.beginFill(ink, 1);
-        g.drawCircle(hx - eyeGap, eyeY, 2.4);
-        g.drawCircle(hx + eyeGap, eyeY, 2.4);
-        g.endFill();
-        g.drawCircle(hx, hy + 5.5, 3);
+        drawEyes("wide");
+        drawMouth("open");
         return;
     }
-
     if (expr === "angry") {
-        g.moveTo(hx - eyeGap - 3, eyeY - 3);
-        g.lineTo(hx - eyeGap + 3, eyeY);
-        g.moveTo(hx + eyeGap + 3, eyeY - 3);
-        g.lineTo(hx + eyeGap - 3, eyeY);
-        g.beginFill(ink, 1);
-        g.drawCircle(hx - eyeGap, eyeY + 1.5, 1.8);
-        g.drawCircle(hx + eyeGap, eyeY + 1.5, 1.8);
-        g.endFill();
-        g.moveTo(hx - 4, hy + 6);
-        g.quadraticCurveTo(hx, hy + 4, hx + 4, hy + 6);
+        drawBrows("angry");
+        drawEyes("normal");
+        drawMouth("frown");
         return;
     }
-
     if (expr === "smile") {
-        g.beginFill(ink, 1);
-        g.drawCircle(hx - eyeGap, eyeY, 2);
-        g.drawCircle(hx + eyeGap, eyeY, 2);
-        g.endFill();
-        g.moveTo(hx - 4, hy + 4.5);
-        g.quadraticCurveTo(hx, hy + 8.5, hx + 4, hy + 4.5);
+        drawEyes("normal");
+        drawMouth("smile");
         return;
     }
-
-    // serious — flat mouth, no smile
-    g.beginFill(ink, 1);
-    g.drawCircle(hx - eyeGap, eyeY, 2);
-    g.drawCircle(hx + eyeGap, eyeY, 2);
-    g.endFill();
-    g.moveTo(hx - 3.5, hy + 6.5);
-    g.lineTo(hx + 3.5, hy + 6.5);
+    drawEyes("normal");
+    drawMouth("neutral");
 };
 
 const initPlayerRenderState = (p) => {
@@ -3379,8 +3446,7 @@ const drawStickmanLines = (g, p, isMe) => {
         drawShadowTeleportStreaks(g, st);
         const drawDashBody = (lineW, col, alpha) => {
             g.lineStyle(lineW, col, alpha, 0.5, true);
-            g.drawCircle(hx, hy, STICK.headR);
-            g.moveTo(hx, hy + STICK.headR);
+            g.moveTo(hx, hy + STICK_HEAD_FILL_R());
             g.lineTo(hx, neckTop);
             g.lineTo(tx, neckTop);
             g.lineTo(tx, ty);
@@ -3399,10 +3465,9 @@ const drawStickmanLines = (g, p, isMe) => {
 
     const drawBody = (lineW, col, alpha) => {
         g.lineStyle(lineW, col, alpha, 0.5, true);
-        g.drawCircle(hx, hy, STICK.headR);
         if (gun.shadowTeleport && gun.stPhase === "windup") {
             const squat = (gun.drop ?? 0) / 24;
-            g.moveTo(hx, hy + STICK.headR * 0.4);
+            g.moveTo(hx, hy + STICK_HEAD_FILL_R() * 0.4);
             g.lineTo(hx, neckTop);
             g.lineTo(tx, neckTop);
             g.lineTo(tx, ty + squat * 0.08);
@@ -3417,7 +3482,7 @@ const drawStickmanLines = (g, p, isMe) => {
         }
         if (gun.shadowTeleport && gun.stPhase === "materialize") {
             const reform = smoothStep(gun.matT ?? 0);
-            g.moveTo(hx, hy + STICK.headR);
+            g.moveTo(hx, hy + STICK_HEAD_FILL_R());
             g.lineTo(hx, neckTop);
             g.lineTo(tx, neckTop);
             g.lineTo(tx, ty);
@@ -3430,7 +3495,7 @@ const drawStickmanLines = (g, p, isMe) => {
             drawLegWithKnee(g, tx + STICK.hipSpread * reform, hipY, legs.rKneeX, legs.rKneeY, legs.rFootX, legs.rFootY);
             return;
         }
-        g.moveTo(hx, hy + STICK.headR);
+        g.moveTo(hx, hy + STICK_HEAD_FILL_R());
         g.lineTo(hx, neckTop);
         g.lineTo(tx, neckTop);
         g.lineTo(tx, ty);
@@ -3812,12 +3877,14 @@ app.ticker.add(() => {
                 p.dom.style.display = 'block';
             }
 
+            const gun = getGunPose(p);
             drawStickmanLines(p.lineGraphics, p, isMe);
             drawStickmanFills(p.fillGraphics, p, isMe);
 
-            // DOM update — HP bar directly above head
-            const hud = arenaPointToClient(p.displayHead.x, p.displayHead.y - 12);
-            p.dom.style.transform = `translate(${hud.x}px, ${hud.y}px) scale(${viewScale})`;
+            // HP bar: bottom edge ~6px above visual head top (screen space)
+            const headTopClient = arenaPointToClient(gun.hx, gun.hy - STICK_HEAD_FILL_R());
+            const hudY = headTopClient.y - 6 - 7 * viewScale;
+            p.dom.style.transform = `translate(${headTopClient.x}px, ${hudY}px) scale(${viewScale})`;
             p.dom.style.transformOrigin = `0 0`;
             const fg = p.dom.querySelector('.health-bar-fg');
             if (fg) fg.style.width = `${Math.max(0, p.health / 1000 * 100)}%`;
