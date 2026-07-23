@@ -7,8 +7,16 @@ import {
   type TickContext,
 } from "@bordiko/sdk";
 
-import * as planck from "./matter-physics.ts";
-import { getPhysicsInitError } from "./matter-physics.ts";
+import {
+  checkBulletWall,
+  checkCircleAABB,
+  resolvePlayerPlatform,
+  stepBullet,
+  stepPlayer,
+  type AABB,
+  type ArcadePlatform,
+  type ArcadePlayer,
+} from "./arcade-physics.ts";
 import { ARENA_H, ARENA_W, getMap, getNextMapId, type MapId } from "./maps.ts";
 
 export type WeaponId =
@@ -176,6 +184,11 @@ export interface PlayerState {
   lastFireTick: number;
   torso: BodyState;
   head: BodyState;
+  vx: number;
+  vy: number;
+  grounded: boolean;
+  wallJumpUsed: boolean;
+  jumpGrace: number;
   team?: TeamId;
   input?: PlayerInput;
 }
@@ -189,6 +202,10 @@ export interface BulletState {
   damage: number;
   aoeRadius?: number;
   fuseTicks?: number;
+  vx: number;
+  vy: number;
+  r: number;
+  gravityScale: number;
 }
 
 export interface HitEvent {
@@ -260,7 +277,6 @@ export interface ShooterState {
   intermissionTicksLeft: number;
   lastRoundWinner: string | null;
   matchPhase: MatchPhase;
-  wasmInitError?: string | null;
 }
 
 export const ROUNDS_TO_WIN = 3;
@@ -284,19 +300,19 @@ const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
 const PHYSICS_HZ = 60;
 const PHYSICS_DT = 1 / PHYSICS_HZ;
 const PHYSICS_STEPS_PER_TICK = PHYSICS_HZ / 30;
-const MOVE_SPEED = 15;
-const JUMP_IMPULSE = 34;
+const MOVE_SPEED = 15 * SCALE;
+const JUMP_VY = -34 * SCALE;
 /** Target peak height = jump × this (impulse uses √ratio for energy scaling). */
 const RECOIL_HEIGHT_OF_JUMP = 0.9;
-const GRAVITY = 97.5;
-const WALL_JUMP_IMPULSE_X = 11;
-const BULLET_SPEED = 40;
+const GRAVITY = 97.5 * SCALE;
+const WALL_JUMP_IMPULSE_X = 11 * SCALE;
+const BULLET_SPEED = 40 * SCALE;
 const BULLET_GRAVITY_SCALE = 0.62;
-const FEET_PIXELS = PLAYER_HALF_H * SCALE;
-const GROUNDED_VEL_Y = 12;
-const GROUNDED_GAP = 0.5;
-const STAND_LIFT = 0.14;
-const MAX_BULLET_BOUNCES = 1;
+const PLAYER_W = PLAYER_HALF_W * SCALE * 2;
+const PLAYER_H = PLAYER_HALF_H * SCALE * 2;
+const FEET_PIXELS = PLAYER_H / 2;
+const GROUNDED_VEL_Y = 12 * SCALE;
+const RECOIL_IMPULSE = 34 * SCALE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP);
 const PLATFORM_HITS_TO_BREAK = 4;
 const PLATFORM_MAX_HEALTH = WEAPONS.winchester.damage * PLATFORM_HITS_TO_BREAK;
 const PLATFORM_BORDER_PX = 2;
@@ -322,29 +338,7 @@ const spawnOnFloor = (x: number) => ({
   y: FLOOR_Y - PLAYER_HALF_H * SCALE,
 });
 
-type FixtureUserData =
-  | { type: "player"; id: string }
-  | { type: "head"; id: string }
-  | { type: "bullet"; id: number; owner: string }
-  | { type: "ground" }
-  | { type: "platform"; id: number }
-  | { type: "crate"; id: number }
-  | { type: "pickup"; id: number };
-
-let world: planck.World;
-let playerBodies: Record<string, { torso: planck.Body; head: planck.Body }> = {};
-let platformBodies: Record<number, planck.Body> = {};
-let crateBodies: Record<number, planck.Body> = {};
-let pickupBodies: Record<number, planck.Body> = {};
-let bulletBodies: Record<number, planck.Body> = {};
-let bulletBounceCounts: Record<number, number> = {};
-let handledBulletContactsThisStep = new Set<number>();
 let handledBulletPlayerHitsThisStep = new Set<string>();
-let handledBulletWallBounceThisStep = new Set<number>();
-let playerGrounded: Record<string, boolean> = {};
-let playerWallJumpUsed: Record<string, boolean> = {};
-let playerWallContact: Record<string, { nx: number; ny: number } | null> = {};
-let playerJumpGrace: Record<string, number> = {};
 const pendingBulletDestroys = new Set<number>();
 const pendingHits: HitEvent[] = [];
 const pendingPlatformDamages: { id: number; damage: number; x: number; y: number }[] = [];
@@ -352,7 +346,11 @@ const pendingCrateDamages: { id: number; damage: number; x: number; y: number }[
 const pendingExplosions: { x: number; y: number; radius: number; damage: number; owner: string }[] =
   [];
 let currentG: ShooterState | null = null;
-const sharedWorldManifold = new planck.WorldManifold();
+
+const FLOOR_AABB: AABB = { x: 0, y: FLOOR_Y, w: ARENA_W, h: 1 };
+const LEFT_WALL_AABB: AABB = { x: -1, y: 0, w: 1, h: ARENA_H };
+const RIGHT_WALL_AABB: AABB = { x: ARENA_W, y: 0, w: 1, h: ARENA_H };
+const CEILING_AABB: AABB = { x: 0, y: -1, w: ARENA_W, h: 1 };
 
 function setCurrentG(G: ShooterState) {
   currentG = G;
@@ -452,37 +450,57 @@ function buildMatchResult(G: ShooterState): GameResult | void {
   return { winners, scores: G.scores, reason: "best-of-5" };
 }
 
-function getFixtureData(fixture: planck.Fixture): FixtureUserData | null {
-  return (fixture.getUserData() as FixtureUserData | null) ?? null;
+function isPlayerAlive(G: ShooterState, id: string): boolean {
+  const p = G.players[id];
+  return !!p && p.health > 0;
 }
 
-function isSolidSurface(data: FixtureUserData | null, body: planck.Body) {
-  if (data?.type === "ground") return true;
-  if (data?.type === "platform") return true;
-  if (data?.type === "crate") return true;
-  return body.getType() === "static" && data?.type !== "bullet";
+function toPlatformArcade(plat: PlatformState): ArcadePlatform {
+  return {
+    x: plat.x,
+    y: plat.y,
+    w: plat.w,
+    h: plat.h,
+    vx: plat.vx,
+    isElevator: plat.kind === "elevator",
+  };
 }
 
-function platformCenterMeters(plat: PlatformState) {
-  return planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE);
+function syncHeadFromTorso(p: PlayerState) {
+  p.head = { x: p.torso.x, y: p.torso.y - HEAD_OFFSET, angle: 0 };
+  p.torso.angle = 0;
 }
 
-function createPlatformBody(plat: PlatformState) {
-  const pos = platformCenterMeters(plat);
-  const pBody = world.createBody({ position: pos });
-  pBody.createFixture(planck.Box(plat.w / 2 / SCALE, plat.h / 2 / SCALE), {
-    friction: 0.35,
-    restitution: 0.05,
-    userData: { type: "platform", id: plat.id } satisfies FixtureUserData,
-  });
-  platformBodies[plat.id] = pBody;
+function initPlayerPhysics(p: PlayerState) {
+  p.vx = 0;
+  p.vy = 0;
+  p.grounded = false;
+  p.wallJumpUsed = false;
+  p.jumpGrace = 0;
+}
+
+function ensurePlayerPhysics(p: PlayerState) {
+  if (typeof p.vx !== "number") p.vx = 0;
+  if (typeof p.vy !== "number") p.vy = 0;
+  if (typeof p.grounded !== "boolean") p.grounded = false;
+  if (typeof p.wallJumpUsed !== "boolean") p.wallJumpUsed = false;
+  if (typeof p.jumpGrace !== "number") p.jumpGrace = 0;
+}
+
+function getFeetY(p: PlayerState): number {
+  return p.torso.y + PLAYER_H / 2;
+}
+
+function playerTorsoAABB(p: PlayerState): AABB {
+  return {
+    x: p.torso.x - PLAYER_W / 2,
+    y: p.torso.y - PLAYER_H / 2,
+    w: PLAYER_W,
+    h: PLAYER_H,
+  };
 }
 
 function initPlatforms(G: ShooterState) {
-  for (const body of Object.values(platformBodies)) {
-    world.destroyBody(body);
-  }
-  platformBodies = {};
   const mapDef = getMap(G.currentMapId);
   G.platforms = mapDef.platforms.map((def) => ({
     id: def.id,
@@ -498,50 +516,6 @@ function initPlatforms(G: ShooterState) {
     minX: def.kind === "elevator" ? def.minX : undefined,
     maxX: def.kind === "elevator" ? def.maxX : undefined,
   }));
-  for (const plat of G.platforms) {
-    createPlatformBody(plat);
-  }
-}
-
-function destroyCrateBody(id: number) {
-  const body = crateBodies[id];
-  if (body) {
-    world.destroyBody(body);
-    delete crateBodies[id];
-  }
-}
-
-function destroyPickupBody(id: number) {
-  const body = pickupBodies[id];
-  if (body) {
-    world.destroyBody(body);
-    delete pickupBodies[id];
-  }
-}
-
-function createCrateBody(crate: CrateState) {
-  const body = world.createDynamicBody({
-    position: planck.Vec2((crate.x + crate.w / 2) / SCALE, (crate.y + crate.h / 2) / SCALE),
-    fixedRotation: true,
-  });
-  body.createFixture(planck.Box(crate.w / 2 / SCALE, crate.h / 2 / SCALE), {
-    density: 2.5,
-    friction: 0.4,
-    restitution: 0.05,
-    userData: { type: "crate", id: crate.id } satisfies FixtureUserData,
-  });
-  crateBodies[crate.id] = body;
-}
-
-function createPickupBody(pickup: PickupState) {
-  const body = world.createKinematicBody({
-    position: planck.Vec2(pickup.x / SCALE, pickup.y / SCALE),
-  });
-  body.createFixture(planck.Circle(PICKUP_RADIUS / SCALE), {
-    isSensor: true,
-    userData: { type: "pickup", id: pickup.id } satisfies FixtureUserData,
-  });
-  pickupBodies[pickup.id] = body;
 }
 
 function getElevators(G: ShooterState) {
@@ -639,11 +613,6 @@ function breakPlatform(G: ShooterState, id: number) {
   plat.broken = true;
   plat.health = 0;
   releasePickupsFromPlatform(G, id, plat);
-  const body = platformBodies[id];
-  if (body) {
-    world.destroyBody(body);
-    delete platformBodies[id];
-  }
   pendingHits.push({
     x: plat.x + plat.w / 2,
     y: plat.y + plat.h / 2,
@@ -663,7 +632,6 @@ function damagePlatform(G: ShooterState, id: number, damage: number, x: number, 
 }
 
 function destroyCrate(G: ShooterState, id: number) {
-  destroyCrateBody(id);
   const idx = G.crates.findIndex((c) => c.id === id);
   if (idx >= 0) G.crates.splice(idx, 1);
 }
@@ -679,23 +647,16 @@ function damageCrate(G: ShooterState, id: number, damage: number, x: number, y: 
 }
 
 function removePickup(G: ShooterState, id: number) {
-  destroyPickupBody(id);
   const idx = G.pickups.findIndex((p) => p.id === id);
   if (idx >= 0) G.pickups.splice(idx, 1);
 }
 
 function destroyBullet(G: ShooterState, bulletId: number) {
-  const body = bulletBodies[bulletId];
-  if (body) {
-    world.destroyBody(body);
-    delete bulletBodies[bulletId];
-  }
-  delete bulletBounceCounts[bulletId];
   const idx = G.bullets.findIndex((b) => b.id === bulletId);
   if (idx >= 0) G.bullets.splice(idx, 1);
 }
 
-function computeMuzzleMeters(
+function computeMuzzlePx(
   torsoXpx: number,
   torsoYpx: number,
   aimAngle: number,
@@ -712,8 +673,8 @@ function computeMuzzleMeters(
     const mountY = neckTop + 6;
     const tubeLen = weapon.barrelPx;
     return {
-      x: (mountX + Math.cos(aimAngle) * tubeLen) / SCALE,
-      y: (mountY + Math.sin(aimAngle) * tubeLen) / SCALE,
+      x: mountX + Math.cos(aimAngle) * tubeLen,
+      y: mountY + Math.sin(aimAngle) * tubeLen,
     };
   }
 
@@ -725,181 +686,13 @@ function computeMuzzleMeters(
   const handY = shoulderY + Math.sin(aimAngle) * armReach;
   const muzzleDist = weapon.barrelPx + GUN_TIP_PX * 0.4;
   return {
-    x: (handX + Math.cos(aimAngle) * muzzleDist) / SCALE,
-    y: (handY + Math.sin(aimAngle) * muzzleDist) / SCALE,
+    x: handX + Math.cos(aimAngle) * muzzleDist,
+    y: handY + Math.sin(aimAngle) * muzzleDist,
   };
 }
 
-function createPlayerPhysics(id: string, x: number, y: number) {
-  const torso = world.createDynamicBody({
-    position: planck.Vec2(x / SCALE, y / SCALE),
-    fixedRotation: true,
-  });
-  // Lower/shorter torso box so head hits register on the head fixture first.
-  torso.createFixture(planck.Box(PLAYER_HALF_W, 0.78, planck.Vec2(0, 0.28)), {
-    density: 2.0,
-    friction: 0.5,
-    restitution: 0.0,
-    userData: { type: "player", id } satisfies FixtureUserData,
-  });
-
-  const head = world.createBody({
-    position: planck.Vec2(x / SCALE, (y - HEAD_OFFSET) / SCALE),
-  });
-  head.createFixture(planck.Circle(HEAD_RADIUS), {
-    density: 1.0,
-    friction: 0.6,
-    restitution: 0.0,
-    isSensor: true,
-    userData: { type: "head", id } satisfies FixtureUserData,
-  });
-
-  playerBodies[id] = { torso, head };
-  playerGrounded[id] = true;
-  playerWallJumpUsed[id] = false;
-  playerWallContact[id] = null;
-  playerJumpGrace[id] = 0;
-}
-
-function destroyPlayerPhysics(id: string) {
-  const bodies = playerBodies[id];
-  if (!bodies) return;
-  world.destroyBody(bodies.torso);
-  world.destroyBody(bodies.head);
-  delete playerBodies[id];
-  delete playerGrounded[id];
-  delete playerWallJumpUsed[id];
-  delete playerWallContact[id];
-  delete playerJumpGrace[id];
-}
-
-function feetPositionMeters(torso: planck.Body) {
-  const pos = torso.getPosition();
-  return planck.Vec2(pos.x, pos.y + PLAYER_HALF_H);
-}
-
-function isStandableFixture(fixture: planck.Fixture, selfId: string) {
-  const data = getFixtureData(fixture);
-  const body = fixture.getBody();
-  if (data?.type === "bullet" || data?.type === "pickup") return false;
-  if (data?.type === "player" || data?.type === "head") {
-    if (data.id === selfId) return false;
-    return playerBodies[data.id] != null;
-  }
-  return isSolidSurface(data, body);
-}
-
-function isFixtureGround(fixture: planck.Fixture) {
-  const data = getFixtureData(fixture);
-  const body = fixture.getBody();
-  if (data?.type === "player" || data?.type === "head" || data?.type === "bullet") return false;
-  if (data?.type === "pickup") return false;
-  return isSolidSurface(data, body);
-}
-
-function raycastStandBelow(feetX: number, feetY: number, selfId: string, maxDist = 0.75): planck.Vec2 | null {
-  const hit = { point: null as planck.Vec2 | null };
-  world.rayCast(
-    planck.Vec2(feetX, feetY - 0.4),
-    planck.Vec2(feetX, feetY + maxDist),
-    (fixture, point) => {
-      if (!isStandableFixture(fixture, selfId)) return 1;
-      hit.point = point;
-      return 0;
-    },
-  );
-  return hit.point;
-}
-
-function feetOnSurface(feet: planck.Vec2, surfaceY: number) {
-  const gap = surfaceY - feet.y;
-  return gap >= -0.2 && gap <= GROUNDED_GAP;
-}
-
-function hasSupportContact(torso: planck.Body, selfId: string): boolean {
-  for (let edge = torso.getContactList(); edge; edge = edge.next) {
-    const contact = edge.contact;
-    if (!contact.isTouching()) continue;
-
-    const fixtureA = contact.getFixtureA();
-    const fixtureB = contact.getFixtureB();
-    const otherFixture = fixtureA.getBody() === torso ? fixtureB : fixtureA;
-    if (fixtureA.getBody() !== torso && fixtureB.getBody() !== torso) continue;
-    if (!isStandableFixture(otherFixture, selfId)) continue;
-
-    contact.getWorldManifold(sharedWorldManifold);
-    if (Math.abs(sharedWorldManifold.normal.y) > 0.1) return true;
-  }
-  return false;
-}
-
-function hasTopSupportContact(body: planck.Body, selfId: string): boolean {
-  for (let edge = body.getContactList(); edge; edge = edge.next) {
-    const contact = edge.contact;
-    if (!contact.isTouching()) continue;
-
-    const fixtureA = contact.getFixtureA();
-    const fixtureB = contact.getFixtureB();
-    const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
-    if (fixtureA.getBody() !== body && fixtureB.getBody() !== body) continue;
-    if (!isStandableFixture(otherFixture, selfId)) continue;
-
-    contact.getWorldManifold(sharedWorldManifold);
-    const nx = sharedWorldManifold.normal.x;
-    const ny = sharedWorldManifold.normal.y;
-    if (Math.abs(ny) > 0.45 && Math.abs(nx) < 0.45) return true;
-  }
-  return false;
-}
-
-function canPerformStandingJump(id: string, torso: planck.Body, crouching: boolean): boolean {
-  if (crouching) return false;
-
-  const vel = torso.getLinearVelocity();
-  if (Math.abs(vel.y) > GROUNDED_VEL_Y) return false;
-
-  if (hasTopSupportContact(torso, id) || hasTopSupportContact(playerBodies[id].head, id)) {
-    return true;
-  }
-
-  const feet = feetPositionMeters(torso);
-  const surfaceHit = raycastStandBelow(feet.x, feet.y, id, 0.85);
-  if (surfaceHit !== null && feetOnSurface(feet, surfaceHit.y)) return true;
-
-  return feet.y * SCALE >= FLOOR_Y - 14;
-}
-
-function measureGrounded(id: string, torso: planck.Body): boolean {
-  const vel = torso.getLinearVelocity();
-  if (Math.abs(vel.y) > GROUNDED_VEL_Y) return false;
-
-  if (hasSupportContact(torso, id)) return true;
-
-  const feet = feetPositionMeters(torso);
-  const surfaceHit = raycastStandBelow(feet.x, feet.y, id, 0.85);
-  if (surfaceHit !== null && feetOnSurface(feet, surfaceHit.y)) return true;
-
-  return feet.y * SCALE >= FLOOR_Y - 14;
-}
-
-function updatePlayerGroundedState() {
-  for (const [id, bodies] of Object.entries(playerBodies)) {
-    playerGrounded[id] = measureGrounded(id, bodies.torso);
-  }
-}
-
-function raycastStaticGroundBelow(feetX: number, feetY: number, maxDist = 0.85): planck.Vec2 | null {
-  const hit = { point: null as planck.Vec2 | null };
-  world.rayCast(
-    planck.Vec2(feetX, feetY - 0.4),
-    planck.Vec2(feetX, feetY + maxDist),
-    (fixture, point) => {
-      if (!isFixtureGround(fixture)) return 1;
-      hit.point = point;
-      return 0;
-    },
-  );
-  return hit.point;
+function createPlayerPhysics(p: PlayerState) {
+  initPlayerPhysics(p);
 }
 
 function isEntityOnPlatform(
@@ -912,47 +705,30 @@ function isEntityOnPlatform(
   return Math.abs(feetY - plat.y) <= tolerance;
 }
 
-function isPlayerOnPlatform(playerId: string, plat: PlatformState): boolean {
-  const bodies = playerBodies[playerId];
-  if (!bodies || !measureGrounded(playerId, bodies.torso)) return false;
-  const feet = feetPositionMeters(bodies.torso);
-  return isEntityOnPlatform(feet.x * SCALE, feet.y * SCALE, plat);
+function isPlayerOnPlatform(G: ShooterState, playerId: string, plat: PlatformState): boolean {
+  const p = G.players[playerId];
+  if (!p || !p.grounded) return false;
+  return isEntityOnPlatform(p.torso.x, getFeetY(p), plat);
 }
 
 function applyPlatformRiderDelta(G: ShooterState, plat: PlatformState, dx: number) {
   if (dx === 0) return;
-  const dxM = dx / SCALE;
 
-  for (const [id, bodies] of Object.entries(playerBodies)) {
-    if (!isPlayerOnPlatform(id, plat)) continue;
-    const torso = bodies.torso;
-    const head = bodies.head;
-    const tPos = torso.getPosition();
-    const hPos = head.getPosition();
-    const vel = torso.getLinearVelocity();
-    torso.setTransform(planck.Vec2(tPos.x + dxM, tPos.y), 0);
-    head.setTransform(planck.Vec2(hPos.x + dxM, hPos.y), head.getAngle());
-    torso.setLinearVelocity(planck.Vec2(vel.x + (plat.vx ?? 0) / SCALE, vel.y));
+  for (const [id, p] of Object.entries(G.players)) {
+    if (!isPlayerAlive(G, id) || !isPlayerOnPlatform(G, id, plat)) continue;
+    p.torso.x += dx;
+    syncHeadFromTorso(p);
+    if (plat.vx != null) p.vx += plat.vx;
   }
 
   for (const crate of G.crates) {
     if (crate.onPlatformId !== plat.id) continue;
-    const body = crateBodies[crate.id];
-    if (!body) continue;
-    const pos = body.getPosition();
-    const vel = body.getLinearVelocity();
-    body.setTransform(planck.Vec2(pos.x + dxM, pos.y), 0);
-    body.setLinearVelocity(planck.Vec2(vel.x + (plat.vx ?? 0) / SCALE, vel.y));
     crate.x += dx;
   }
 
   for (const pickup of G.pickups) {
     if (pickup.onPlatformId !== plat.id) continue;
     pickup.x += dx;
-    const body = pickupBodies[pickup.id];
-    if (body) {
-      body.setTransform(planck.Vec2(pickup.x / SCALE, pickup.y / SCALE), 0);
-    }
   }
 }
 
@@ -984,194 +760,140 @@ function advancePlatformMotion(G: ShooterState) {
 
     const dx = newX - prevX;
     plat.x = newX;
-
-    const body = platformBodies[plat.id];
-    if (body) {
-      body.setTransform(platformCenterMeters(plat), 0);
-    }
-
     applyPlatformRiderDelta(G, plat, dx);
   }
 }
 
-function snapPlayersToGround() {
-  for (const [id, bodies] of Object.entries(playerBodies)) {
-    const torso = bodies.torso;
-    const vel = torso.getLinearVelocity();
-    if (Math.abs(vel.y) > 12) continue;
-
-    const feet = feetPositionMeters(torso);
-    const surfaceHit = raycastStandBelow(feet.x, feet.y, id, 0.85);
-    if (surfaceHit === null) continue;
-
-    const targetTorsoY = surfaceHit.y - PLAYER_HALF_H - STAND_LIFT;
-    const pos = torso.getPosition();
-    const dy = targetTorsoY - pos.y;
-    if (dy > -0.08 && dy < 0.35) {
-      torso.setTransform(planck.Vec2(pos.x, targetTorsoY), 0);
-      if (Math.abs(vel.y) < 1.5) {
-        torso.setLinearVelocity(planck.Vec2(vel.x, 0));
-      }
-    }
-  }
+function isPlayerGrounded(p: PlayerState): boolean {
+  return p.grounded;
 }
 
-function isPlayerGrounded(id: string, torso: planck.Body): boolean {
-  return measureGrounded(id, torso);
+function canPerformStandingJump(G: ShooterState, id: string, crouching: boolean): boolean {
+  const p = G.players[id];
+  if (!p || crouching) return false;
+  if (Math.abs(p.vy) > GROUNDED_VEL_Y) return false;
+  if (p.grounded) return true;
+  return getFeetY(p) >= FLOOR_Y - 14;
 }
 
-function applyVerticalJump(
-  torso: planck.Body,
-  playerId: string,
-  opts: { keepVx?: number; horizImpulse?: number } = {},
-) {
-  torso.setAwake(true);
-  const mass = torso.getMass();
+function applyVerticalJump(p: PlayerState, opts: { keepVx?: number; horizImpulse?: number } = {}) {
   const horiz = opts.horizImpulse ?? 0;
-  if (horiz !== 0) {
-    torso.setLinearVelocity(planck.Vec2(0, 0));
-  } else {
-    torso.setLinearVelocity(planck.Vec2(opts.keepVx ?? 0, 0));
-  }
-  torso.applyLinearImpulse(
-    planck.Vec2(mass * horiz, -mass * JUMP_IMPULSE),
-    torso.getWorldCenter(),
-    true,
-  );
-  playerJumpGrace[playerId] = 8;
+  p.vx = horiz !== 0 ? horiz : (opts.keepVx ?? 0);
+  p.vy = JUMP_VY;
+  p.grounded = false;
+  p.jumpGrace = 8;
 }
 
-function isWallLikeContact(otherFixture: planck.Fixture, selfId: string) {
-  const data = getFixtureData(otherFixture);
-  const body = otherFixture.getBody();
-  if (data?.type === "bullet" || data?.type === "pickup") return false;
-  if (data?.type === "player" || data?.type === "head") {
-    if (data.id === selfId) return false;
-    return playerBodies[data.id] != null;
-  }
-  return isSolidSurface(data, body);
-}
+function scanPlayerWallContact(G: ShooterState, playerId: string) {
+  const p = G.players[playerId];
+  if (!p) return null;
+  const box = playerTorsoAABB(p);
+  const headY = p.head.y;
 
-function readSideContactNormal(contact: planck.Contact, selfBody: planck.Body) {
-  contact.getWorldManifold(sharedWorldManifold);
-  const nx = sharedWorldManifold.normal.x;
-  const ny = sharedWorldManifold.normal.y;
-  if (Math.abs(nx) <= 0.5 || Math.abs(ny) >= 0.45) return null;
-  return { nx, ny };
-}
+  if (box.x <= 1) return { nx: 1, ny: 0 };
+  if (box.x + box.w >= ARENA_W - 1) return { nx: -1, ny: 0 };
 
-function scanBodyWallContact(body: planck.Body, selfId: string) {
-  for (let edge = body.getContactList(); edge; edge = edge.next) {
-    const contact = edge.contact;
-    if (!contact.isTouching()) continue;
-
-    const fixtureA = contact.getFixtureA();
-    const fixtureB = contact.getFixtureB();
-    const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
-    if (fixtureA.getBody() !== body && fixtureB.getBody() !== body) continue;
-    if (!isWallLikeContact(otherFixture, selfId)) continue;
-
-    const side = readSideContactNormal(contact, body);
-    if (side) return side;
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
+    if (box.x + box.w > platBox.x && box.x < platBox.x + platBox.w) {
+      if (headY <= platBox.y + platBox.h + 2 && box.y + box.h > platBox.y + platBox.h) continue;
+    }
+    if (Math.abs(box.x + box.w - platBox.x) <= 3 && box.y + box.h > platBox.y + 4) {
+      return { nx: -1, ny: 0 };
+    }
+    if (Math.abs(box.x - (platBox.x + platBox.w)) <= 3 && box.y + box.h > platBox.y + 4) {
+      return { nx: 1, ny: 0 };
+    }
   }
   return null;
 }
 
-function updatePlayerWallContacts() {
-  for (const [id, bodies] of Object.entries(playerBodies)) {
-    if (isPlayerGrounded(id, bodies.torso)) {
-      playerWallJumpUsed[id] = false;
-      playerWallContact[id] = null;
-      continue;
-    }
-
-    playerWallContact[id] =
-      scanBodyWallContact(bodies.torso, id) ?? scanBodyWallContact(bodies.head, id);
-  }
-}
-
-function resolvePlayerSideStick() {
-  for (const [id, bodies] of Object.entries(playerBodies)) {
-    if (isPlayerGrounded(id, bodies.torso)) continue;
-    if ((playerJumpGrace[id] ?? 0) > 0) continue;
-
-    const torso = bodies.torso;
-    const vel = torso.getLinearVelocity();
-    if (vel.y < -2) continue;
-
-    let adjusted = false;
-    let slideVx = vel.x;
-    let slideVy = vel.y;
-
-    for (const body of [torso, bodies.head]) {
-      for (let edge = body.getContactList(); edge; edge = edge.next) {
-        const contact = edge.contact;
-        if (!contact.isTouching()) continue;
-
-        const fixtureA = contact.getFixtureA();
-        const fixtureB = contact.getFixtureB();
-        const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
-        if (fixtureA.getBody() !== body && fixtureB.getBody() !== body) continue;
-        if (!isWallLikeContact(otherFixture, id)) continue;
-
-        contact.getWorldManifold(sharedWorldManifold);
-        const nx = sharedWorldManifold.normal.x;
-        const ny = sharedWorldManifold.normal.y;
-
-        if (Math.abs(nx) > 0.5 && Math.abs(ny) < 0.45) {
-          slideVx *= 0.2;
-          if (vel.y >= 0) slideVy = Math.max(slideVy, 5);
-          adjusted = true;
-          continue;
-        }
-
-        if (ny > 0.55 && vel.y >= 0 && vel.y < 2) {
-          slideVy = Math.max(slideVy, 5);
-          slideVx *= 0.7;
-          adjusted = true;
-        }
-      }
-    }
-
-    if (adjusted) {
-      torso.setLinearVelocity(planck.Vec2(slideVx, slideVy));
-    }
-  }
-
-  for (const id of Object.keys(playerJumpGrace)) {
-    if (playerJumpGrace[id] > 0) playerJumpGrace[id]--;
-  }
-}
-
-function syncStateFromPhysics(G: ShooterState) {
+function updatePlayerWallContacts(G: ShooterState) {
   for (const [id, p] of Object.entries(G.players)) {
-    const bodies = playerBodies[id];
-    if (bodies) {
-      bodies.torso.setAngle(0);
-      bodies.head.setAngle(0);
-      const tPos = bodies.torso.getPosition();
-      const hPos = bodies.head.getPosition();
-      p.torso = { x: tPos.x * SCALE, y: tPos.y * SCALE, angle: 0 };
-      p.head = { x: hPos.x * SCALE, y: hPos.y * SCALE, angle: 0 };
+    if (!isPlayerAlive(G, id)) continue;
+    if (isPlayerGrounded(p)) {
+      p.wallJumpUsed = false;
+    }
+  }
+}
+
+function resolvePlayerWalls(player: ArcadePlayer) {
+  const halfW = player.w / 2;
+  if (player.x - halfW < 0) {
+    player.x = halfW;
+    player.vx = Math.max(0, player.vx);
+  }
+  if (player.x + halfW > ARENA_W) {
+    player.x = ARENA_W - halfW;
+    player.vx = Math.min(0, player.vx);
+  }
+  const halfH = player.h / 2;
+  if (player.y - halfH < 0) {
+    player.y = halfH;
+    player.vy = Math.max(0, player.vy);
+  }
+}
+
+function resolvePlayerSideStick(G: ShooterState) {
+  for (const [id, p] of Object.entries(G.players)) {
+    if (!isPlayerAlive(G, id)) continue;
+    if (isPlayerGrounded(p)) continue;
+    if (p.jumpGrace > 0) continue;
+    if (p.vy < -2 * SCALE) continue;
+
+    const wall = scanPlayerWallContact(G, id);
+    if (wall && Math.abs(wall.nx) > 0.5) {
+      p.vx *= 0.2;
+      if (p.vy >= 0) p.vy = Math.max(p.vy, 5 * SCALE);
     }
   }
 
-  for (const b of G.bullets) {
-    const body = bulletBodies[b.id];
-    if (body) {
-      const pos = body.getPosition();
-      b.body = { x: pos.x * SCALE, y: pos.y * SCALE, angle: body.getAngle() };
-    }
+  for (const p of Object.values(G.players)) {
+    if (p.jumpGrace > 0) p.jumpGrace -= 1;
   }
+}
 
-  for (const crate of G.crates) {
-    const body = crateBodies[crate.id];
-    if (body) {
-      const pos = body.getPosition();
-      crate.x = pos.x * SCALE - crate.w / 2;
-      crate.y = pos.y * SCALE - crate.h / 2;
+function stepArcadePlayers(G: ShooterState) {
+  for (const [id, p] of Object.entries(G.players)) {
+    if (!isPlayerAlive(G, id)) continue;
+    ensurePlayerPhysics(p);
+
+    const player: ArcadePlayer = {
+      x: p.torso.x,
+      y: p.torso.y,
+      w: PLAYER_W,
+      h: PLAYER_H,
+      vx: p.vx,
+      vy: p.vy,
+      grounded: false,
+    };
+
+    stepPlayer(player, PHYSICS_DT, GRAVITY);
+    resolvePlayerPlatform(player, FLOOR_AABB);
+    for (const plat of G.platforms) {
+      if (!plat.broken) resolvePlayerPlatform(player, toPlatformArcade(plat));
     }
+    resolvePlayerWalls(player);
+
+    p.torso.x = player.x;
+    p.torso.y = player.y;
+    p.vx = player.vx;
+    p.vy = player.vy;
+    p.grounded = player.grounded;
+    syncHeadFromTorso(p);
   }
+}
+
+function bulletRadiusForKind(kind: BulletState["kind"]): number {
+  if (kind === "rocket") return 0.11 * SCALE;
+  if (kind === "grenade") return 0.09 * SCALE;
+  if (kind === "pellet") return 0.05 * SCALE;
+  return 0.07 * SCALE;
+}
+
+function syncStateFromPhysics(_G: ShooterState) {
+  /* state is authoritative in arcade mode */
 }
 
 function queueExplosion(x: number, y: number, radius: number, damage: number, owner: string) {
@@ -1183,11 +905,10 @@ function processExplosions(G: ShooterState) {
     pendingHits.push({ x: ex.x, y: ex.y, targetId: "", damage: 0 });
 
     for (const [id, p] of Object.entries(G.players)) {
-      if (p.health <= 0 || !playerBodies[id]) continue;
+      if (p.health <= 0 || !isPlayerAlive(G, id)) continue;
       if (!canDamage(G, ex.owner, id)) continue;
-      const tPos = playerBodies[id].torso.getPosition();
-      const dx = tPos.x * SCALE - ex.x;
-      const dy = tPos.y * SCALE - ex.y;
+      const dx = p.torso.x - ex.x;
+      const dy = p.torso.y - ex.y;
       if (Math.hypot(dx, dy) <= ex.radius) {
         pendingHits.push({ x: ex.x, y: ex.y, targetId: id, damage: ex.damage });
       }
@@ -1260,32 +981,28 @@ function resolveMeleeSwingHits(
   facing: number,
   weapon: WeaponDef,
 ) {
-  const bodies = playerBodies[playerId];
-  if (!bodies) return;
+  const attacker = G.players[playerId];
+  if (!attacker) return;
 
   const hitIds: string[] = [];
 
   for (const progress of KATANA_SWING_HIT_SAMPLES) {
-    const tPos = bodies.torso.getPosition();
     const blade = computeKatanaBladeSegment(
-      tPos.x * SCALE,
-      tPos.y * SCALE,
+      attacker.torso.x,
+      attacker.torso.y,
       aimAngle,
       facing,
       progress,
     );
 
     for (const [targetId, target] of Object.entries(G.players)) {
-      if (targetId === playerId || target.health <= 0 || !playerBodies[targetId]) continue;
+      if (targetId === playerId || target.health <= 0 || !isPlayerAlive(G, targetId)) continue;
       if (!canDamage(G, playerId, targetId)) continue;
       if (hitIds.includes(targetId)) continue;
 
-      const targetBodies = playerBodies[targetId];
-      const torsoPos = targetBodies.torso.getPosition();
-      const headPos = targetBodies.head.getPosition();
       const hitPoints: [number, number][] = [
-        [torsoPos.x * SCALE, torsoPos.y * SCALE],
-        [headPos.x * SCALE, headPos.y * SCALE],
+        [target.torso.x, target.torso.y],
+        [target.head.x, target.head.y],
       ];
 
       let hit = false;
@@ -1300,8 +1017,8 @@ function resolveMeleeSwingHits(
 
       hitIds.push(targetId);
       pendingHits.push({
-        x: torsoPos.x * SCALE,
-        y: torsoPos.y * SCALE,
+        x: target.torso.x,
+        y: target.torso.y,
         targetId,
         damage: weapon.damage,
       });
@@ -1328,49 +1045,33 @@ function spawnProjectile(
           ? "pellet"
           : "bullet";
 
-  const bBody = world.createDynamicBody({
-    position: planck.Vec2(startX, startY),
-    bullet: true,
-    gravityScale: weapon.gravityScale ?? BULLET_GRAVITY_SCALE,
-  });
-
-  const radius =
-    kind === "rocket" ? 0.11 : kind === "grenade" ? 0.09 : kind === "pellet" ? 0.05 : 0.07;
-
-  bBody.createFixture(planck.Circle(radius), {
-    density: 5.0,
-    restitution: kind === "grenade" ? 0.45 : 0.55,
-    friction: 0.05,
-    userData: { type: "bullet", id: bulletId, owner } satisfies FixtureUserData,
-  });
-
-  const speed = weapon.speed || BULLET_SPEED;
-  bBody.setBallisticVelocity(
-    planck.Vec2(Math.cos(shotAngle) * speed, Math.sin(shotAngle) * speed),
-  );
-
-  bulletBodies[bulletId] = bBody;
+  const speed = (weapon.speed || BULLET_SPEED / SCALE) * SCALE;
+  const gravityScale = weapon.gravityScale ?? BULLET_GRAVITY_SCALE;
+  const r = bulletRadiusForKind(kind);
 
   G.bullets.push({
     id: bulletId,
     owner,
-    body: { x: startX * SCALE, y: startY * SCALE, angle: shotAngle },
+    body: { x: startX, y: startY, angle: shotAngle },
     kind,
     weaponId,
     damage: weapon.damage,
     aoeRadius: weapon.aoeRadius,
     fuseTicks: weapon.fuseTicks,
+    vx: Math.cos(shotAngle) * speed,
+    vy: Math.sin(shotAngle) * speed,
+    r,
+    gravityScale,
   });
 }
 
 function applyRecoil(
-  torso: planck.Body,
+  p: PlayerState,
   aimAngle: number,
   onGround: boolean,
   crouching: boolean,
   weaponId: WeaponId,
 ) {
-  const mass = torso.getMass();
   const weaponScale =
     weaponId === "bazooka"
       ? 1.35
@@ -1379,21 +1080,15 @@ function applyRecoil(
         : weaponId === "winchester_shotgun"
           ? 0.85
           : 1.0;
-  let impulseMag = JUMP_IMPULSE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP) * weaponScale;
+  let impulseMag = RECOIL_IMPULSE * weaponScale;
   if (crouching && onGround) impulseMag *= 0.45;
 
-  const ix = -Math.cos(aimAngle) * mass * impulseMag;
-  const iy = -Math.sin(aimAngle) * mass * impulseMag;
-
-  torso.setAwake(true);
-  torso.applyLinearImpulse(planck.Vec2(ix, iy), torso.getWorldCenter(), true);
+  p.vx += -Math.cos(aimAngle) * impulseMag;
+  p.vy += -Math.sin(aimAngle) * impulseMag;
 }
 
 function getPickupCollectY(pickup: PickupState) {
-  const body = pickupBodies[pickup.id];
-  if (!body) return pickup.y;
-  const bodyY = body.getPosition().y * SCALE;
-  return Math.max(pickup.y, bodyY);
+  return pickup.y;
 }
 
 function isFloorCollectiblePickup(pickup: PickupState, collectY: number, feetY: number) {
@@ -1468,55 +1163,20 @@ function canPlayerCollectPickup(
   return Math.hypot(pickup.x - px, collectY - py) <= PICKUP_RADIUS + 34;
 }
 
-function pickupBodyOverlapsPlayer(bodies: { torso: planck.Body; head: planck.Body }, pickupId: number) {
-  const pickBody = pickupBodies[pickupId];
-  if (!pickBody) return false;
-
-  return (
-    planck.testBodyOverlap(bodies.torso, pickBody) ||
-    planck.testBodyOverlap(bodies.head, pickBody)
-  );
-}
-
 function collectPickupsForPlayers(G: ShooterState) {
-  for (const [playerId, bodies] of Object.entries(playerBodies)) {
-    const p = G.players[playerId];
+  for (const [playerId, p] of Object.entries(G.players)) {
     if (!p || p.health <= 0) continue;
-    const tPos = bodies.torso.getPosition();
-    const hPos = bodies.head.getPosition();
-    const px = tPos.x * SCALE;
-    const py = tPos.y * SCALE;
-    const headX = hPos.x * SCALE;
-    const headY = hPos.y * SCALE;
-    const feetY = py + FEET_PIXELS;
+    const px = p.torso.x;
+    const py = p.torso.y;
+    const headX = p.head.x;
+    const headY = p.head.y;
+    const feetY = getFeetY(p);
 
     for (const pickup of [...G.pickups]) {
-      const overlaps =
-        canPlayerCollectPickup(px, py, headX, headY, feetY, pickup) ||
-        pickupBodyOverlapsPlayer(bodies, pickup.id);
-      if (!overlaps) continue;
+      if (!canPlayerCollectPickup(px, py, headX, headY, feetY, pickup)) continue;
       applyPickupToPlayer(G, playerId, pickup);
     }
   }
-}
-
-function handleContactPickupCollection(G: ShooterState, contact: planck.Contact) {
-  const fixtureA = contact.getFixtureA();
-  const fixtureB = contact.getFixtureB();
-  const dataA = getFixtureData(fixtureA);
-  const dataB = getFixtureData(fixtureB);
-
-  const pickupData =
-    dataA?.type === "pickup" ? dataA : dataB?.type === "pickup" ? dataB : null;
-  if (!pickupData) return;
-
-  const otherData = pickupData === dataA ? dataB : dataA;
-  if (otherData?.type !== "player" && otherData?.type !== "head") return;
-
-  const pickup = G.pickups.find((p) => p.id === pickupData.id);
-  if (!pickup) return;
-
-  applyPickupToPlayer(G, otherData.id, pickup);
 }
 
 function updatePickupDrops(G: ShooterState) {
@@ -1524,10 +1184,6 @@ function updatePickupDrops(G: ShooterState) {
     if (pickupHasPlatformSupport(G, pickup)) {
       pickup.targetY = undefined;
       pickup.onPlatformId = findPlatformIdUnderPickup(G, pickup);
-      const body = pickupBodies[pickup.id];
-      if (body) {
-        body.setTransform(planck.Vec2(pickup.x / SCALE, pickup.y / SCALE), 0);
-      }
       continue;
     }
 
@@ -1545,11 +1201,6 @@ function updatePickupDrops(G: ShooterState) {
       }
       const platId = findPlatformIdUnderPickup(G, pickup);
       if (platId != null) pickup.onPlatformId = platId;
-    }
-
-    const body = pickupBodies[pickup.id];
-    if (body) {
-      body.setTransform(planck.Vec2(pickup.x / SCALE, pickup.y / SCALE), 0);
     }
   }
 }
@@ -1570,7 +1221,6 @@ function spawnPickupOnPlatform(G: ShooterState, plat: PlatformState, random: Ran
     pickup.weaponId = random.pick(WEAPON_ORDER);
   }
   G.pickups.push(pickup);
-  createPickupBody(pickup);
 }
 
 function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
@@ -1600,7 +1250,6 @@ function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
   };
 
   G.platforms.push(plat);
-  createPlatformBody(plat);
 }
 
 function runSpawnCycle(G: ShooterState, random: RandomAPI) {
@@ -1630,7 +1279,6 @@ function processPendingHits(G: ShooterState) {
     if (!target) continue;
 
     if (target.health <= 0) {
-      destroyPlayerPhysics(hit.targetId);
       continue;
     }
 
@@ -1638,7 +1286,7 @@ function processPendingHits(G: ShooterState) {
     G.hitEvents.push(hit);
 
     if (target.health <= 0) {
-      destroyPlayerPhysics(hit.targetId);
+      continue;
     }
   }
   pendingHits.length = 0;
@@ -1659,90 +1307,28 @@ function processPendingHits(G: ShooterState) {
   pendingBulletDestroys.clear();
 }
 
-function handleProjectileImpacts(G: ShooterState) {
-  for (const b of [...G.bullets]) {
-    const body = bulletBodies[b.id];
-    if (!body) continue;
-
-    if (b.kind === "rocket" || b.kind === "grenade") {
-      for (let edge = body.getContactList(); edge; edge = edge.next) {
-        const edgeContact = edge.contact;
-        if (!edgeContact.isTouching()) continue;
-        const fixtureA = edgeContact.getFixtureA();
-        const fixtureB = edgeContact.getFixtureB();
-        const otherFixture = fixtureA.getBody() === body ? fixtureB : fixtureA;
-        const otherData = getFixtureData(otherFixture);
-        if (
-          otherData?.type === "player" ||
-          otherData?.type === "head" ||
-          otherData?.type === "platform" ||
-          otherData?.type === "crate" ||
-          otherData?.type === "ground"
-        ) {
-          const pos = body.getPosition();
-          queueExplosion(
-            pos.x * SCALE,
-            pos.y * SCALE,
-            b.aoeRadius ?? 70,
-            b.damage,
-            b.owner,
-          );
-          pendingBulletDestroys.add(b.id);
-          break;
-        }
-      }
-    }
-
-    if (b.fuseTicks != null) {
-      b.fuseTicks -= 1;
-      if (b.fuseTicks <= 0) {
-        const pos = body.getPosition();
-        queueExplosion(pos.x * SCALE, pos.y * SCALE, b.aoeRadius ?? 70, b.damage, b.owner);
-        pendingBulletDestroys.add(b.id);
-      }
-    }
-  }
+function isHeadshotHit(G: ShooterState, targetId: string, hitX: number, hitY: number): boolean {
+  const target = G.players[targetId];
+  if (!target) return false;
+  return Math.hypot(hitX - target.head.x, hitY - target.head.y) <= HEAD_HIT_RADIUS_PX;
 }
 
-function getContactHitPointPx(contact: planck.Contact): { x: number; y: number } | null {
-  contact.getWorldManifold(sharedWorldManifold);
-  if (sharedWorldManifold.pointCount > 0) {
-    const p = sharedWorldManifold.points[0];
-    return { x: p.x * SCALE, y: p.y * SCALE };
-  }
-  return null;
-}
+function bulletHitsHeadZone(G: ShooterState, targetId: string, bullet: BulletState): boolean {
+  const target = G.players[targetId];
+  if (!target) return false;
 
-function isHeadshotHit(targetId: string, hitX: number, hitY: number): boolean {
-  const bodies = playerBodies[targetId];
-  if (!bodies) return false;
-  const hPos = bodies.head.getPosition();
-  const hx = hPos.x * SCALE;
-  const hy = hPos.y * SCALE;
-  return Math.hypot(hitX - hx, hitY - hy) <= HEAD_HIT_RADIUS_PX;
-}
+  const bx = bullet.body.x;
+  const by = bullet.body.y;
+  if (isHeadshotHit(G, targetId, bx, by)) return true;
 
-function bulletHitsHeadZone(targetId: string, bulletBody: planck.Body): boolean {
-  const bodies = playerBodies[targetId];
-  if (!bodies) return false;
-
-  const pos = bulletBody.getPosition();
-  const vel = bulletBody.getLinearVelocity();
-  const bx = pos.x * SCALE;
-  const by = pos.y * SCALE;
-
-  if (isHeadshotHit(targetId, bx, by)) return true;
-
-  const speed = Math.hypot(vel.x, vel.y);
+  const speed = Math.hypot(bullet.vx, bullet.vy);
   if (speed < 0.01) return false;
 
-  const hPos = bodies.head.getPosition();
-  const hx = hPos.x * SCALE;
-  const hy = hPos.y * SCALE;
-  const nx = vel.x / speed;
-  const ny = vel.y / speed;
+  const hx = target.head.x;
+  const hy = target.head.y;
+  const nx = bullet.vx / speed;
+  const ny = bullet.vy / speed;
 
-  // Longer backtrack so point-blank torso contacts still count head line hits.
   const backPx = 88;
   const fwdPx = 14;
   const x1 = bx - nx * backPx;
@@ -1754,214 +1340,204 @@ function bulletHitsHeadZone(targetId: string, bulletBody: planck.Body): boolean 
     return true;
   }
 
-  const torsoPos = bodies.torso.getPosition();
-  const tx = torsoPos.x * SCALE;
-  const ty = torsoPos.y * SCALE;
+  const tx = target.torso.x;
+  const ty = target.torso.y;
   const toHeadX = hx - tx;
   const toHeadY = hy - ty;
   const toHeadLen = Math.hypot(toHeadX, toHeadY) || 1;
   const aimDot = (nx * toHeadX + ny * toHeadY) / toHeadLen;
-  const closeRange = Math.hypot(bx - hx, by - hy) <= HEAD_HIT_RADIUS_PX + PLAYER_HALF_W * SCALE + 18;
+  const closeRange = Math.hypot(bx - hx, by - hy) <= HEAD_HIT_RADIUS_PX + PLAYER_W / 2 + 18;
 
   return closeRange && aimDot > 0.55;
 }
 
-function headHitPointPx(targetId: string): { x: number; y: number } | null {
-  const bodies = playerBodies[targetId];
-  if (!bodies) return null;
-  const hPos = bodies.head.getPosition();
-  return { x: hPos.x * SCALE, y: hPos.y * SCALE };
+function headHitPointPx(G: ShooterState, targetId: string): { x: number; y: number } | null {
+  const target = G.players[targetId];
+  if (!target) return null;
+  return { x: target.head.x, y: target.head.y };
 }
 
 function resolveBulletPlayerDamage(
+  G: ShooterState,
   targetId: string,
   hitPart: "player" | "head",
-  bulletBody: planck.Body,
+  bullet: BulletState,
   contactPx: { x: number; y: number } | null,
-  bulletDamage: number,
 ): { damage: number; isHeadshot: boolean } {
   const headshot =
     hitPart === "head" ||
-    bulletHitsHeadZone(targetId, bulletBody) ||
-    (contactPx != null && isHeadshotHit(targetId, contactPx.x, contactPx.y));
+    bulletHitsHeadZone(G, targetId, bullet) ||
+    (contactPx != null && isHeadshotHit(G, targetId, contactPx.x, contactPx.y));
 
   if (headshot) {
-    return {
-      damage: HEADSHOT_DAMAGE,
-      isHeadshot: true,
-    };
+    return { damage: HEADSHOT_DAMAGE, isHeadshot: true };
   }
   return { damage: BODY_BULLET_DAMAGE, isHeadshot: false };
 }
 
-function handleContactWithBulletDamage(G: ShooterState, contact: planck.Contact) {
-  const contactId = contact.getId();
-  if (handledBulletContactsThisStep.has(contactId)) return;
-  handledBulletContactsThisStep.add(contactId);
+function bulletHitsSolid(G: ShooterState, b: BulletState): boolean {
+  const circle = { x: b.body.x, y: b.body.y, r: b.r };
+  if (checkBulletWall(circle, FLOOR_AABB)) return true;
+  if (checkBulletWall(circle, LEFT_WALL_AABB)) return true;
+  if (checkBulletWall(circle, RIGHT_WALL_AABB)) return true;
+  if (checkBulletWall(circle, CEILING_AABB)) return true;
 
-  const fixtureA = contact.getFixtureA();
-  const fixtureB = contact.getFixtureB();
-  const dataA = getFixtureData(fixtureA);
-  const dataB = getFixtureData(fixtureB);
-
-  const bulletData =
-    dataA?.type === "bullet" ? dataA : dataB?.type === "bullet" ? dataB : null;
-  if (!bulletData) return;
-  if (pendingBulletDestroys.has(bulletData.id)) return;
-
-  const bullet = G.bullets.find((b) => b.id === bulletData.id);
-  const bulletDamage = bullet?.damage ?? BULLET_DAMAGE;
-  const bulletKind = bullet?.kind ?? "bullet";
-  const aoeRadius = bullet?.aoeRadius;
-  const owner = bullet?.owner ?? bulletData.owner;
-
-  const otherData = bulletData === dataA ? dataB : dataA;
-  const bulletBody = bulletData === dataA ? fixtureA.getBody() : fixtureB.getBody();
-  const bulletPos = bulletBody.getPosition();
-
-  if (otherData?.type === "player" || otherData?.type === "head") {
-    if (otherData.id === owner) return;
-    const target = G.players[otherData.id];
-    if (!target || target.health <= 0) return;
-    if (G.roundPhase !== "playing") return;
-    if (!canDamage(G, owner, otherData.id)) return;
-    if (!playerBodies[otherData.id]) return;
-    if (handledBulletPlayerHitsThisStep.has(String(bulletData.id))) return;
-    handledBulletPlayerHitsThisStep.add(String(bulletData.id));
-    pendingBulletDestroys.add(bulletData.id);
-    const contactPoint = getContactHitPointPx(contact);
-    const bulletPxX = bulletPos.x * SCALE;
-    const bulletPxY = bulletPos.y * SCALE;
-    const { damage, isHeadshot } = resolveBulletPlayerDamage(
-      otherData.id,
-      otherData.type,
-      bulletBody,
-      contactPoint,
-      bulletDamage,
-    );
-    const headPoint = isHeadshot ? headHitPointPx(otherData.id) : null;
-    pendingHits.push({
-      x: headPoint?.x ?? contactPoint?.x ?? bulletPxX,
-      y: headPoint?.y ?? contactPoint?.y ?? bulletPxY,
-      targetId: otherData.id,
-      damage,
-      isHeadshot,
-    });
-    return;
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
+    if (checkBulletWall(circle, platBox)) return true;
   }
 
-  if (otherData?.type === "crate") {
-    pendingBulletDestroys.add(bulletData.id);
-    pendingCrateDamages.push({
-      id: otherData.id,
-      damage: bulletDamage,
-      x: bulletPos.x * SCALE,
-      y: bulletPos.y * SCALE,
-    });
-    return;
+  for (const crate of G.crates) {
+    const crateBox: AABB = { x: crate.x, y: crate.y, w: crate.w, h: crate.h };
+    if (checkBulletWall(circle, crateBox)) return true;
   }
 
-  if (otherData?.type === "platform") {
-    pendingBulletDestroys.add(bulletData.id);
-    pendingPlatformDamages.push({
-      id: otherData.id,
-      damage: bulletDamage,
-      x: bulletPos.x * SCALE,
-      y: bulletPos.y * SCALE,
-    });
-    return;
-  }
+  return false;
+}
 
-  if (otherData?.type === "ground") {
-    if (bulletKind === "rocket" || bulletKind === "grenade") {
-      queueExplosion(bulletPos.x * SCALE, bulletPos.y * SCALE, aoeRadius ?? 70, bulletDamage, owner);
-      pendingBulletDestroys.add(bulletData.id);
-      return;
+function stepArcadeBullets(G: ShooterState) {
+  handledBulletPlayerHitsThisStep.clear();
+
+  for (const b of [...G.bullets]) {
+    if (pendingBulletDestroys.has(b.id)) continue;
+
+    const bulletState = { x: b.body.x, y: b.body.y, r: b.r, vx: b.vx, vy: b.vy };
+    stepBullet(bulletState, PHYSICS_DT, GRAVITY, b.gravityScale);
+    b.body.x = bulletState.x;
+    b.body.y = bulletState.y;
+    b.vx = bulletState.vx;
+    b.vy = bulletState.vy;
+    b.body.angle = Math.atan2(b.vy, b.vx);
+
+    if (b.fuseTicks != null) {
+      b.fuseTicks -= 1;
+      if (b.fuseTicks <= 0) {
+        queueExplosion(b.body.x, b.body.y, b.aoeRadius ?? 70, b.damage, b.owner);
+        pendingBulletDestroys.add(b.id);
+        continue;
+      }
     }
 
-    if (handledBulletWallBounceThisStep.has(bulletData.id)) return;
-    handledBulletWallBounceThisStep.add(bulletData.id);
+    if (b.kind === "rocket" || b.kind === "grenade") {
+      if (bulletHitsSolid(G, b)) {
+        queueExplosion(b.body.x, b.body.y, b.aoeRadius ?? 70, b.damage, b.owner);
+        pendingBulletDestroys.add(b.id);
+        continue;
+      }
+    } else {
+      const circle = { x: b.body.x, y: b.body.y, r: b.r };
 
-    const bounces = bulletBounceCounts[bulletData.id] ?? 0;
-    pendingHits.push({
-      x: bulletPos.x * SCALE,
-      y: bulletPos.y * SCALE,
-      targetId: "",
-      damage: 0,
-    });
+      if (checkBulletWall(circle, FLOOR_AABB)) {
+        pendingHits.push({ x: b.body.x, y: b.body.y, targetId: "", damage: 0 });
+        pendingBulletDestroys.add(b.id);
+        continue;
+      }
+      if (checkBulletWall(circle, LEFT_WALL_AABB) || checkBulletWall(circle, RIGHT_WALL_AABB) || checkBulletWall(circle, CEILING_AABB)) {
+        pendingHits.push({ x: b.body.x, y: b.body.y, targetId: "", damage: 0 });
+        pendingBulletDestroys.add(b.id);
+        continue;
+      }
 
-    if (bounces >= MAX_BULLET_BOUNCES) {
-      pendingBulletDestroys.add(bulletData.id);
-      return;
+      for (const plat of G.platforms) {
+        if (plat.broken) continue;
+        const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
+        if (!checkBulletWall(circle, platBox)) continue;
+        pendingBulletDestroys.add(b.id);
+        pendingPlatformDamages.push({ id: plat.id, damage: b.damage, x: b.body.x, y: b.body.y });
+        break;
+      }
+      if (pendingBulletDestroys.has(b.id)) continue;
+
+      for (const crate of G.crates) {
+        const crateBox: AABB = { x: crate.x, y: crate.y, w: crate.w, h: crate.h };
+        if (!checkBulletWall(circle, crateBox)) continue;
+        pendingBulletDestroys.add(b.id);
+        pendingCrateDamages.push({ id: crate.id, damage: b.damage, x: b.body.x, y: b.body.y });
+        break;
+      }
+      if (pendingBulletDestroys.has(b.id)) continue;
+
+      for (const [targetId, target] of Object.entries(G.players)) {
+        if (targetId === b.owner || target.health <= 0 || !isPlayerAlive(G, targetId)) continue;
+        if (G.roundPhase !== "playing") continue;
+        if (!canDamage(G, b.owner, targetId)) continue;
+        if (handledBulletPlayerHitsThisStep.has(String(b.id))) continue;
+
+        const headHit = checkCircleAABB(circle, {
+          x: target.head.x - HEAD_HIT_RADIUS_PX,
+          y: target.head.y - HEAD_HIT_RADIUS_PX,
+          w: HEAD_HIT_RADIUS_PX * 2,
+          h: HEAD_HIT_RADIUS_PX * 2,
+        });
+        const torsoHit = checkCircleAABB(circle, playerTorsoAABB(target));
+        if (!headHit && !torsoHit) continue;
+
+        handledBulletPlayerHitsThisStep.add(String(b.id));
+        pendingBulletDestroys.add(b.id);
+        const hitPart = headHit ? "head" : "player";
+        const { damage, isHeadshot } = resolveBulletPlayerDamage(
+          G,
+          targetId,
+          hitPart,
+          b,
+          { x: b.body.x, y: b.body.y },
+        );
+        const headPoint = isHeadshot ? headHitPointPx(G, targetId) : null;
+        pendingHits.push({
+          x: headPoint?.x ?? b.body.x,
+          y: headPoint?.y ?? b.body.y,
+          targetId,
+          damage,
+          isHeadshot,
+        });
+        break;
+      }
     }
 
-    bulletBounceCounts[bulletData.id] = bounces + 1;
-
-    const vel = bulletBody.getLinearVelocity();
-    contact.getWorldManifold(sharedWorldManifold);
-
-    let nx = sharedWorldManifold.normal.x;
-    let ny = sharedWorldManifold.normal.y;
-    if (Math.hypot(nx, ny) < 0.01) {
-      nx = 0;
-      ny = bulletPos.y * SCALE >= FLOOR_Y - 2 ? -1 : 1;
+    if (
+      b.body.x < -20 ||
+      b.body.x > ARENA_W + 20 ||
+      b.body.y > ARENA_H + 20 ||
+      b.body.y < -20
+    ) {
+      pendingBulletDestroys.add(b.id);
     }
-    const dot = vel.x * nx + vel.y * ny;
-    if (dot > 0) {
-      nx = -nx;
-      ny = -ny;
-    }
-    const reflectDot = vel.x * nx + vel.y * ny;
-    const speed = Math.hypot(vel.x, vel.y);
-    const bounce = speed > 28 ? 0.72 : speed > 12 ? 0.58 : 0.42;
-    const rvx = (vel.x - 2 * reflectDot * nx) * bounce;
-    const rvy = (vel.y - 2 * reflectDot * ny) * bounce;
-    bulletBody.setBallisticVelocity(planck.Vec2(rvx, rvy));
-    const pos = bulletBody.getPosition();
-    bulletBody.setTransform(
-      planck.Vec2(pos.x - nx * 0.06, pos.y - ny * 0.06),
-      bulletBody.getAngle(),
-    );
   }
 }
 
 function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI) {
   const p = G.players[playerId];
-  const bodies = playerBodies[playerId];
-  if (!p || !bodies || p.health <= 0 || !p.input) return;
+  if (!p || p.health <= 0 || !p.input) return;
+  ensurePlayerPhysics(p);
 
   const data = p.input;
-  const torso = bodies.torso;
-  torso.setAwake(true);
-  const vel = torso.getLinearVelocity();
   const crouching = data.crouching === true || data.action === "crouch";
-  const grounded = isPlayerGrounded(playerId, torso);
+  const grounded = isPlayerGrounded(p);
   p.crouching = crouching && grounded;
   const speedMul = p.crouching ? 0.45 : 1;
 
   if (data.action === "left") {
-    torso.setLinearVelocity(planck.Vec2(-MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
+    p.vx = -MOVE_SPEED * speedMul;
   } else if (data.action === "right") {
-    torso.setLinearVelocity(planck.Vec2(MOVE_SPEED * speedMul, torso.getLinearVelocity().y));
+    p.vx = MOVE_SPEED * speedMul;
   } else if (data.action === "crouch" || (crouching && !data.action)) {
-    torso.setLinearVelocity(planck.Vec2(torso.getLinearVelocity().x * 0.35, torso.getLinearVelocity().y));
+    p.vx *= 0.35;
   } else {
-    torso.setLinearVelocity(planck.Vec2(0, torso.getLinearVelocity().y));
+    p.vx = 0;
   }
 
   if (data.jumping) {
-    const wall = playerWallContact[playerId];
-    const standingJump = canPerformStandingJump(playerId, torso, p.crouching);
+    const wall = scanPlayerWallContact(G, playerId);
+    const standingJump = canPerformStandingJump(G, playerId, p.crouching);
 
     if (standingJump) {
-      applyVerticalJump(torso, playerId, { keepVx: torso.getLinearVelocity().x });
-      playerGrounded[playerId] = false;
-      playerWallJumpUsed[playerId] = false;
-    } else if (wall && !playerWallJumpUsed[playerId]) {
+      applyVerticalJump(p, { keepVx: p.vx });
+      p.wallJumpUsed = false;
+    } else if (wall && !p.wallJumpUsed) {
       const awayX = wall.nx >= 0 ? 1 : -1;
-      applyVerticalJump(torso, playerId, { horizImpulse: WALL_JUMP_IMPULSE_X * awayX });
-      playerGrounded[playerId] = false;
-      playerWallJumpUsed[playerId] = true;
+      applyVerticalJump(p, { horizImpulse: WALL_JUMP_IMPULSE_X * awayX });
+      p.wallJumpUsed = true;
     }
     data.jumping = false;
   }
@@ -1976,20 +1552,7 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     data.action !== "crouch" &&
     !(crouching && !data.action)
   ) {
-    const vy = torso.getLinearVelocity().y;
-    if (Math.abs(torso.getLinearVelocity().x) > 0.05) {
-      torso.setLinearVelocity(planck.Vec2(0, vy));
-    }
-  }
-}
-
-function syncHeadBodiesFromTorso() {
-  for (const [, bodies] of Object.entries(playerBodies)) {
-    const tPos = bodies.torso.getPosition();
-    bodies.head.setTransform(
-      planck.Vec2(tPos.x, tPos.y - HEAD_OFFSET / SCALE),
-      0,
-    );
+    if (Math.abs(p.vx) > 0.05) p.vx = 0;
   }
 }
 
@@ -1999,77 +1562,24 @@ function advanceWorld(G: ShooterState, random: RandomAPI) {
   G.worldTick += 1;
 
   if (G.roundPhase === "playing") {
-    handledBulletContactsThisStep.clear();
-    handledBulletPlayerHitsThisStep.clear();
-    handledBulletWallBounceThisStep.clear();
     runSpawnCycle(G, random);
     advancePlatformMotion(G);
     updatePickupDrops(G);
-    syncHeadBodiesFromTorso();
-    world.step(PHYSICS_DT);
-    syncHeadBodiesFromTorso();
-    updatePlayerGroundedState();
-    updatePlayerWallContacts();
-    resolvePlayerSideStick();
-    snapPlayersToGround();
-    handleProjectileImpacts(G);
+    stepArcadePlayers(G);
+    updatePlayerWallContacts(G);
+    resolvePlayerSideStick(G);
+    stepArcadeBullets(G);
     processExplosions(G);
     processPendingHits(G);
     fixOrphanedPickups(G);
     updatePickupDrops(G);
     collectPickupsForPlayers(G);
-
-    for (let i = G.bullets.length - 1; i >= 0; i--) {
-      const b = G.bullets[i];
-      const body = bulletBodies[b.id];
-      if (body) {
-        const pos = body.getPosition();
-        if (
-          pos.x * SCALE < -20 ||
-          pos.x * SCALE > ARENA_W + 20 ||
-          pos.y * SCALE > ARENA_H + 20 ||
-          pos.y * SCALE < -20
-        ) {
-          destroyBullet(G, b.id);
-        }
-      }
-    }
-
-    syncStateFromPhysics(G);
     checkRoundEnd(G);
   }
 }
 
 function resetRound(G: ShooterState) {
-  for (const [, b] of Object.entries(playerBodies)) {
-    world.destroyBody(b.torso);
-    world.destroyBody(b.head);
-  }
-  for (const b of Object.values(bulletBodies)) {
-    world.destroyBody(b);
-  }
-  for (const b of Object.values(crateBodies)) {
-    world.destroyBody(b);
-  }
-  for (const b of Object.values(pickupBodies)) {
-    world.destroyBody(b);
-  }
-  for (const b of Object.values(platformBodies)) {
-    world.destroyBody(b);
-  }
-  playerBodies = {};
-  platformBodies = {};
-  crateBodies = {};
-  pickupBodies = {};
-  bulletBodies = {};
-  bulletBounceCounts = {};
-  handledBulletContactsThisStep.clear();
   handledBulletPlayerHitsThisStep.clear();
-  handledBulletWallBounceThisStep.clear();
-  playerGrounded = {};
-  playerWallJumpUsed = {};
-  playerWallContact = {};
-  playerJumpGrace = {};
   G.bullets = [];
   G.crates = [];
   G.pickups = [];
@@ -2094,6 +1604,8 @@ function resetRound(G: ShooterState) {
     p.currentWeapon = START_WEAPON;
     p.ownedWeapons = defaultOwnedWeapons();
     p.lastFireTick = 0;
+    p.torso = { x: spawn.x, y: spawn.y, angle: 0 };
+    p.head = { x: spawn.x, y: spawn.y - HEAD_OFFSET, angle: 0 };
     p.input = {
       action: null,
       jumping: false,
@@ -2102,10 +1614,9 @@ function resetRound(G: ShooterState) {
       crouching: false,
       shooting: false,
     };
-    createPlayerPhysics(id, spawn.x, spawn.y);
+    createPlayerPhysics(p);
     index++;
   }
-  syncStateFromPhysics(G);
 }
 
 function countActiveProjectiles(G: ShooterState, owner: string, weaponId: WeaponId) {
@@ -2120,8 +1631,8 @@ function fireWeapon(
   random: RandomAPI,
 ) {
   const p = G.players[playerId];
-  const bodies = playerBodies[playerId];
-  if (!p || !bodies || p.health <= 0) return false;
+  if (!p || p.health <= 0) return false;
+  ensurePlayerPhysics(p);
 
   const weaponId = p.currentWeapon;
   const weapon = WEAPONS[weaponId];
@@ -2129,10 +1640,10 @@ function fireWeapon(
 
   if (p.lastFireTick >= 0 && G.worldTick - p.lastFireTick < weapon.fireRateTicks) return false;
 
+  const onGround = isPlayerGrounded(p);
+
   if (weapon.kind === "melee") {
-    const torso = bodies.torso;
-    const onGround = isPlayerGrounded(playerId, torso);
-    applyRecoil(torso, aimAngle, onGround, p.crouching, weaponId);
+    applyRecoil(p, aimAngle, onGround, p.crouching, weaponId);
     resolveMeleeSwingHits(G, playerId, aimAngle, facing, weapon);
     p.lastFireTick = G.worldTick;
     return true;
@@ -2147,21 +1658,18 @@ function fireWeapon(
   const weaponActive = countActiveProjectiles(G, playerId, weaponId);
   if (weaponActive >= weapon.maxActive) return false;
 
-  const torso = bodies.torso;
-  const tPos = torso.getPosition();
-  const onGround = isPlayerGrounded(playerId, torso);
-  applyRecoil(torso, aimAngle, onGround, p.crouching, weaponId);
+  applyRecoil(p, aimAngle, onGround, p.crouching, weaponId);
 
-  const muzzle = computeMuzzleMeters(
-    tPos.x * SCALE,
-    tPos.y * SCALE,
+  const muzzle = computeMuzzlePx(
+    p.torso.x,
+    p.torso.y,
     aimAngle,
     facing,
     p.crouching,
     weaponId,
   );
 
-  const spawnPad = 0.38;
+  const spawnPad = 0.38 * SCALE;
   for (let i = 0; i < pellets; i++) {
     if (G.bullets.filter((b) => b.owner === playerId).length >= weapon.maxActive) break;
     const spread = (random.float() - 0.5) * weapon.spread * 2;
@@ -2195,8 +1703,6 @@ export default defineGame<ShooterState>({
   // @ts-ignore
   tick: (G: ShooterState, dt: number | undefined, ctx: TickContext) => {
     try {
-      if (!world) return;
-
       setCurrentG(G);
 
       const steps = PHYSICS_STEPS_PER_TICK;
@@ -2221,71 +1727,18 @@ export default defineGame<ShooterState>({
   },
 
   setup: (ctx) => {
-    const preflightErr = getPhysicsInitError();
-    if (preflightErr) {
-      throw new Error(`WASM INIT (preflight): ${preflightErr}`);
-    }
-
     try {
     const gameMode = parseGameConfig(ctx.config);
     if (gameMode === "teams2v2" && ctx.numPlayers !== 4) {
       throw new Error("teams2v2 requires exactly 4 players");
     }
 
-    world = new planck.World({ gravity: planck.Vec2(0, GRAVITY) });
-    playerBodies = {};
-    platformBodies = {};
-    crateBodies = {};
-    pickupBodies = {};
-    bulletBodies = {};
-    bulletBounceCounts = {};
-    handledBulletContactsThisStep.clear();
     handledBulletPlayerHitsThisStep.clear();
-    handledBulletWallBounceThisStep.clear();
-    playerGrounded = {};
-    playerWallJumpUsed = {};
-    playerWallContact = {};
-    playerJumpGrace = {};
     pendingHits.length = 0;
     pendingPlatformDamages.length = 0;
     pendingCrateDamages.length = 0;
     pendingExplosions.length = 0;
     pendingBulletDestroys.clear();
-
-    world.on("begin-contact", (contact) => {
-      if (!currentG) return;
-      handleContactPickupCollection(currentG, contact);
-      handleContactWithBulletDamage(currentG, contact);
-    });
-
-    const addGroundEdge = (
-      v1: planck.Vec2,
-      v2: planck.Vec2,
-      opts: { friction?: number; restitution?: number; userData?: FixtureUserData },
-    ) => {
-      const edge = world.createBody();
-      edge.createFixture(planck.Edge(v1, v2), opts);
-    };
-
-    addGroundEdge(
-      planck.Vec2(0, FLOOR_Y / SCALE),
-      planck.Vec2(ARENA_W / SCALE, FLOOR_Y / SCALE),
-      { friction: 1.0, userData: { type: "ground" } satisfies FixtureUserData },
-    );
-    addGroundEdge(planck.Vec2(0, 0), planck.Vec2(0, ARENA_H / SCALE), {
-      friction: 0.0,
-      userData: { type: "ground" } satisfies FixtureUserData,
-    });
-    addGroundEdge(
-      planck.Vec2(ARENA_W / SCALE, 0),
-      planck.Vec2(ARENA_W / SCALE, ARENA_H / SCALE),
-      { friction: 0.0, userData: { type: "ground" } satisfies FixtureUserData },
-    );
-    addGroundEdge(planck.Vec2(0, 0), planck.Vec2(ARENA_W / SCALE, 0), {
-      friction: 0.2,
-      restitution: 0.12,
-      userData: { type: "ground" } satisfies FixtureUserData,
-    });
 
     const players: Record<string, PlayerState> = {};
     const teams = gameMode === "teams2v2" ? assignTeams(ctx.players) : {};
@@ -2305,9 +1758,13 @@ export default defineGame<ShooterState>({
         lastFireTick: -1,
         torso: { x: spawn.x, y: spawn.y, angle: 0 },
         head: { x: spawn.x, y: spawn.y - HEAD_OFFSET, angle: 0 },
+        vx: 0,
+        vy: 0,
+        grounded: false,
+        wallJumpUsed: false,
+        jumpGrace: 0,
         team,
       };
-      createPlayerPhysics(id, spawn.x, spawn.y);
     });
 
     const G: ShooterState = {
@@ -2335,7 +1792,6 @@ export default defineGame<ShooterState>({
       matchPhase: "active",
     };
     initPlatforms(G);
-    syncStateFromPhysics(G);
     setCurrentG(G);
     return G;
     } catch (err: unknown) {
@@ -2415,26 +1871,24 @@ export default defineGame<ShooterState>({
 
 export const testUtils = {
   breakPlatform: (G: ShooterState, id: number) => breakPlatform(G, id),
-  createPickupBody: (pickup: PickupState) => createPickupBody(pickup),
   killPlayer: (G: ShooterState, id: string) => {
     const p = G.players[id];
     if (!p) return;
     p.health = 0;
-    destroyPlayerPhysics(id);
   },
   startNextRound: (G: ShooterState) => startNextRound(G),
-  platformBodyCount: () => Object.keys(platformBodies).length,
+  platformBodyCount: () => 0,
   canDamage: (G: ShooterState, attackerId: string, targetId: string) =>
     canDamage(G, attackerId, targetId),
   resolveBulletPlayerDamage: (
+    G: ShooterState,
     targetId: string,
     hitPart: "player" | "head",
-    bulletBody: planck.Body,
+    bullet: BulletState,
     contactPx: { x: number; y: number } | null,
-    bulletDamage: number,
-  ) => resolveBulletPlayerDamage(targetId, hitPart, bulletBody, contactPx, bulletDamage).damage,
-  isHeadshotHit: (targetId: string, hitX: number, hitY: number) =>
-    isHeadshotHit(targetId, hitX, hitY),
-  bulletHitsHeadZone: (targetId: string, bulletBody: planck.Body) =>
-    bulletHitsHeadZone(targetId, bulletBody),
+  ) => resolveBulletPlayerDamage(G, targetId, hitPart, bullet, contactPx).damage,
+  isHeadshotHit: (G: ShooterState, targetId: string, hitX: number, hitY: number) =>
+    isHeadshotHit(G, targetId, hitX, hitY),
+  bulletHitsHeadZone: (G: ShooterState, targetId: string, bullet: BulletState) =>
+    bulletHitsHeadZone(G, targetId, bullet),
 };

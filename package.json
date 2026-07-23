@@ -1,6 +1,6 @@
 {
   "name": "my-shooter-game",
-  "version": "0.1.33",
+  "version": "0.1.35",
   "type": "module",
   "private": true,
   "bordiko": {
@@ -23,12 +23,10 @@
     "test": "node --test \"test/*.test.ts\""
   },
   "dependencies": {
-    "@bordiko/sdk": "^0.2.0",
-    "matter-js": "^0.20.0"
+    "@bordiko/sdk": "^0.2.0"
   },
   "devDependencies": {
     "@bordiko/cli": "^0.1.0",
-    "@types/matter-js": "^0.20.2",
     "@types/node": "^26.1.1",
     "esbuild": "^0.28.1"
   }

@@ -431,7 +431,6 @@ test("player collects weapon after platform break fall with physics body", () =>
     onPlatformId: 1,
   };
   m.G.pickups.push(pickup);
-  testUtils.createPickupBody(pickup);
 
   testUtils.breakPlatform(m.G, 1);
   let fallen = m.G.pickups.find((p) => p.id === 201);
@@ -471,7 +470,6 @@ test("p2 can move and collect while not currentPlayer in simultaneous mode", () 
     x: pickX,
     y: 480,
   });
-  testUtils.createPickupBody(m.G.pickups[0]!);
 
   for (let i = 0; i < 12; i++) {
     m = applyMove(game, m, {
@@ -525,9 +523,9 @@ test("headshot in head zone deals 50% max health", () => {
   const m = bootMatch( { players: ["p1", "p2"], seed: "headshot" });
   const p2 = m.G.players["p2"];
 
-  assert.equal(testUtils.isHeadshotHit("p2", p2.head.x, p2.head.y), true);
+  assert.equal(testUtils.isHeadshotHit(m.G, "p2", p2.head.x, p2.head.y), true);
 
-  const bodyDamage = testUtils.isHeadshotHit("p2", p2.torso.x, p2.torso.y + 24);
+  const bodyDamage = testUtils.isHeadshotHit(m.G, "p2", p2.torso.x, p2.torso.y + 24);
   assert.equal(bodyDamage, false);
 });
 
@@ -536,7 +534,7 @@ test("side torso contact at chest height is not a headshot", () => {
   const p2 = m.G.players["p2"];
   const sideContactX = p2.torso.x - 20;
 
-  assert.equal(testUtils.isHeadshotHit("p2", sideContactX, p2.torso.y + 8), false);
+  assert.equal(testUtils.isHeadshotHit(m.G, "p2", sideContactX, p2.torso.y + 8), false);
 });
 
 test("shooting aimed at head deals 500 damage", () => {
@@ -682,18 +680,14 @@ test("teams2v2 requires exactly 4 players", () => {
   );
 });
 
-test("resetRound removes old platform physics bodies", () => {
+test("resetRound restores platform state for new map", () => {
   let m = bootMatch( { players: ["p1", "p2"], seed: "plat-ghost" });
   testUtils.breakPlatform(m.G, m.G.platforms[0].id);
 
   m = advanceTicks(m, 500);
 
-  const beforeReset = testUtils.platformBodyCount();
-  assert.ok(beforeReset > 0);
-
   testUtils.startNextRound(m.G);
 
-  assert.equal(testUtils.platformBodyCount(), m.G.platforms.length);
   assert.ok(m.G.platforms.every((p) => !p.broken));
   assert.ok(m.G.platforms.length >= 3);
 });
