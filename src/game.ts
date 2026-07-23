@@ -8,12 +8,17 @@ import {
 } from "@bordiko/sdk";
 
 import {
+  bounceBullet,
   checkBulletWall,
   checkCircleAABB,
+  checkCircleCircle,
+  getCircleAABBCollision,
   resolvePlayerPlatform,
+  resolvePlayerPlayer,
   stepBullet,
   stepPlayer,
   type AABB,
+  type ArcadeBullet,
   type ArcadePlatform,
   type ArcadePlayer,
 } from "./arcade-physics.ts";
@@ -206,6 +211,7 @@ export interface BulletState {
   vy: number;
   r: number;
   gravityScale: number;
+  bounces: number;
 }
 
 export interface HitEvent {
@@ -307,11 +313,14 @@ const RECOIL_HEIGHT_OF_JUMP = 0.9;
 const GRAVITY = 97.5 * SCALE;
 const WALL_JUMP_IMPULSE_X = 11 * SCALE;
 const BULLET_SPEED = 40 * SCALE;
+const BULLET_SPEED_MUL = 0.85;
 const BULLET_GRAVITY_SCALE = 0.62;
+const ARENA_WALL_THICK = 12;
 const PLAYER_W = PLAYER_HALF_W * SCALE * 2;
 const PLAYER_H = PLAYER_HALF_H * SCALE * 2;
 const FEET_PIXELS = PLAYER_H / 2;
 const GROUNDED_VEL_Y = 12 * SCALE;
+const MAX_BULLET_BOUNCES = 3;
 const RECOIL_IMPULSE = 34 * SCALE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP);
 const PLATFORM_HITS_TO_BREAK = 4;
 const PLATFORM_MAX_HEALTH = WEAPONS.winchester.damage * PLATFORM_HITS_TO_BREAK;
@@ -330,6 +339,7 @@ const KATANA_SWING_HIT_SAMPLES = [0.28, 0.36, 0.44, 0.52, 0.6, 0.68];
 const STICK_BODY_LEN_PX = 44;
 const STICK_ARM_LEN_PX = 28;
 const STICK_CROUCH_DROP_PX = 46;
+const PLAYER_CROUCH_H = PLAYER_H - STICK_CROUCH_DROP_PX;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
 
@@ -347,10 +357,30 @@ const pendingExplosions: { x: number; y: number; radius: number; damage: number;
   [];
 let currentG: ShooterState | null = null;
 
-const FLOOR_AABB: AABB = { x: 0, y: FLOOR_Y, w: ARENA_W, h: 1 };
-const LEFT_WALL_AABB: AABB = { x: -1, y: 0, w: 1, h: ARENA_H };
-const RIGHT_WALL_AABB: AABB = { x: ARENA_W, y: 0, w: 1, h: ARENA_H };
-const CEILING_AABB: AABB = { x: 0, y: -1, w: ARENA_W, h: 1 };
+const FLOOR_AABB: AABB = {
+  x: 0,
+  y: FLOOR_Y - ARENA_WALL_THICK,
+  w: ARENA_W,
+  h: ARENA_WALL_THICK,
+};
+const LEFT_WALL_AABB: AABB = {
+  x: -ARENA_WALL_THICK,
+  y: -ARENA_WALL_THICK,
+  w: ARENA_WALL_THICK,
+  h: ARENA_H + ARENA_WALL_THICK * 2,
+};
+const RIGHT_WALL_AABB: AABB = {
+  x: ARENA_W,
+  y: -ARENA_WALL_THICK,
+  w: ARENA_WALL_THICK,
+  h: ARENA_H + ARENA_WALL_THICK * 2,
+};
+const CEILING_AABB: AABB = {
+  x: -ARENA_WALL_THICK,
+  y: -ARENA_WALL_THICK,
+  w: ARENA_W + ARENA_WALL_THICK * 2,
+  h: ARENA_WALL_THICK,
+};
 
 function setCurrentG(G: ShooterState) {
   currentG = G;
@@ -487,17 +517,33 @@ function ensurePlayerPhysics(p: PlayerState) {
   if (typeof p.jumpGrace !== "number") p.jumpGrace = 0;
 }
 
+function playerBodyHeight(p: PlayerState): number {
+  return p.crouching ? PLAYER_CROUCH_H : PLAYER_H;
+}
+
 function getFeetY(p: PlayerState): number {
-  return p.torso.y + PLAYER_H / 2;
+  return p.torso.y + playerBodyHeight(p) / 2;
 }
 
 function playerTorsoAABB(p: PlayerState): AABB {
+  const h = playerBodyHeight(p);
   return {
     x: p.torso.x - PLAYER_W / 2,
-    y: p.torso.y - PLAYER_H / 2,
+    y: p.torso.y - h / 2,
     w: PLAYER_W,
-    h: PLAYER_H,
+    h,
   };
+}
+
+function applyCrouchPose(p: PlayerState, crouching: boolean) {
+  const prevH = playerBodyHeight(p);
+  p.crouching = crouching;
+  const nextH = playerBodyHeight(p);
+  if (prevH === nextH) return;
+
+  const feetY = p.torso.y + prevH / 2;
+  p.torso.y = feetY - nextH / 2;
+  syncHeadFromTorso(p);
 }
 
 function initPlatforms(G: ShooterState) {
@@ -855,27 +901,55 @@ function resolvePlayerSideStick(G: ShooterState) {
 }
 
 function stepArcadePlayers(G: ShooterState) {
+  const arcadePlayers: { id: string; player: ArcadePlayer; wasGrounded: boolean }[] = [];
+
   for (const [id, p] of Object.entries(G.players)) {
     if (!isPlayerAlive(G, id)) continue;
     ensurePlayerPhysics(p);
 
+    const wasGrounded = p.grounded;
+    const moveInput = p.input?.action === "left" || p.input?.action === "right";
     const player: ArcadePlayer = {
       x: p.torso.x,
       y: p.torso.y,
       w: PLAYER_W,
-      h: PLAYER_H,
+      h: playerBodyHeight(p),
       vx: p.vx,
       vy: p.vy,
       grounded: false,
+      moveInput,
     };
 
-    stepPlayer(player, PHYSICS_DT, GRAVITY);
-    resolvePlayerPlatform(player, FLOOR_AABB);
+    if (!moveInput) {
+      player.vx = 0;
+    } else if (wasGrounded) {
+      player.vx *= 0.72;
+      if (Math.abs(player.vx) < 3) player.vx = 0;
+    }
+
+    stepPlayer(player, PHYSICS_DT, GRAVITY, !wasGrounded);
+    resolvePlayerPlatform(player, FLOOR_AABB, wasGrounded);
     for (const plat of G.platforms) {
-      if (!plat.broken) resolvePlayerPlatform(player, toPlatformArcade(plat));
+      if (!plat.broken) resolvePlayerPlatform(player, toPlatformArcade(plat), wasGrounded);
     }
     resolvePlayerWalls(player);
 
+    arcadePlayers.push({ id, player, wasGrounded });
+  }
+
+  for (let i = 0; i < arcadePlayers.length; i += 1) {
+    for (let j = i + 1; j < arcadePlayers.length; j += 1) {
+      resolvePlayerPlayer(arcadePlayers[i].player, arcadePlayers[j].player, ARENA_W);
+    }
+  }
+
+  for (const { player } of arcadePlayers) {
+    resolvePlayerWalls(player);
+  }
+
+  for (const { id, player } of arcadePlayers) {
+    const p = G.players[id];
+    if (!p) continue;
     p.torso.x = player.x;
     p.torso.y = player.y;
     p.vx = player.vx;
@@ -1045,14 +1119,16 @@ function spawnProjectile(
           ? "pellet"
           : "bullet";
 
-  const speed = (weapon.speed || BULLET_SPEED / SCALE) * SCALE;
+  const speed = (weapon.speed || BULLET_SPEED / SCALE) * SCALE * BULLET_SPEED_MUL;
   const gravityScale = weapon.gravityScale ?? BULLET_GRAVITY_SCALE;
   const r = bulletRadiusForKind(kind);
+  const clampedX = Math.max(r, Math.min(ARENA_W - r, startX));
+  const clampedY = Math.max(r, Math.min(ARENA_H - r, startY));
 
   G.bullets.push({
     id: bulletId,
     owner,
-    body: { x: startX, y: startY, angle: shotAngle },
+    body: { x: clampedX, y: clampedY, angle: shotAngle },
     kind,
     weaponId,
     damage: weapon.damage,
@@ -1062,6 +1138,7 @@ function spawnProjectile(
     vy: Math.sin(shotAngle) * speed,
     r,
     gravityScale,
+    bounces: 0,
   });
 }
 
@@ -1375,22 +1452,97 @@ function resolveBulletPlayerDamage(
   return { damage: BODY_BULLET_DAMAGE, isHeadshot: false };
 }
 
-function bulletHitsSolid(G: ShooterState, b: BulletState): boolean {
+function bulletHitsSolid(G: ShooterState, b: BulletState, prevX?: number, prevY?: number): boolean {
   const circle = { x: b.body.x, y: b.body.y, r: b.r };
-  if (checkBulletWall(circle, FLOOR_AABB)) return true;
-  if (checkBulletWall(circle, LEFT_WALL_AABB)) return true;
-  if (checkBulletWall(circle, RIGHT_WALL_AABB)) return true;
-  if (checkBulletWall(circle, CEILING_AABB)) return true;
+  if (checkBulletWall(circle, FLOOR_AABB, prevX, prevY)) return true;
+  if (checkBulletWall(circle, LEFT_WALL_AABB, prevX, prevY)) return true;
+  if (checkBulletWall(circle, RIGHT_WALL_AABB, prevX, prevY)) return true;
+  if (checkBulletWall(circle, CEILING_AABB, prevX, prevY)) return true;
 
   for (const plat of G.platforms) {
     if (plat.broken) continue;
     const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
-    if (checkBulletWall(circle, platBox)) return true;
+    if (checkBulletWall(circle, platBox, prevX, prevY)) return true;
   }
 
   for (const crate of G.crates) {
     const crateBox: AABB = { x: crate.x, y: crate.y, w: crate.w, h: crate.h };
-    if (checkBulletWall(circle, crateBox)) return true;
+    if (checkBulletWall(circle, crateBox, prevX, prevY)) return true;
+  }
+
+  return false;
+}
+
+function resolveBulletSolidBounce(
+  G: ShooterState,
+  b: BulletState,
+  bulletState: ArcadeBullet,
+  prevX: number,
+  prevY: number,
+): boolean {
+  const bounces = b.bounces ?? 0;
+  type SolidHit =
+    | { kind: "arena"; box: AABB }
+    | { kind: "platform"; box: AABB; id: number }
+    | { kind: "crate"; box: AABB; id: number };
+
+  const solids: SolidHit[] = [
+    { kind: "arena", box: FLOOR_AABB },
+    { kind: "arena", box: LEFT_WALL_AABB },
+    { kind: "arena", box: RIGHT_WALL_AABB },
+    { kind: "arena", box: CEILING_AABB },
+  ];
+
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    solids.push({
+      kind: "platform",
+      id: plat.id,
+      box: { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h },
+    });
+  }
+
+  for (const crate of G.crates) {
+    solids.push({
+      kind: "crate",
+      id: crate.id,
+      box: { x: crate.x, y: crate.y, w: crate.w, h: crate.h },
+    });
+  }
+
+  for (const solid of solids) {
+    if (!checkBulletWall(bulletState, solid.box, prevX, prevY)) continue;
+
+    const hit = getCircleAABBCollision(bulletState, solid.box);
+    if (!hit.hit) continue;
+    if (bounces >= MAX_BULLET_BOUNCES) return true;
+
+    bounceBullet(bulletState, hit.nx, hit.ny);
+    b.body.x = bulletState.x;
+    b.body.y = bulletState.y;
+    b.vx = bulletState.vx;
+    b.vy = bulletState.vy;
+    b.bounces = bounces + 1;
+    b.body.angle = Math.atan2(b.vy, b.vx);
+    pendingHits.push({ x: b.body.x, y: b.body.y, targetId: "", damage: 0 });
+
+    if (solid.kind === "platform") {
+      pendingPlatformDamages.push({
+        id: solid.id,
+        damage: b.damage,
+        x: b.body.x,
+        y: b.body.y,
+      });
+    } else if (solid.kind === "crate") {
+      pendingCrateDamages.push({
+        id: solid.id,
+        damage: b.damage,
+        x: b.body.x,
+        y: b.body.y,
+      });
+    }
+
+    return false;
   }
 
   return false;
@@ -1402,6 +1554,8 @@ function stepArcadeBullets(G: ShooterState) {
   for (const b of [...G.bullets]) {
     if (pendingBulletDestroys.has(b.id)) continue;
 
+    const prevX = b.body.x;
+    const prevY = b.body.y;
     const bulletState = { x: b.body.x, y: b.body.y, r: b.r, vx: b.vx, vy: b.vy };
     stepBullet(bulletState, PHYSICS_DT, GRAVITY, b.gravityScale);
     b.body.x = bulletState.x;
@@ -1420,57 +1574,31 @@ function stepArcadeBullets(G: ShooterState) {
     }
 
     if (b.kind === "rocket" || b.kind === "grenade") {
-      if (bulletHitsSolid(G, b)) {
+      if (bulletHitsSolid(G, b, prevX, prevY)) {
         queueExplosion(b.body.x, b.body.y, b.aoeRadius ?? 70, b.damage, b.owner);
         pendingBulletDestroys.add(b.id);
         continue;
       }
     } else {
-      const circle = { x: b.body.x, y: b.body.y, r: b.r };
-
-      if (checkBulletWall(circle, FLOOR_AABB)) {
-        pendingHits.push({ x: b.body.x, y: b.body.y, targetId: "", damage: 0 });
-        pendingBulletDestroys.add(b.id);
-        continue;
-      }
-      if (checkBulletWall(circle, LEFT_WALL_AABB) || checkBulletWall(circle, RIGHT_WALL_AABB) || checkBulletWall(circle, CEILING_AABB)) {
-        pendingHits.push({ x: b.body.x, y: b.body.y, targetId: "", damage: 0 });
-        pendingBulletDestroys.add(b.id);
-        continue;
-      }
-
-      for (const plat of G.platforms) {
-        if (plat.broken) continue;
-        const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
-        if (!checkBulletWall(circle, platBox)) continue;
-        pendingBulletDestroys.add(b.id);
-        pendingPlatformDamages.push({ id: plat.id, damage: b.damage, x: b.body.x, y: b.body.y });
-        break;
-      }
-      if (pendingBulletDestroys.has(b.id)) continue;
-
-      for (const crate of G.crates) {
-        const crateBox: AABB = { x: crate.x, y: crate.y, w: crate.w, h: crate.h };
-        if (!checkBulletWall(circle, crateBox)) continue;
-        pendingBulletDestroys.add(b.id);
-        pendingCrateDamages.push({ id: crate.id, damage: b.damage, x: b.body.x, y: b.body.y });
-        break;
-      }
-      if (pendingBulletDestroys.has(b.id)) continue;
-
+      let hitPlayer = false;
       for (const [targetId, target] of Object.entries(G.players)) {
         if (targetId === b.owner || target.health <= 0 || !isPlayerAlive(G, targetId)) continue;
         if (G.roundPhase !== "playing") continue;
         if (!canDamage(G, b.owner, targetId)) continue;
         if (handledBulletPlayerHitsThisStep.has(String(b.id))) continue;
 
-        const headHit = checkCircleAABB(circle, {
+        const headBox = {
           x: target.head.x - HEAD_HIT_RADIUS_PX,
           y: target.head.y - HEAD_HIT_RADIUS_PX,
           w: HEAD_HIT_RADIUS_PX * 2,
           h: HEAD_HIT_RADIUS_PX * 2,
-        });
-        const torsoHit = checkCircleAABB(circle, playerTorsoAABB(target));
+        };
+        const torsoBox = playerTorsoAABB(target);
+        const circle = { x: b.body.x, y: b.body.y, r: b.r };
+        const headHit =
+          checkBulletWall(circle, headBox, prevX, prevY) || checkCircleAABB(circle, headBox);
+        const torsoHit =
+          checkBulletWall(circle, torsoBox, prevX, prevY) || checkCircleAABB(circle, torsoBox);
         if (!headHit && !torsoHit) continue;
 
         handledBulletPlayerHitsThisStep.add(String(b.id));
@@ -1491,7 +1619,15 @@ function stepArcadeBullets(G: ShooterState) {
           damage,
           isHeadshot,
         });
+        hitPlayer = true;
         break;
+      }
+      if (hitPlayer || pendingBulletDestroys.has(b.id)) continue;
+
+      const destroyOnImpact = resolveBulletSolidBounce(G, b, bulletState, prevX, prevY);
+      if (destroyOnImpact) {
+        pendingBulletDestroys.add(b.id);
+        continue;
       }
     }
 
@@ -1504,6 +1640,28 @@ function stepArcadeBullets(G: ShooterState) {
       pendingBulletDestroys.add(b.id);
     }
   }
+
+  for (let i = 0; i < G.bullets.length; i += 1) {
+    for (let j = i + 1; j < G.bullets.length; j += 1) {
+      const a = G.bullets[i];
+      const b = G.bullets[j];
+      if (pendingBulletDestroys.has(a.id) || pendingBulletDestroys.has(b.id)) continue;
+      if (a.owner === b.owner) continue;
+      if (a.kind === "rocket" || a.kind === "grenade" || b.kind === "rocket" || b.kind === "grenade") {
+        continue;
+      }
+
+      const hit = checkCircleCircle(
+        { x: a.body.x, y: a.body.y, r: a.r },
+        { x: b.body.x, y: b.body.y, r: b.r },
+      );
+      if (!hit) continue;
+
+      pendingBulletDestroys.add(a.id);
+      pendingBulletDestroys.add(b.id);
+      pendingHits.push({ x: (a.body.x + b.body.x) / 2, y: (a.body.y + b.body.y) / 2, targetId: "", damage: 0 });
+    }
+  }
 }
 
 function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI) {
@@ -1512,16 +1670,22 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
   ensurePlayerPhysics(p);
 
   const data = p.input;
-  const crouching = data.crouching === true || data.action === "crouch";
+  const wantCrouch = data.crouching === true || data.action === "crouch";
   const grounded = isPlayerGrounded(p);
-  p.crouching = crouching && grounded;
+  if (wantCrouch && grounded) {
+    applyCrouchPose(p, true);
+  } else if (!wantCrouch && p.crouching) {
+    applyCrouchPose(p, false);
+  } else {
+    p.crouching = wantCrouch && grounded;
+  }
   const speedMul = p.crouching ? 0.45 : 1;
 
   if (data.action === "left") {
     p.vx = -MOVE_SPEED * speedMul;
   } else if (data.action === "right") {
     p.vx = MOVE_SPEED * speedMul;
-  } else if (data.action === "crouch" || (crouching && !data.action)) {
+  } else if (data.action === "crouch" || (wantCrouch && !data.action)) {
     p.vx *= 0.35;
   } else {
     p.vx = 0;
@@ -1550,7 +1714,7 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     data.action !== "left" &&
     data.action !== "right" &&
     data.action !== "crouch" &&
-    !(crouching && !data.action)
+    !(wantCrouch && !data.action)
   ) {
     if (Math.abs(p.vx) > 0.05) p.vx = 0;
   }
@@ -1660,22 +1824,14 @@ function fireWeapon(
 
   applyRecoil(p, aimAngle, onGround, p.crouching, weaponId);
 
-  const muzzle = computeMuzzlePx(
-    p.torso.x,
-    p.torso.y,
-    aimAngle,
-    facing,
-    p.crouching,
-    weaponId,
-  );
-
   const spawnPad = 0.38 * SCALE;
+  const spawnDist = PLAYER_W * 0.5 + spawnPad;
   for (let i = 0; i < pellets; i++) {
     if (G.bullets.filter((b) => b.owner === playerId).length >= weapon.maxActive) break;
     const spread = (random.float() - 0.5) * weapon.spread * 2;
     const shotAngle = aimAngle + spread;
-    const startX = muzzle.x + Math.cos(shotAngle) * spawnPad;
-    const startY = muzzle.y + Math.sin(shotAngle) * spawnPad;
+    const startX = p.torso.x + Math.cos(shotAngle) * spawnDist;
+    const startY = p.torso.y + Math.sin(shotAngle) * spawnDist;
     spawnProjectile(G, playerId, weaponId, weapon, startX, startY, shotAngle);
   }
 
