@@ -42,6 +42,18 @@
   .wrap { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); min-height: 0; }
   .play { min-width: 0; position: relative; display: flex; flex-direction: column; }
   .play iframe { flex: 1; width: 100%; border: 0; background: #0e0c16; }
+  html:fullscreen,
+  html:fullscreen body {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+  }
+  html:fullscreen .bar { display: none; }
+  html:fullscreen .wrap { height: 100vh; }
+  html:fullscreen .play,
+  html:fullscreen .play iframe {
+    height: 100vh;
+  }
   .noui { padding: 22px; overflow: auto; }
   .noui h3 { margin: 0 0 4px; }
   .noui .hint { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
@@ -181,7 +193,7 @@ function renderPlay(d, first) {
     if (!iframe) {
       play.innerHTML = "";
       iframe = document.createElement("iframe");
-      iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.setAttribute("sandbox", "allow-scripts allow-fullscreen");
       iframe.src = "/ui";
       play.appendChild(iframe);
     }
@@ -262,10 +274,21 @@ window.addEventListener("message", (ev) => {
   if (m.t === "bordiko:ready") postToIframe();
   else if (m.t === "bordiko:move" && typeof m.type === "string") sendMove(m.type, m.payload);
   else if (m.t === "bordiko:fullscreen") {
-    const play = $("play");
-    if (document.fullscreenElement) document.exitFullscreen?.();
-    else if (play?.requestFullscreen) play.requestFullscreen();
+    if (document.fullscreenElement) {
+      document.exitFullscreen?.().catch(() => {});
+    } else {
+      document.documentElement.requestFullscreen?.().catch(() => {
+        $("play")?.requestFullscreen?.();
+      });
+    }
   }
+});
+
+document.addEventListener("fullscreenchange", () => {
+  iframe?.contentWindow?.postMessage({ t: "bordiko:fullscreen-changed" }, "*");
+});
+document.addEventListener("webkitfullscreenchange", () => {
+  iframe?.contentWindow?.postMessage({ t: "bordiko:fullscreen-changed" }, "*");
 });
 
 /* ------------------------------ helpers ------------------------------- */

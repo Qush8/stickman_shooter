@@ -332,8 +332,10 @@ const KATANA_SWING_HIT_SAMPLES = [0.28, 0.36, 0.44, 0.52, 0.6, 0.68];
 
 const STICK_BODY_LEN_PX = 44;
 const STICK_ARM_LEN_PX = 28;
-const STICK_CROUCH_DROP_PX = 32;
+const STICK_CROUCH_DROP_PX = 22;
 const PLAYER_CROUCH_H = PLAYER_H - STICK_CROUCH_DROP_PX;
+/** Narrower playable platforms (map defs scaled at init). */
+const PLATFORM_WIDTH_MUL = 0.78;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
 
@@ -460,6 +462,12 @@ function ensureWorld(G: ShooterState) {
     }
     if (uB?.type === "bullet" && currentG && !currentG.bullets.some((b) => b.id === uB.id)) {
       contact.setEnabled(false);
+    }
+    if (uA?.type === "player" && uB?.type === "platform") {
+      handlePlayerPlatformPreSolve(contact, fA, fB, String(uA.id));
+    }
+    if (uB?.type === "player" && uA?.type === "platform") {
+      handlePlayerPlatformPreSolve(contact, fB, fA, String(uB.id));
     }
     if (uA?.type === "player" && uB?.type === "player") {
       contact.setFriction(1.0);
@@ -798,22 +806,46 @@ function applyCrouchPose(p: PlayerState, crouching: boolean) {
   syncHeadFromTorso(p);
 }
 
+function scalePlatformFromDef(def: {
+  id: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  kind: "static" | "elevator";
+  vx?: number;
+  minX?: number;
+  maxX?: number;
+}) {
+  const w = Math.round(def.w * PLATFORM_WIDTH_MUL);
+  const shrink = def.w - w;
+  const x = def.x + shrink / 2;
+  const minX =
+    def.minX != null ? def.minX + shrink / 2 : undefined;
+  const maxX =
+    def.maxX != null ? def.maxX - shrink / 2 : undefined;
+  return { ...def, x, w, minX, maxX };
+}
+
 function initPlatforms(G: ShooterState) {
   const mapDef = getMap(G.currentMapId);
-  G.platforms = mapDef.platforms.map((def) => ({
-    id: def.id,
-    x: def.x,
-    y: def.y,
-    w: def.w,
-    h: def.h,
-    health: PLATFORM_MAX_HEALTH,
-    maxHealth: PLATFORM_MAX_HEALTH,
-    broken: false,
-    kind: def.kind,
-    vx: def.kind === "elevator" ? def.vx : undefined,
-    minX: def.kind === "elevator" ? def.minX : undefined,
-    maxX: def.kind === "elevator" ? def.maxX : undefined,
-  }));
+  G.platforms = mapDef.platforms.map((def) => {
+    const scaled = scalePlatformFromDef(def);
+    return {
+      id: scaled.id,
+      x: scaled.x,
+      y: scaled.y,
+      w: scaled.w,
+      h: scaled.h,
+      health: PLATFORM_MAX_HEALTH,
+      maxHealth: PLATFORM_MAX_HEALTH,
+      broken: false,
+      kind: scaled.kind,
+      vx: scaled.kind === "elevator" ? scaled.vx : undefined,
+      minX: scaled.kind === "elevator" ? scaled.minX : undefined,
+      maxX: scaled.kind === "elevator" ? scaled.maxX : undefined,
+    };
+  });
 }
 
 function getElevators(G: ShooterState) {
@@ -1061,6 +1093,68 @@ function isEntityOnPlatform(
 ): boolean {
   if (centerX < plat.x - 4 || centerX > plat.x + plat.w + 4) return false;
   return Math.abs(feetY - plat.y) <= tolerance;
+}
+
+function handlePlayerPlatformPreSolve(
+  contact: planck.Contact,
+  playerFix: planck.Fixture,
+  platFix: planck.Fixture,
+  playerId: string,
+) {
+  if (!currentG) return;
+  const platData = platFix.getUserData() as { id?: number } | null;
+  const plat = currentG.platforms.find((p) => p.id === platData?.id);
+  if (!plat || plat.broken) return;
+  const p = currentG.players[playerId];
+  if (!p || p.health <= 0) return;
+
+  const wm = contact.getWorldManifold(null);
+  if (!wm) return;
+
+  const playerIsA = playerFix === contact.getFixtureA();
+  const upNormal = playerIsA ? wm.normal.y : -wm.normal.y;
+  const feetY = getFeetY(p);
+  const platTop = plat.y;
+
+  if (feetY <= platTop + 10 && upNormal >= 0.35) return;
+  if (Math.abs(feetY - platTop) <= 14) return;
+
+  contact.setEnabled(false);
+}
+
+function resolvePlayerPlatformSideOverlap(
+  G: ShooterState,
+  p: PlayerState,
+  b: planck.Body,
+) {
+  const halfW = PLAYER_HALF_W * SCALE;
+  const h = playerBodyHeight(p);
+  const top = p.torso.y - h / 2;
+  const bottom = getFeetY(p);
+  let nx = p.torso.x;
+  let changed = false;
+
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    const platTop = plat.y;
+    if (bottom <= platTop + 2) continue;
+    if (top >= plat.y + plat.h + 4) continue;
+    const overlapsX =
+      nx + halfW > plat.x + 2 && nx - halfW < plat.x + plat.w - 2;
+    if (!overlapsX) continue;
+    if (Math.abs(bottom - platTop) <= 12) continue;
+    if (nx < plat.x + plat.w / 2) nx = plat.x - halfW - 1;
+    else nx = plat.x + plat.w + halfW + 1;
+    changed = true;
+  }
+
+  if (!changed) return;
+  p.torso.x = nx;
+  syncHeadFromTorso(p);
+  syncPlayerBodyTransform(p, b);
+  const vel = b.getLinearVelocity();
+  b.setLinearVelocity(planck.Vec2(0, vel.y));
+  p.vx = 0;
 }
 
 function isPlayerOnPlatform(G: ShooterState, playerId: string, plat: PlatformState): boolean {
@@ -1358,21 +1452,17 @@ function applyRecoil(
         : weaponId === "winchester_shotgun"
           ? 0.85
           : 1.0;
-  let impulseMag = RECOIL_IMPULSE * weaponScale;
-  if (onGround) {
-    impulseMag *= 1.5;
-    if (crouching) impulseMag *= 0.45;
-    p.vx += -Math.cos(aimAngle) * impulseMag;
-    const sinA = Math.sin(aimAngle);
-    if (sinA < -0.25) {
-      p.vy += -sinA * impulseMag * 0.2;
-    }
-    return;
-  }
+  let mag = RECOIL_IMPULSE * weaponScale * 0.72;
+  if (onGround && crouching) mag *= 0.45;
 
-  impulseMag *= 0.72;
-  p.vx += -Math.cos(aimAngle) * impulseMag;
-  p.vy += -Math.sin(aimAngle) * impulseMag;
+  const cosA = Math.cos(aimAngle);
+  const sinA = Math.sin(aimAngle);
+  p.vx += -cosA * mag;
+
+  if (onGround) return;
+
+  // Airborne: full Newton recoil — shooting down pushes upward (negative vy).
+  p.vy += -sinA * mag;
 }
 
 function getPickupCollectY(pickup: PickupState) {
@@ -1525,7 +1615,7 @@ function spawnJumpableElevator(
   brokenSite?: { x: number; y: number; w: number },
 ) {
   const alive = G.platforms.filter((p) => !p.broken);
-  const w = 90 + Math.floor(random.float() * 30);
+  const w = Math.round((90 + Math.floor(random.float() * 30)) * PLATFORM_WIDTH_MUL);
   const maxH = MAX_JUMP_HEIGHT * JUMP_REACH_SAFE;
   const maxW = MAX_JUMP_WIDTH * JUMP_REACH_SAFE;
 
@@ -1627,7 +1717,7 @@ function spawnJumpableElevator(
 
 function spawnReplacementElevator(G: ShooterState, random: RandomAPI, y: number, w: number) {
   const fromLeft = random.bool();
-  const platW = w || 100;
+  const platW = w || Math.round(100 * PLATFORM_WIDTH_MUL);
   const x = fromLeft ? -platW - 40 : ARENA_W + 40;
   const vx = fromLeft ? 27 : -27;
   const id = G.nextPlatformId++;
@@ -1668,7 +1758,7 @@ function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
   const yChoices = mapDef.elevatorYLevels;
   const y = yChoices.length ? random.pick(yChoices) : 273;
   const id = G.nextPlatformId++;
-  const w = 100;
+  const w = Math.round(100 * PLATFORM_WIDTH_MUL);
   const x = fromLeft ? -140 : ARENA_W + 40;
   const vx = fromLeft ? 27 : -27;
 
@@ -1913,6 +2003,8 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     vx = p.vx;
     vy = p.vy;
   }
+
+  resolvePlayerPlatformSideOverlap(G, p, b);
 
   b.setAwake(true);
   b.setLinearVelocity(planck.Vec2(vx / SCALE, vy / SCALE));

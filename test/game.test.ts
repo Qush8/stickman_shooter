@@ -154,6 +154,37 @@ test("shoot spawns a bullet for winchester", () => {
   assert.equal(m.G.bullets[0].weaponId, "winchester");
 });
 
+test("airborne shooting downward applies upward recoil", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "air-recoil-down" });
+  m = advanceTicks(m, 40);
+
+  let r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, jumping: true, aimAngle: 0, crouching: false, shooting: false },
+  });
+  assertMoveOk(r);
+  m = advanceTicks(r.state, 5);
+  const p1 = m.G.players["p1"];
+  assert.ok(p1.vy <= 0 || !p1.grounded, "player should be in air during jump arc");
+
+  const vyBefore = p1.vy;
+  const aimDown = Math.PI / 2;
+
+  r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: aimDown, facing: 1, crouching: false, shooting: true },
+  });
+  assertMoveOk(r);
+  m = advanceTicks(r.state, 1);
+
+  assert.ok(
+    m.G.players["p1"].vy < vyBefore - 50,
+    `shooting down in air should push upward (vy ${m.G.players["p1"].vy} vs before ${vyBefore})`,
+  );
+});
+
 test("switchWeapon rejects unowned weapon", () => {
   const m = bootMatch( { players: ["p1", "p2"], seed: "t5" });
 

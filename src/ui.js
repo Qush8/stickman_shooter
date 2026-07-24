@@ -11,13 +11,20 @@ const SCALE = 30;
 /** Half-height of standing Box2D player box (game.ts PLAYER_HALF_H * SCALE). */
 const FEET_OFF = 1.06 * SCALE; // 31.8 — visual feet sit on bottom of physics AABB
 /** Must match game.ts STICK_CROUCH_DROP_PX so crouch feet stay on the box bottom. */
-const STICK_CROUCH_DROP_PX = 32;
-const CROUCH_BODY_LEN_MUL = 0.76;
+const STICK_CROUCH_DROP_PX = 22;
+const CROUCH_BODY_LEN_MUL = 0.74;
 const CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
 /** Match game.ts movement constants (pixels / second). */
 const MOVE_SPEED_PX = 15 * SCALE;
 const JUMP_VY_PX = -34 * SCALE;
 const GRAVITY_PX = 97.5 * SCALE;
+const RECOIL_HEIGHT_OF_JUMP = 0.9;
+const RECOIL_IMPULSE_PX = 34 * SCALE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP);
+const WEAPON_RECOIL_SCALE = {
+    bazooka: 1.35,
+    sniper: 1.15,
+    winchester_shotgun: 0.85,
+};
 /** Exponential smoothing rates (higher = snappier). */
 const REMOTE_LERP_RATE = 20;
 const LOCAL_RECONCILE_RATE = 10;
@@ -25,7 +32,14 @@ const LOCAL_RECONCILE_RATE_MOVING = 4;
 const LOCAL_SNAP_DIST = 120;
 const CAMERA_LERP_RATE = 14;
 const PLAYER_HALF_W_PX = 0.48 * SCALE;
-const FIT_PADDING = 0.9;
+const FIT_PADDING = 0.46;
+/** Cap windowed scale on large monitors so stickman/platforms stay readable. */
+const WINDOWED_MAX_CONTAINER_W = 540;
+const WINDOWED_MAX_CONTAINER_H = 290;
+/** Lift grounded stickman feet on the floor only (not platforms). */
+const VISUAL_FLOOR_LIFT = 14;
+/** Uniform in-arena draw scale for stickman, weapons, pickups, platform bars. */
+const VISUAL_DRAW_SCALE = 0.86;
 
 let viewScale = 1;
 let viewOffsetX = 0;
@@ -36,36 +50,36 @@ let cameraY = 0;
 let cameraInitialized = false;
 
 const PLATFORM_BORDER = 2;
-const PLATFORM_VIS_H = 16;
+const PLATFORM_VIS_H = 11;
 const PLATFORM_MAX_HP = 1000;
 const PLATFORM_LAND_TOLERANCE = 10;
 const CROUCH_BLEND_MS = 150;
 
 const STICK = {
-  headR: 14,
-  lineW: 2.5,
-  outlineW: 3.5,
-  neckLen: 5,
-  limbFillW: 10,
-  bodyLen: 39,
-  hipSpread: 3.5,
-  footW: 14,
-  footSpread: 4.5,
-  armLen: 25,
-  stride: 10,
-  lift: 5,
+  headR: 14 * VISUAL_DRAW_SCALE,
+  lineW: 2.5 * VISUAL_DRAW_SCALE,
+  outlineW: 3.5 * VISUAL_DRAW_SCALE,
+  neckLen: 5 * VISUAL_DRAW_SCALE,
+  limbFillW: 10 * VISUAL_DRAW_SCALE,
+  bodyLen: 39 * VISUAL_DRAW_SCALE,
+  hipSpread: 3.5 * VISUAL_DRAW_SCALE,
+  footW: 14 * VISUAL_DRAW_SCALE,
+  footSpread: 4.5 * VISUAL_DRAW_SCALE,
+  armLen: 25 * VISUAL_DRAW_SCALE,
+  stride: 10 * VISUAL_DRAW_SCALE,
+  lift: 5 * VISUAL_DRAW_SCALE,
   crouchDrop: STICK_CROUCH_DROP_PX,
-  kneeBend: 9,
+  kneeBend: 9 * VISUAL_DRAW_SCALE,
 };
 
-const STICK_BODY_LEN_PX = 44;
+const STICK_BODY_LEN_PX = 44 * VISUAL_DRAW_SCALE;
 
 const GUN = {
-  barrel: 23,
-  slideHalfH: 3.2,
-  gripLen: 10,
-  gripHalfW: 4,
-  tipR: 2.4,
+  barrel: 23 * VISUAL_DRAW_SCALE,
+  slideHalfH: 3.2 * VISUAL_DRAW_SCALE,
+  gripLen: 10 * VISUAL_DRAW_SCALE,
+  gripHalfW: 4 * VISUAL_DRAW_SCALE,
+  tipR: 2.4 * VISUAL_DRAW_SCALE,
 };
 
 const WEAPON_ORDER = [
@@ -184,7 +198,7 @@ gameContainer.addChild(gridGraphics);
 // Floor — solid fill only (no path line)
 const floorGraphics = new Graphics();
 floorGraphics.beginFill(0x3d4654);
-floorGraphics.drawRect(0, FLOOR_Y - 10, ARENA_W, 10);
+floorGraphics.drawRect(0, FLOOR_Y - 16, ARENA_W, 16);
 floorGraphics.endFill();
 gameContainer.addChild(floorGraphics);
 
@@ -213,7 +227,7 @@ const applyMapTheme = (mapId) => {
 
     floorGraphics.clear();
     floorGraphics.beginFill(theme.floor);
-    floorGraphics.drawRect(0, FLOOR_Y - 10, ARENA_W, 10);
+    floorGraphics.drawRect(0, FLOOR_Y - 16, ARENA_W, 16);
     floorGraphics.endFill();
 };
 
@@ -547,7 +561,6 @@ drawPlatforms(getPlatformsForRender(null));
 
 const localPickupMeta = {};
 const FLOOR_PICKUP_Y = 480;
-const PICKUP_FALL_PX_SEC = 420;
 
 const pickupSupportedAt = (x, y, platforms) => {
     if (y >= FLOOR_PICKUP_Y - 1) return true;
@@ -694,8 +707,8 @@ const drawWeaponDrop = (container, pickup, drawX, drawY, falling, fallRot) => {
     container.addChild(shadow);
 
     const icon = new Graphics();
-    icon.rotation = falling ? fallRot : Math.sin(Date.now() / 900 + pickup.id) * 0.05;
-    drawWeaponPickupIcon(icon, wId, 0, 0, 1.08);
+    icon.rotation = falling ? fallRot : 0;
+    drawWeaponPickupIcon(icon, wId, 0, 0, 0.92 * VISUAL_DRAW_SCALE);
     container.addChild(icon);
 
     container.position.set(drawX, drawY);
@@ -719,63 +732,55 @@ const drawPickups = (pickups, platforms) => {
         if (!localPickupMeta[pickup.id]) {
             localPickupMeta[pickup.id] = {
                 simY: pickup.y,
-                goalY: goal,
-                wasFalling: pickup.y < goal - 0.5,
-                landFx: false,
-                fallRot: (pickup.id % 7) * 0.4,
+                wasAtRest: pickup.y >= goal - 0.5,
+                fallRot: 0,
             };
         }
 
         const meta = localPickupMeta[pickup.id];
-        meta.goalY = goal;
 
-        // Server moved pickup upward (fresh spawn above platform) — restart from spawn height.
         if (pickup.y < meta.simY - 2) {
             meta.simY = pickup.y;
-            meta.landFx = false;
-            meta.fallRot = (pickup.id % 7) * 0.4;
+            meta.wasAtRest = false;
+            meta.fallRot = 0;
         }
 
-        const falling = meta.simY < meta.goalY - 0.5;
+        const falling = pickup.y < goal - 0.5;
         if (falling) {
-            meta.simY = Math.min(meta.goalY, meta.simY + PICKUP_FALL_PX_SEC * dtSec);
-            meta.fallRot += dtSec * 5.5;
+            meta.simY += (pickup.y - meta.simY) * Math.min(1, dtSec * 22);
+            meta.fallRot = Math.min(meta.fallRot + dtSec * 3.5, 0.9);
         } else {
-            meta.simY += (meta.goalY - meta.simY) * Math.min(1, dtSec * 12);
-            meta.fallRot *= 0.92;
+            meta.simY = goal;
+            meta.fallRot = 0;
+            if (!meta.wasAtRest) {
+                meta.wasAtRest = true;
+                if (pickup.kind === "weapon") Sfx.playPickupLand();
+            }
         }
+        if (falling) meta.wasAtRest = false;
 
-        const landed = meta.wasFalling && !falling && meta.simY >= meta.goalY - 0.5;
-        if (landed && !meta.landFx) {
-            meta.landFx = true;
-            createSparkHit(pickup.x, meta.simY, 0.5);
-            if (pickup.kind === "weapon") Sfx.playPickupLand();
-        }
-        meta.wasFalling = falling;
-
-        const onFloor = meta.simY >= FLOOR_PICKUP_Y - 1;
-        const bob = falling || onFloor ? 0 : Math.sin(Date.now() / 280 + pickup.id) * 1.5;
-        const drawY = meta.simY + bob;
+        const drawY = meta.simY;
 
         if (pickup.kind === "health") {
             const g = new Graphics();
+            const s = VISUAL_DRAW_SCALE;
             const pulse = 0.9 + Math.sin(Date.now() / 350 + pickup.id) * 0.1;
             g.beginFill(0x000000, 0.18);
-            g.drawEllipse(pickup.x, drawY + 16, 10, 3);
+            g.drawEllipse(pickup.x, drawY + 16 * s, 10 * s, 3 * s);
             g.endFill();
             g.lineStyle(2, 0x66ff99, 0.5 * pulse);
-            g.drawCircle(pickup.x, drawY, 14 * pulse);
+            g.drawCircle(pickup.x, drawY, 14 * pulse * s);
             g.beginFill(0x22cc55, 0.95);
-            g.drawCircle(pickup.x, drawY, 11);
+            g.drawCircle(pickup.x, drawY, 11 * s);
             g.endFill();
             g.beginFill(0x44ff88, 0.45);
-            g.drawCircle(pickup.x - 3, drawY - 3, 4);
+            g.drawCircle(pickup.x - 3 * s, drawY - 3 * s, 4 * s);
             g.endFill();
             g.lineStyle(2.5, 0xffffff, 0.95);
-            g.moveTo(pickup.x - 5, drawY);
-            g.lineTo(pickup.x + 5, drawY);
-            g.moveTo(pickup.x, drawY - 5);
-            g.lineTo(pickup.x, drawY + 5);
+            g.moveTo(pickup.x - 5 * s, drawY);
+            g.lineTo(pickup.x + 5 * s, drawY);
+            g.moveTo(pickup.x, drawY - 5 * s);
+            g.lineTo(pickup.x, drawY + 5 * s);
             pickupsContainer.addChild(g);
         } else {
             const drop = new Container();
@@ -804,6 +809,9 @@ const arenaPointToClient = (arenaX, arenaY) => {
     };
 };
 
+const getFullscreenElement = () =>
+    document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
+
 const fitCanvas = () => {
     const rect = gameContainerEl.getBoundingClientRect();
     const cw = rect.width || gameContainerEl.clientWidth || window.innerWidth;
@@ -812,11 +820,26 @@ const fitCanvas = () => {
 
     app.renderer.resize(Math.round(cw), Math.round(ch));
 
-    viewScale = Math.min(cw / ARENA_W, ch / ARENA_H) * FIT_PADDING;
-    const displayW = ARENA_W * viewScale;
-    const displayH = ARENA_H * viewScale;
-    viewOffsetX = (cw - displayW) / 2;
-    viewOffsetY = (ch - displayH) / 2;
+    const isFullscreen = getFullscreenElement() != null;
+    const nearFullBleed =
+        cw >= window.innerWidth * 0.98 && ch >= window.innerHeight * 0.98;
+    const fullBleed = isFullscreen || nearFullBleed;
+
+    if (fullBleed) {
+        viewScale = Math.min(cw / ARENA_W, ch / ARENA_H);
+        const displayW = ARENA_W * viewScale;
+        const displayH = ARENA_H * viewScale;
+        viewOffsetX = (cw - displayW) / 2;
+        viewOffsetY = (ch - displayH) / 2;
+    } else {
+        const fitW = Math.min(cw, WINDOWED_MAX_CONTAINER_W);
+        const fitH = Math.min(ch, WINDOWED_MAX_CONTAINER_H);
+        viewScale = Math.min(fitW / ARENA_W, fitH / ARENA_H) * FIT_PADDING;
+        const displayW = ARENA_W * viewScale;
+        const displayH = ARENA_H * viewScale;
+        viewOffsetX = (cw - displayW) / 2;
+        viewOffsetY = (ch - displayH) / 2;
+    }
 
     gameContainer.scale.set(viewScale);
     cameraX = viewOffsetX;
@@ -840,8 +863,6 @@ const fitUntilStable = () => {
 fitUntilStable();
 
 const fullscreenBtn = document.getElementById('fullscreen-btn');
-const getFullscreenElement = () =>
-    document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
 
 const updateFullscreenButton = () => {
     if (!fullscreenBtn) return;
@@ -855,6 +876,14 @@ const toggleFullscreen = async () => {
             else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
             return;
         }
+        if (window.parent !== window) {
+            if (bordikoHost?.fullscreen) {
+                bordikoHost.fullscreen();
+                return;
+            }
+            window.parent.postMessage({ t: 'bordiko:fullscreen' }, '*');
+            return;
+        }
         const el = gameContainerEl;
         if (el.requestFullscreen) {
             await el.requestFullscreen();
@@ -864,14 +893,14 @@ const toggleFullscreen = async () => {
             await el.webkitRequestFullscreen();
             return;
         }
-        if (window.parent !== window && bordikoHost?.fullscreen) {
-            bordikoHost.fullscreen();
-            return;
-        }
         console.warn('Fullscreen API not available');
     } catch (err) {
-        if (window.parent !== window && bordikoHost?.fullscreen) {
-            bordikoHost.fullscreen();
+        if (window.parent !== window) {
+            if (bordikoHost?.fullscreen) {
+                bordikoHost.fullscreen();
+                return;
+            }
+            window.parent.postMessage({ t: 'bordiko:fullscreen' }, '*');
             return;
         }
         console.warn('Fullscreen toggle failed:', err);
@@ -891,6 +920,16 @@ document.addEventListener('fullscreenchange', () => {
 document.addEventListener('webkitfullscreenchange', () => {
     updateFullscreenButton();
     fitCanvas();
+});
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && getFullscreenElement()) {
+        requestAnimationFrame(fitCanvas);
+    }
+});
+window.addEventListener('message', (ev) => {
+    if (ev.data?.t === 'bordiko:fullscreen-changed') {
+        requestAnimationFrame(fitCanvas);
+    }
 });
 updateFullscreenButton();
 
@@ -1474,15 +1513,20 @@ const removeLocalPlayer = (id) => {
 
 const getPlayerFeetOff = (p) => (p.crouching ? CROUCH_FEET_OFF : FEET_OFF);
 
+const isStandingOnFloor = (p) => {
+    if (!p || p.renderY === undefined || !p.grounded || p.airborne) return false;
+    return p.renderY + getPlayerFeetOff(p) >= FLOOR_Y - 2;
+};
+
 const applyLocalCrouchState = (p, wantCrouch) => {
     const wasCrouching = !!p.crouching;
     if (wantCrouch && (p.grounded || wasCrouching)) {
         if (!wasCrouching && p.grounded) {
-            p.renderY += STICK_CROUCH_DROP_PX * 0.5;
+            p.renderY += STICK_CROUCH_DROP_PX * 0.35;
         }
         p.crouching = true;
     } else if (!wantCrouch && wasCrouching) {
-        p.renderY -= STICK_CROUCH_DROP_PX * 0.5;
+        p.renderY -= STICK_CROUCH_DROP_PX * 0.35;
         p.crouching = false;
     } else if (!wantCrouch) {
         p.crouching = false;
@@ -1773,6 +1817,11 @@ const handleGameState = (state) => {
                         triggerWeaponRecoil(shooter, wId);
                         if (b.owner === latestState?.playerId) {
                             triggerRecoilShake(wId);
+                            applyPredictedRecoil(
+                                shooter,
+                                shooter.aimAngle ?? Math.atan2(b.vy ?? 1, b.vx ?? 0),
+                                wId,
+                            );
                         }
                     }
                 } else {
@@ -2158,7 +2207,6 @@ function createHitBurst(x, y) {
 }
 
 // Stickman drawing + animation helpers
-const VISUAL_STAND_LIFT = 0;
 
 const smoothStep = (t) => {
     const x = Math.max(0, Math.min(1, t));
@@ -2209,6 +2257,17 @@ const tickShadowAfterimages = (_dt) => {
     shadowAfterimages.length = 0;
 };
 const getDodgeJuicePeak = (p) => p.shadowFlash ?? 0;
+
+const applyPredictedRecoil = (p, aimAngle, weaponId) => {
+    const weaponScale = WEAPON_RECOIL_SCALE[weaponId] ?? 1.0;
+    let mag = RECOIL_IMPULSE_PX * weaponScale * 0.72;
+    if (p.grounded && p.crouching) mag *= 0.45;
+
+    if (p.grounded) return;
+
+    const sinA = Math.sin(aimAngle);
+    p.predVy = (p.predVy ?? p.vy ?? 0) + (-sinA * mag);
+};
 
 const buildMovementInput = (me, action, crouching, pendingJump, pointerHeld) => ({
     action,
@@ -2403,7 +2462,7 @@ const getStickPose = (p) => {
     const tx = p.renderX + recoilX;
     const ty = p.renderY + recoilY;
     const blend = p.crouching ? 1 : 0;
-    const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
+    const standLift = isStandingOnFloor(p) ? VISUAL_FLOOR_LIFT : 0;
     const f = p.facing || 1;
     const feetOff = getPlayerFeetOff(p);
     const footY = ty + feetOff - standLift;
@@ -2411,7 +2470,7 @@ const getStickPose = (p) => {
     const crouchHipY = footY - 9;
     const hipY = standHipY + (crouchHipY - standHipY) * blend;
     const standTorsoY = ty;
-    const crouchTorsoY = ty + STICK_CROUCH_DROP_PX * 0.28;
+    const crouchTorsoY = ty + STICK_CROUCH_DROP_PX * 0.18;
     const torsoDrawY = standTorsoY + (crouchTorsoY - standTorsoY) * blend;
     const bodyLenMul = 1 + (CROUCH_BODY_LEN_MUL - 1) * blend;
     const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, torsoDrawY, 0, bodyLenMul);
@@ -2437,7 +2496,7 @@ const getGunPose = (p) => {
     const aim = getEffectiveAim(p);
     const f = p.facing || 1;
     const weaponId = p.currentWeapon || "winchester";
-    const barrel = WEAPON_BARREL[weaponId] ?? GUN.barrel;
+    const barrel = (WEAPON_BARREL[weaponId] ?? GUN.barrel / VISUAL_DRAW_SCALE) * VISUAL_DRAW_SCALE;
 
     if (pose.shadowTeleport) {
         const dir = pose.dodgeDir ?? pose.f ?? 1;
@@ -2904,7 +2963,7 @@ const getCorpsePose = (p) => {
     const hx = slumpHx + facing * 2 * headEase;
     const hy = slumpHy + (groundHeadY - slumpHy) * headEase;
 
-    const startFootY = c.startTorso.y + FEET_OFF - VISUAL_STAND_LIFT;
+    const startFootY = c.startTorso.y + FEET_OFF - VISUAL_FLOOR_LIFT;
     const footY = startFootY + (FLOOR_Y - 2 - startFootY) * bodyEase;
 
     return {

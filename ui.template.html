@@ -120,7 +120,18 @@
     }
     #game-container:fullscreen,
     #game-container:-webkit-full-screen {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      max-width: 100vw;
+      max-height: 100vh;
       background: #1e1e1e;
+    }
+    #game-container:fullscreen canvas,
+    #game-container:-webkit-full-screen canvas {
+      width: 100% !important;
+      height: 100% !important;
     }
     #game-container:fullscreen ~ #hud,
     #game-container:-webkit-full-screen ~ #hud {
