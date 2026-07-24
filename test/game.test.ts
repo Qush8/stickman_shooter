@@ -779,3 +779,60 @@ test("match starts active without lobby wait", () => {
   const nextState = advanceTicks(moved.state, 1);
   assert.notEqual(nextState.G.players.p1.torso.x, m.G.players.p1.torso.x);
 });
+
+test("broken platform replacement spawns off-screen after delay", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "plat-replace" });
+  const plat = m.G.platforms.find((p) => p.kind === "static");
+  assert.ok(plat, "expected static platform");
+  const countBefore = m.G.platforms.length;
+  const idsBefore = new Set(m.G.platforms.map((p) => p.id));
+
+  testUtils.breakPlatformWithReplacement(m.G, plat!.id);
+  assert.equal(m.G.platforms.length, countBefore - 1, "broken platform removed immediately");
+
+  m = advanceTicks(m, 59);
+  assert.equal(m.G.platforms.length, countBefore - 1, "replacement should not appear before delay");
+
+  m = advanceTicks(m, 1);
+  const replacement = m.G.platforms.find((p) => !idsBefore.has(p.id));
+  assert.ok(replacement, "replacement elevator should spawn after delay");
+  assert.ok(
+    replacement!.x + replacement!.w <= 0 || replacement!.x >= 912,
+    "replacement should enter from off-screen",
+  );
+});
+
+test("dead player torso stops moving after kill", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "dead-freeze" });
+  m = advanceTicks(m, 30);
+  testUtils.killPlayer(m.G, "p2");
+  const frozenX = m.G.players["p2"].torso.x;
+  const frozenY = m.G.players["p2"].torso.y;
+
+  m = advanceTicks(m, 60);
+  assert.equal(m.G.players["p2"].torso.x, frozenX);
+  assert.equal(m.G.players["p2"].torso.y, frozenY);
+  assert.equal(testUtils.playerFixtureCount("p2"), 0);
+});
+
+test("crouch stays active while key held on ground", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "crouch-hold" });
+  m = advanceTicks(m, 30);
+  let r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: "crouch", aimAngle: 0, crouching: true, shooting: false },
+  });
+  assertMoveOk(r);
+  m = r.state;
+  for (let i = 0; i < 20; i++) {
+    r = applyMove(game, m, {
+      type: "input",
+      playerId: "p1",
+      payload: { action: "crouch", aimAngle: 0, crouching: true, shooting: false },
+    });
+    assertMoveOk(r);
+    m = advanceTicks(r.state, 1);
+    assert.equal(m.G.players["p1"].crouching, true, `tick ${i}`);
+  }
+});

@@ -11,8 +11,8 @@ const SCALE = 30;
 /** Half-height of standing Box2D player box (game.ts PLAYER_HALF_H * SCALE). */
 const FEET_OFF = 1.06 * SCALE; // 31.8 — visual feet sit on bottom of physics AABB
 /** Must match game.ts STICK_CROUCH_DROP_PX so crouch feet stay on the box bottom. */
-const STICK_CROUCH_DROP_PX = 46;
-const VISUAL_CROUCH_DROP = 26;
+const STICK_CROUCH_DROP_PX = 32;
+const CROUCH_BODY_LEN_MUL = 0.76;
 const CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
 /** Match game.ts movement constants (pixels / second). */
 const MOVE_SPEED_PX = 15 * SCALE;
@@ -36,6 +36,10 @@ let cameraY = 0;
 let cameraInitialized = false;
 
 const PLATFORM_BORDER = 2;
+const PLATFORM_VIS_H = 16;
+const PLATFORM_MAX_HP = 1000;
+const PLATFORM_LAND_TOLERANCE = 10;
+const CROUCH_BLEND_MS = 150;
 
 const STICK = {
   headR: 14,
@@ -350,12 +354,43 @@ const getPlatformsForRender = (G) => {
 
 /** Display-only platform positions (lerp toward server; never used for sync/input). */
 const localPlatformDisplay = new Map();
+const platformBreakAnims = new Map();
+
+const resolvePlatformLanding = (renderX, feetY, feetOff, platforms) => {
+    let best = null;
+    let bestDist = PLATFORM_LAND_TOLERANCE + 1;
+    for (const plat of platforms ?? []) {
+        if (plat.broken) continue;
+        if (renderX < plat.x - 4 || renderX > plat.x + plat.w + 4) continue;
+        const dist = feetY - plat.y;
+        if (dist >= -2 && dist <= PLATFORM_LAND_TOLERANCE && dist < bestDist) {
+            bestDist = dist;
+            best = plat;
+        }
+    }
+    if (!best) return null;
+    return { renderY: best.y - feetOff, platId: best.id };
+};
+
+const getLocalPlatformSnapId = (player, platforms) => {
+    if (!player || player.renderX === undefined || player.renderY === undefined) return null;
+    const feetOff = getPlayerFeetOff(player);
+    const feetY = player.renderY + feetOff;
+    for (const plat of platforms ?? []) {
+        if (plat.broken) continue;
+        if (player.renderX < plat.x - 4 || player.renderX > plat.x + plat.w + 4) continue;
+        if (Math.abs(feetY - plat.y) <= PLATFORM_LAND_TOLERANCE && player.grounded) {
+            return plat.id;
+        }
+    }
+    return null;
+};
 
 const lerpToward = (from, to, t) => from + (to - from) * t;
 /** Frame-rate independent exponential lerp factor. */
 const expLerpFactor = (rate, dtSec) => 1 - Math.exp(-rate * Math.max(0, dtSec));
 
-const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60) => {
+const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60, snapPlatformId = null) => {
     const liveIds = new Set();
     const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
     for (const plat of platforms ?? []) {
@@ -363,11 +398,40 @@ const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60) => {
         liveIds.add(plat.id);
         const prev = localPlatformDisplay.get(plat.id);
         if (!prev) {
-            localPlatformDisplay.set(plat.id, { renderX: plat.x, renderY: plat.y });
+            const isOffScreenEntry =
+                plat.kind === "elevator" &&
+                (plat.x + plat.w <= 0 || plat.x >= ARENA_W);
+            if (isOffScreenEntry) {
+                const fromLeft = plat.vx == null || plat.vx > 0;
+                const startX = fromLeft ? -plat.w - 40 : ARENA_W + 40;
+                localPlatformDisplay.set(plat.id, {
+                    renderX: startX,
+                    renderY: plat.y,
+                    w: plat.w,
+                    h: plat.h,
+                    health: plat.health ?? PLATFORM_MAX_HP,
+                    maxHealth: plat.maxHealth ?? PLATFORM_MAX_HP,
+                });
+            } else {
+                localPlatformDisplay.set(plat.id, {
+                    renderX: plat.x,
+                    renderY: plat.y,
+                    w: plat.w,
+                    h: plat.h,
+                    health: plat.health ?? PLATFORM_MAX_HP,
+                    maxHealth: plat.maxHealth ?? PLATFORM_MAX_HP,
+                });
+            }
             continue;
         }
-        // Snap on large jumps (map swap / teleport) to avoid long trails.
-        if (Math.hypot(plat.x - prev.renderX, plat.y - prev.renderY) > 80) {
+        prev.w = plat.w;
+        prev.h = plat.h;
+        prev.health = plat.health ?? prev.health ?? PLATFORM_MAX_HP;
+        prev.maxHealth = plat.maxHealth ?? prev.maxHealth ?? PLATFORM_MAX_HP;
+        if (snapPlatformId === plat.id) {
+            prev.renderX = plat.x;
+            prev.renderY = plat.y;
+        } else if (Math.hypot(plat.x - prev.renderX, plat.y - prev.renderY) > 80) {
             prev.renderX = plat.x;
             prev.renderY = plat.y;
         } else {
@@ -376,22 +440,67 @@ const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60) => {
         }
     }
     for (const id of [...localPlatformDisplay.keys()]) {
-        if (!liveIds.has(id)) localPlatformDisplay.delete(id);
+        if (!liveIds.has(id)) {
+            const prev = localPlatformDisplay.get(id);
+            if (prev) {
+                platformBreakAnims.set(id, {
+                    renderX: prev.renderX,
+                    renderY: prev.renderY,
+                    w: prev.w ?? 100,
+                    h: prev.h ?? 12,
+                    life: 1,
+                });
+            }
+            localPlatformDisplay.delete(id);
+        }
     }
 };
 
-const drawPlatforms = (platforms, dtSec = 1 / 60) => {
+const drawPlatforms = (platforms, dtSec = 1 / 60, snapPlatformId = null) => {
     platformsContainer.removeChildren();
-    if (!platforms?.length) return;
+    const renderPlatforms = platforms?.length ? platforms : [];
 
-    syncPlatformDisplayTargets(platforms, dtSec);
+    syncPlatformDisplayTargets(renderPlatforms, dtSec, snapPlatformId);
 
-    for (const plat of platforms) {
+    for (const [id, anim] of [...platformBreakAnims.entries()]) {
+        anim.life = Math.max(0, anim.life - dtSec * 5);
+        if (anim.life <= 0) {
+            platformBreakAnims.delete(id);
+            continue;
+        }
+        const g = new Graphics();
+        const alpha = anim.life;
+        const shrink = 1 - (1 - anim.life) * 0.35;
+        const w = anim.w * shrink;
+        const h = anim.h * shrink;
+        const cx = anim.renderX + anim.w / 2;
+        const drawX = cx - w / 2;
+        const drawY = anim.renderY + (anim.h - h) / 2;
+        g.beginFill(0xff8844, 0.35 * alpha);
+        g.drawRect(drawX, drawY, w, h);
+        g.endFill();
+        g.lineStyle(2, 0xffcc88, 0.8 * alpha, 0.5, true);
+        g.drawRect(drawX, drawY, w, h);
+        platformsContainer.addChild(g);
+    }
+
+    if (!renderPlatforms.length && platformBreakAnims.size === 0) return;
+
+    for (const plat of renderPlatforms) {
         if (plat.broken) continue;
 
-        const display = localPlatformDisplay.get(plat.id) ?? { renderX: plat.x, renderY: plat.y };
+        const display = localPlatformDisplay.get(plat.id) ?? {
+            renderX: plat.x,
+            renderY: plat.y,
+            w: plat.w,
+            h: plat.h,
+            health: plat.health ?? PLATFORM_MAX_HP,
+            maxHealth: plat.maxHealth ?? PLATFORM_MAX_HP,
+        };
         const drawX = display.renderX;
         const drawY = display.renderY;
+        const barH = Math.max(plat.h, PLATFORM_VIS_H);
+        const barY = drawY + plat.h - barH;
 
         if (drawX + plat.w <= 0 || drawX >= ARENA_W) continue;
 
@@ -402,31 +511,33 @@ const drawPlatforms = (platforms, dtSec = 1 / 60) => {
 
         const g = new Graphics();
         const inset = PLATFORM_BORDER;
-        const hpRatio = Math.max(0, Math.min(1, plat.health / (plat.maxHealth || 500)));
+        const maxHp = display.maxHealth || plat.maxHealth || PLATFORM_MAX_HP;
+        const hp = display.health ?? plat.health ?? maxHp;
+        const hpRatio = Math.max(0, Math.min(1, hp / maxHp));
         const innerW = Math.max(0, plat.w - inset * 2);
-        const innerH = Math.max(1, plat.h - inset * 2);
+        const innerH = Math.max(4, barH - inset * 2);
         const fillW = innerW * hpRatio;
         const isElevator = plat.kind === "elevator";
-        const shellColor = isElevator ? 0x1a3355 : 0x24384f;
-        const baseFill = isElevator ? 0x44aaff : 0x3ecf6e;
-        const baseBorder = isElevator ? 0x88ccff : 0xf0f6ff;
+        const shellColor = 0x555555;
+        const hpFill = isElevator ? 0x44aaff : 0x55ff55;
+        const borderColor = 0x222222;
 
-        g.beginFill(shellColor, 0.95);
-        g.drawRect(clipLeft, drawY, visibleW, plat.h);
+        g.lineStyle(1, borderColor, 1, 0.5, true);
+        g.drawRect(clipLeft, barY, visibleW, barH);
+
+        g.beginFill(shellColor, 1);
+        g.drawRect(clipLeft + inset, barY + inset, visibleW - inset * 2, innerH);
         g.endFill();
 
         const innerLeft = drawX + inset;
         const innerRight = drawX + inset + fillW;
-        const fillClipLeft = Math.max(clipLeft, innerLeft);
-        const fillClipRight = Math.min(clipRight, innerRight);
+        const fillClipLeft = Math.max(clipLeft + inset, innerLeft);
+        const fillClipRight = Math.min(clipRight - inset, innerRight);
         if (fillClipRight > fillClipLeft) {
-            g.beginFill(baseFill, 1);
-            g.drawRect(fillClipLeft, drawY + inset, fillClipRight - fillClipLeft, innerH);
+            g.beginFill(hpFill, 1);
+            g.drawRect(fillClipLeft, barY + inset, fillClipRight - fillClipLeft, innerH);
             g.endFill();
         }
-
-        g.lineStyle(2, baseBorder, 0.95, 0.5, true);
-        g.drawRect(clipLeft, drawY, visibleW, plat.h);
 
         platformsContainer.addChild(g);
     }
@@ -744,11 +855,25 @@ const toggleFullscreen = async () => {
             else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
             return;
         }
-        const el = document.documentElement;
-        if (el.requestFullscreen) await el.requestFullscreen();
-        else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
-        else console.warn('Fullscreen API not available');
+        const el = gameContainerEl;
+        if (el.requestFullscreen) {
+            await el.requestFullscreen();
+            return;
+        }
+        if (el.webkitRequestFullscreen) {
+            await el.webkitRequestFullscreen();
+            return;
+        }
+        if (window.parent !== window && bordikoHost?.fullscreen) {
+            bordikoHost.fullscreen();
+            return;
+        }
+        console.warn('Fullscreen API not available');
     } catch (err) {
+        if (window.parent !== window && bordikoHost?.fullscreen) {
+            bordikoHost.fullscreen();
+            return;
+        }
         console.warn('Fullscreen toggle failed:', err);
     } finally {
         updateFullscreenButton();
@@ -1326,6 +1451,53 @@ const resolveMoveAction = (crouching) => {
     return null;
 };
 
+const removeLocalPlayer = (id) => {
+    const lp = localPlayers[id];
+    if (!lp) return;
+    if (lp.lineGraphics) {
+        playersContainer.removeChild(lp.lineGraphics);
+        lp.lineGraphics.destroy();
+        lp.lineGraphics = null;
+    }
+    if (lp.fillGraphics) {
+        playersContainer.removeChild(lp.fillGraphics);
+        lp.fillGraphics.destroy();
+        lp.fillGraphics = null;
+    }
+    if (lp.dom) {
+        lp.dom.remove();
+        lp.dom = null;
+    }
+    delete localPlayers[id];
+};
+
+
+const getPlayerFeetOff = (p) => (p.crouching ? CROUCH_FEET_OFF : FEET_OFF);
+
+const applyLocalCrouchState = (p, wantCrouch) => {
+    const wasCrouching = !!p.crouching;
+    if (wantCrouch && (p.grounded || wasCrouching)) {
+        if (!wasCrouching && p.grounded) {
+            p.renderY += STICK_CROUCH_DROP_PX * 0.5;
+        }
+        p.crouching = true;
+    } else if (!wantCrouch && wasCrouching) {
+        p.renderY -= STICK_CROUCH_DROP_PX * 0.5;
+        p.crouching = false;
+    } else if (!wantCrouch) {
+        p.crouching = false;
+    }
+    updateCrouchVisual(p, wantCrouch);
+};
+
+const updateCrouchVisual = (p, wantCrouch) => {
+    p.prevWantCrouch = wantCrouch;
+    p.crouchBlend = wantCrouch ? 1 : 0;
+};
+
+const isOnPlatformSurface = (renderX, renderY, feetOff, platforms) =>
+    !!resolvePlatformLanding(renderX, renderY + feetOff, feetOff, platforms);
+
 function isKeyPressed(...k) {
     return k.some(key => activeKeys.has(key));
 }
@@ -1371,6 +1543,7 @@ const handleGameState = (state) => {
             }
             if (G.roundPhase === "playing" && prevRoundPhase === "intermission") {
                 localPlatformDisplay.clear();
+                platformBreakAnims.clear();
                 for (const [id, p] of Object.entries(G.players)) {
                     const lp = localPlayers[id];
                     if (!lp) continue;
@@ -1402,7 +1575,7 @@ const handleGameState = (state) => {
 
             const liveIds = new Set(Object.keys(G.players));
             for (const id of Object.keys(localPlayers)) {
-                if (!liveIds.has(id)) delete localPlayers[id];
+                if (!liveIds.has(id)) removeLocalPlayer(id);
             }
 
             for (const [id, p] of Object.entries(G.players)) {
@@ -1431,6 +1604,8 @@ const handleGameState = (state) => {
                         katanaEquip: 1,
                         lastFireTick: p.lastFireTick ?? 0,
                         deathCorpse: null,
+                        crouchBlend: p.crouching ? 1 : 0,
+                        prevWantCrouch: false,
                     };
                 } else {
                     const lp = localPlayers[id];
@@ -1471,10 +1646,16 @@ const handleGameState = (state) => {
                         }
                     }
                     lp.health = p.health;
-                    lp.crouching = !!p.crouching;
+                    if (id !== latestState.playerId) {
+                        lp.crouching = !!p.crouching;
+                    }
 
-                    lp.torso = { ...p.torso };
-                    lp.head = { ...p.head };
+                    if (p.health <= 0 && lp.deathCorpse) {
+                        // Keep corpse frozen; ignore live server torso drift after death.
+                    } else {
+                        lp.torso = { ...p.torso };
+                        lp.head = { ...p.head };
+                    }
 
                     lp.currentWeapon = p.currentWeapon || "winchester";
                     lp.ownedWeapons = p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"];
@@ -1498,6 +1679,11 @@ const handleGameState = (state) => {
 
         if (G && G.platforms) {
             for (const plat of G.platforms) {
+                const cached = localPlatformDisplay.get(plat.id);
+                if (cached && typeof plat.health === "number") {
+                    cached.health = plat.health;
+                    cached.maxHealth = plat.maxHealth ?? cached.maxHealth ?? PLATFORM_MAX_HP;
+                }
                 const wasBroken = prevPlatformBroken[plat.id];
                 if (wasBroken === false && plat.broken) {
                     createSparkHit(plat.x + plat.w / 2, plat.y + plat.h / 2, 0.35);
@@ -1521,12 +1707,13 @@ const handleGameState = (state) => {
                         }
                     }
                     const targetPlayer = localPlayers[hit.targetId];
-                    const hitX = hit.isHeadshot && targetPlayer?.renderX !== undefined
-                        ? targetPlayer.renderX
-                        : hit.x;
-                    const hitY = hit.isHeadshot && targetPlayer?.renderY !== undefined
-                        ? targetPlayer.renderY - 36
-                        : hit.y;
+                    let hitX = hit.x;
+                    let hitY = hit.y;
+                    if (hit.isHeadshot && targetPlayer) {
+                        const gun = getGunPose(targetPlayer);
+                        hitX = gun.hx;
+                        hitY = gun.hy;
+                    }
                     createPlayerHitEffect(hitX, hitY, hit.isHeadshot);
                     if (targetPlayer) {
                         markBulletHitFace(targetPlayer, hit.isHeadshot);
@@ -2107,14 +2294,21 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
         return;
     }
 
-    const speedMul = crouching && p.grounded ? 0.45 : 1;
+    const feetOff = getPlayerFeetOff(p);
+    const speedMul = p.crouching && p.grounded ? 0.45 : 1;
     let predVx = 0;
     if (action === "left") predVx = -MOVE_SPEED_PX * speedMul;
     else if (action === "right") predVx = MOVE_SPEED_PX * speedMul;
 
     if (typeof p.predVy !== "number") p.predVy = p.vy ?? 0;
 
-    if (jumpPressed && p.grounded) {
+    const platforms = latestState?.G?.platforms;
+    const onSurface =
+        p.grounded ||
+        isOnPlatformSurface(p.renderX, p.renderY, feetOff, platforms) ||
+        p.renderY + feetOff >= FLOOR_Y - 2;
+
+    if (jumpPressed && onSurface && !p.crouching) {
         p.predVy = JUMP_VY_PX;
         p.grounded = false;
         p.airborne = true;
@@ -2125,7 +2319,6 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
     if (!p.grounded || Math.abs(p.predVy) > 1) {
         p.predVy += GRAVITY_PX * dtSec;
         p.renderY += p.predVy * dtSec;
-        const feetOff = crouching ? CROUCH_FEET_OFF : FEET_OFF;
         const feetY = p.renderY + feetOff;
         if (feetY >= FLOOR_Y) {
             p.renderY = FLOOR_Y - feetOff;
@@ -2133,11 +2326,38 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
             p.grounded = true;
             p.airborne = false;
         } else {
-            p.grounded = false;
-            p.airborne = true;
+            const land = resolvePlatformLanding(
+                p.renderX,
+                feetY,
+                feetOff,
+                latestState?.G?.platforms,
+            );
+            if (land && p.predVy >= 0) {
+                p.renderY = land.renderY;
+                p.predVy = 0;
+                p.grounded = true;
+                p.airborne = false;
+            } else {
+                p.grounded = false;
+                p.airborne = true;
+            }
         }
     } else {
         p.predVy = 0;
+        const land = resolvePlatformLanding(
+            p.renderX,
+            p.renderY + feetOff,
+            feetOff,
+            platforms,
+        );
+        if (land) {
+            p.renderY = land.renderY;
+            p.grounded = true;
+            p.airborne = false;
+        } else if (p.renderY + feetOff >= FLOOR_Y - 2) {
+            p.grounded = true;
+            p.airborne = false;
+        }
     }
 
     p.vx = predVx;
@@ -2157,7 +2377,9 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
         if (reconcileX) {
             p.renderX += errX * expLerpFactor(xRate, dtSec);
         }
-        p.renderY += errY * expLerpFactor(LOCAL_RECONCILE_RATE, dtSec);
+        if (!p.crouching) {
+            p.renderY += errY * expLerpFactor(LOCAL_RECONCILE_RATE, dtSec);
+        }
     }
 
     p.renderX = Math.max(PLAYER_HALF_W_PX, Math.min(ARENA_W - PLAYER_HALF_W_PX, p.renderX));
@@ -2166,8 +2388,8 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
 
 const STICK_HEAD_FILL_R = () => STICK.headR - 1.2;
 
-const stickHeadNeckFromTorso = (tx, ty, drop = 0) => {
-    const neckTop = ty - STICK.bodyLen * 0.48 + drop * 0.38;
+const stickHeadNeckFromTorso = (tx, ty, drop = 0, bodyLenMul = 1) => {
+    const neckTop = ty - STICK.bodyLen * 0.48 * bodyLenMul + drop * 0.38;
     const hy = neckTop - STICK_HEAD_FILL_R() - STICK.neckLen;
     return { hx: tx, hy, neckTop };
 };
@@ -2180,25 +2402,31 @@ const getStickPose = (p) => {
     const recoilY = dodgeVisual ? 0 : (p.recoilTorsoOffY ?? 0);
     const tx = p.renderX + recoilX;
     const ty = p.renderY + recoilY;
-    const crouch = !!p.crouching && p.grounded;
-    const drop = crouch ? VISUAL_CROUCH_DROP : 0;
+    const blend = p.crouching ? 1 : 0;
     const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
     const f = p.facing || 1;
-    // Feet rest exactly on the bottom edge of the Box2D player AABB.
-    const feetOff = crouch ? CROUCH_FEET_OFF : FEET_OFF;
+    const feetOff = getPlayerFeetOff(p);
     const footY = ty + feetOff - standLift;
-    const hipY = ty + feetOff * 0.22 + drop * 0.15 - standLift * 0.4;
-    const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty, drop * 0.5);
+    const standHipY = ty + FEET_OFF * 0.22 - standLift * 0.4;
+    const crouchHipY = footY - 9;
+    const hipY = standHipY + (crouchHipY - standHipY) * blend;
+    const standTorsoY = ty;
+    const crouchTorsoY = ty + STICK_CROUCH_DROP_PX * 0.28;
+    const torsoDrawY = standTorsoY + (crouchTorsoY - standTorsoY) * blend;
+    const bodyLenMul = 1 + (CROUCH_BODY_LEN_MUL - 1) * blend;
+    const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, torsoDrawY, 0, bodyLenMul);
+    const spineMidY = torsoDrawY + (hipY - torsoDrawY) * 0.32 * blend;
     return {
         tx,
-        ty,
+        ty: spineMidY,
         hx,
-        hy: crouch ? hy + drop * 0.06 : hy,
+        hy,
         neckTop,
         hipY,
         footY,
-        crouch,
-        drop,
+        crouch: blend > 0.35,
+        drop: STICK_CROUCH_DROP_PX * 0.28 * blend,
+        crouchBlend: blend,
         dive: false,
         f,
     };
@@ -3103,7 +3331,8 @@ const computeLegPositions = (p, pose) => {
         rFootY = footY - 14;
         lBend = 1.1;
         rBend = 1.35;
-    } else if (crouch) {
+    } else if (crouch || (pose.crouchBlend ?? 0) > 0.05) {
+        const cb = pose.crouchBlend ?? (crouch ? 1 : 0);
         if (p.walking) {
             const swing = Math.sin(p.walkPhase);
             lFootX = tx - s - 1 + swing * STICK.stride * 0.42 * f;
@@ -3115,10 +3344,10 @@ const computeLegPositions = (p, pose) => {
         } else {
             lFootX = tx - s - 1;
             rFootX = tx + s + 1;
-            lFootY = footY + 2;
-            rFootY = footY + 2;
-            lBend = 0.9;
-            rBend = 0.9;
+            lFootY = footY;
+            rFootY = footY;
+            lBend = 0.55 + 0.35 * cb;
+            rBend = 0.55 + 0.35 * cb;
         }
     } else if (p.walking) {
         const swing = Math.sin(p.walkPhase);
@@ -3301,7 +3530,9 @@ app.ticker.add(() => {
 
         const G = latestState.G;
         if (G?.currentMapId) applyMapTheme(G.currentMapId);
-        drawPlatforms(getPlatformsForRender(G), dtSec);
+        const meForPlatform = localPlayers[latestState.playerId];
+        const snapPlatformId = getLocalPlatformSnapId(meForPlatform, G?.platforms);
+        drawPlatforms(getPlatformsForRender(G), dtSec, snapPlatformId);
         drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
 
         updateStartOverlay();
@@ -3414,6 +3645,11 @@ app.ticker.add(() => {
             tickKatanaSwing(p);
             tickKatanaEquip(p);
             if (p === me) {
+                applyLocalCrouchState(p, crouching);
+            } else if (p.grounded) {
+                updateCrouchVisual(p, !!p.crouching);
+            }
+            if (p === me) {
                 predictLocalPlayerDisplay(
                     p,
                     action,
@@ -3434,9 +3670,6 @@ app.ticker.add(() => {
                 p === me && gameplayActive,
             );
             tickFaceExpr(p, dt);
-            if (p === me) {
-                p.crouching = crouching && p.grounded;
-            }
             if (p === me && p.walking && p.grounded && !p.crouching && p.health > 0) {
                 Sfx.playFootstep();
             }

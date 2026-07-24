@@ -118,6 +118,14 @@
     #fullscreen-btn:hover {
       background: rgba(30, 30, 30, 0.85);
     }
+    #game-container:fullscreen,
+    #game-container:-webkit-full-screen {
+      background: #1e1e1e;
+    }
+    #game-container:fullscreen ~ #hud,
+    #game-container:-webkit-full-screen ~ #hud {
+      display: none;
+    }
   </style>
 </head>
 <body>

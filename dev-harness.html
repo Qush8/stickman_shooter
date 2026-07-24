@@ -261,7 +261,11 @@ window.addEventListener("message", (ev) => {
   const m = ev.data || {};
   if (m.t === "bordiko:ready") postToIframe();
   else if (m.t === "bordiko:move" && typeof m.type === "string") sendMove(m.type, m.payload);
-  // bordiko:chat / bordiko:emote are ignored in the sandbox
+  else if (m.t === "bordiko:fullscreen") {
+    const play = $("play");
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else if (play?.requestFullscreen) play.requestFullscreen();
+  }
 });
 
 /* ------------------------------ helpers ------------------------------- */
