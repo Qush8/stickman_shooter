@@ -102,6 +102,13 @@
           <option value="teams2v2">2v2</option>
         </select>
       </label>
+      <label class="chk">rounds
+        <select id="roundstowin">
+          <option value="3">First to 3</option>
+          <option value="4">First to 4</option>
+          <option value="5">First to 5</option>
+        </select>
+      </label>
       <label class="chk">seats <input type="number" id="seatcount" min="2" max="10"></label>
       <button id="reset">Reset</button>
       <button id="reseed">New deal</button>
@@ -160,6 +167,7 @@ function onState(d) {
   $("auto").checked = d.auto;
   const sc = $("seatcount");
   const gm = $("gamemode");
+  const rtw = $("roundstowin");
   if (document.activeElement !== sc) {
     sc.value = d.seats.length;
     sc.min = d.meta.minPlayers;
@@ -167,6 +175,7 @@ function onState(d) {
     sc.disabled = d.gameMode === "teams2v2";
   }
   if (document.activeElement !== gm && d.gameMode) gm.value = d.gameMode;
+  if (document.activeElement !== rtw && d.roundsToWin) rtw.value = String(d.roundsToWin);
   renderPlay(d, first);
   renderInspector(d);
   if (d.meta.hasUI) postToIframe();
@@ -325,6 +334,7 @@ $("reset").onclick = () => action({ kind: "reset" });
 $("reseed").onclick = () => action({ kind: "reset", reseed: true });
 $("seatcount").onchange = (e) => action({ kind: "seats", count: +e.target.value });
 $("gamemode").onchange = (e) => action({ kind: "mode", mode: e.target.value });
+$("roundstowin").onchange = (e) => action({ kind: "rounds", roundsToWin: +e.target.value });
 $("tabs").querySelectorAll(".insp-tab").forEach((b) => {
   b.onclick = () => {
     tab = b.dataset.tab;

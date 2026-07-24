@@ -716,8 +716,9 @@ test("map rotates after intermission", () => {
   assert.equal(m.G.players["p2"].health, 1000);
 });
 
-test("match ends after 3 round wins (best of 5)", () => {
+test("match ends after first-to-3 round wins", () => {
   let m = bootMatch( { players: ["p1", "p2"], seed: "match-end" });
+  assert.equal(m.G.roundsToWin, ROUNDS_TO_WIN);
 
   for (let i = 0; i < ROUNDS_TO_WIN; i++) {
     testUtils.killPlayer(m.G, "p2");
@@ -744,6 +745,87 @@ test("match ends after 3 round wins (best of 5)", () => {
   assert.ok(m.ended);
   assert.equal(m.result?.winner, "p1");
   assert.equal(m.G.scores["p1"], ROUNDS_TO_WIN);
+});
+
+test("roundsToWin config ends match at 4 round wins", () => {
+  let m = bootMatch({
+    players: ["p1", "p2"],
+    seed: "match-r4",
+    config: { roundsToWin: 4 },
+  });
+  assert.equal(m.G.roundsToWin, 4);
+
+  for (let i = 0; i < 4; i++) {
+    testUtils.killPlayer(m.G, "p2");
+    m = applyMove(game, m, {
+      type: "input",
+      playerId: "p1",
+      payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
+    }).state;
+    m = advanceTicks(m, 1);
+
+    if (m.ended) break;
+
+    while (m.G.roundPhase === "intermission") {
+      m = applyMove(game, m, {
+        type: "input",
+        playerId: "p1",
+        payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
+      }).state;
+      m = advanceTicks(m, 1);
+      if (m.ended) break;
+    }
+  }
+
+  assert.ok(m.ended);
+  assert.equal(m.result?.winner, "p1");
+  assert.equal(m.G.scores["p1"], 4);
+});
+
+test("round intermission uses shortened tick count", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "intermission-len" });
+  testUtils.killPlayer(m.G, "p2");
+  m = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
+  }).state;
+  m = advanceTicks(m, 1);
+  assert.equal(m.G.roundPhase, "intermission");
+  assert.equal(m.G.intermissionTicksLeft, 50);
+});
+
+test("incoming elevator spawns respect global caps", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "spawn-cap" });
+  m = advanceTicks(m, 6000);
+  const incoming = m.G.platforms.filter(
+    (p) => !p.broken && p.kind === "elevator" && p.ttlTicks != null,
+  );
+  const onScreen = m.G.platforms.filter(
+    (p) => !p.broken && p.x + p.w > 0 && p.x < 912,
+  );
+  assert.ok(incoming.length <= 7, `incoming=${incoming.length}`);
+  assert.ok(onScreen.length <= 10, `onScreen=${onScreen.length}`);
+});
+
+test("player cannot stand on platform from the side", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "oneway-side" });
+  m = advanceTicks(m, 30);
+  const plat = m.G.platforms.find((p) => p.kind === "static" && !p.broken);
+  assert.ok(plat, "expected static platform");
+
+  const halfH = 1.06 * 30;
+  m.G.players["p1"].torso.x = plat!.x + plat!.w * 0.35;
+  m.G.players["p1"].torso.y = plat!.y - halfH + 8;
+  m.G.players["p1"].vy = 0;
+  m.G.players["p1"].vx = 0;
+  m.G.players["p1"].onPlatformId = undefined;
+
+  m = advanceTicks(m, 25);
+  const p1 = m.G.players["p1"];
+  const feetY = p1.torso.y + halfH;
+  const onTop = Math.abs(feetY - plat!.y) <= 8 && p1.torso.y - halfH < plat!.y - 4;
+  assert.ok(!onTop || p1.vy > 0, "side/belly contact should not leave player riding platform top");
 });
 
 test("2v2 blocks friendly fire between teammates", () => {
@@ -840,7 +922,7 @@ test("dead player torso stops moving after kill", () => {
   const frozenX = m.G.players["p2"].torso.x;
   const frozenY = m.G.players["p2"].torso.y;
 
-  m = advanceTicks(m, 60);
+  m = advanceTicks(m, 30);
   assert.equal(m.G.players["p2"].torso.x, frozenX);
   assert.equal(m.G.players["p2"].torso.y, frozenY);
   assert.equal(testUtils.playerFixtureCount("p2"), 0);

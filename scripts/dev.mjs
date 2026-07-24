@@ -53,6 +53,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
   const clampSeats = (n) => Math.min(Math.max(n, def.minPlayers ?? 2), def.maxPlayers ?? Math.max(def.minPlayers ?? 2, n));
   let seatCount = clampSeats(meta.minPlayers || def.minPlayers || 2);
   let gameMode = "ffa";
+  let roundsToWin = 3;
   let seats = [];
   let state = null;
   let history = [];
@@ -90,7 +91,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
     state = createMatch(def, {
       players: seats.map((s) => s.id),
       seed: SEED,
-      config: { mode: gameMode },
+      config: { mode: gameMode, roundsToWin },
     });
     history = [];
     startTick();
@@ -136,6 +137,7 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
     type: "state",
     meta: { gameId: meta.gameId ?? def.name, displayName: meta.displayName ?? def.name, minPlayers: def.minPlayers, maxPlayers: def.maxPlayers, hasUI },
     gameMode,
+    roundsToWin,
     seats: seats.map((s) => ({ id: s.id, name: s.name, bot: s.bot })),
     names: Object.fromEntries(seats.map((s) => [s.id, s.name])),
     seed: SEED, auto, actor: actorSet(), history, ...seatView(seat),
@@ -166,6 +168,14 @@ export async function startDev(projectDir, { port = 5178 } = {}) {
         if (gameMode === "teams2v2") seatCount = 4;
         newMatch({});
         notice(`Mode: ${gameMode === "teams2v2" ? "2v2" : "FFA"}`);
+        broadcast();
+        return { ok: true };
+      }
+      case "rounds": {
+        const next = Math.max(3, Math.min(5, Number(body.roundsToWin) || 3));
+        roundsToWin = next;
+        newMatch({});
+        notice(`Rounds to win: ${roundsToWin}`);
         broadcast();
         return { ok: true };
       }

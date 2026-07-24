@@ -370,12 +370,18 @@ const getPlatformsForRender = (G) => {
 const localPlatformDisplay = new Map();
 const platformBreakAnims = new Map();
 
-const resolvePlatformLanding = (renderX, feetY, feetOff, platforms) => {
+const getPlayerBodyHalfH = (p) =>
+    p?.crouching ? FEET_OFF - STICK_CROUCH_DROP_PX / 2 : FEET_OFF;
+
+const resolvePlatformLanding = (renderX, feetY, feetOff, platforms, bodyHalfH = FEET_OFF) => {
+    const renderY = feetY - feetOff;
+    const playerTop = renderY - bodyHalfH;
     let best = null;
     let bestDist = PLATFORM_LAND_TOLERANCE + 1;
     for (const plat of platforms ?? []) {
         if (plat.broken) continue;
         if (renderX < plat.x - 4 || renderX > plat.x + plat.w + 4) continue;
+        if (playerTop > plat.y - 2) continue;
         const dist = feetY - plat.y;
         if (dist >= -2 && dist <= PLATFORM_LAND_TOLERANCE && dist < bestDist) {
             bestDist = dist;
@@ -2333,115 +2339,30 @@ const lerpRemotePlayerDisplay = (p, dtSec) => {
 };
 
 /**
- * Local player: apply input velocity every render frame, then softly reconcile
- * to the 30Hz server torso without hard snaps on small errors.
+ * Local player: instant input visuals only; position lerps to authoritative Box2D torso.
  */
 const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gameplayActive) => {
     if (!p.torso) return;
     if (p.renderX === undefined || p.renderY === undefined) {
         p.renderX = p.torso.x;
         p.renderY = p.torso.y;
-        p.predVy = p.vy ?? 0;
         return;
     }
 
-    if (!gameplayActive) {
-        const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
-        p.renderX = lerpToward(p.renderX, p.torso.x, t);
-        p.renderY = lerpToward(p.renderY, p.torso.y, t);
-        p.predVy = 0;
-        return;
+    if (gameplayActive) {
+        if (action === "left") p.facing = -1;
+        else if (action === "right") p.facing = 1;
     }
 
-    const feetOff = getPlayerFeetOff(p);
-    const speedMul = p.crouching && p.grounded ? 0.45 : 1;
-    let predVx = 0;
-    if (action === "left") predVx = -MOVE_SPEED_PX * speedMul;
-    else if (action === "right") predVx = MOVE_SPEED_PX * speedMul;
+    p.grounded = !!p.grounded;
+    p.airborne = !p.grounded;
+    if (p.crouching) p.grounded = true;
 
-    if (typeof p.predVy !== "number") p.predVy = p.vy ?? 0;
+    const rate = gameplayActive ? 25 : REMOTE_LERP_RATE;
+    const t = expLerpFactor(rate, dtSec);
 
-    const platforms = latestState?.G?.platforms;
-    const onSurface =
-        p.grounded ||
-        isOnPlatformSurface(p.renderX, p.renderY, feetOff, platforms) ||
-        p.renderY + feetOff >= FLOOR_Y - 2;
-
-    if (jumpPressed && onSurface && !p.crouching) {
-        p.predVy = JUMP_VY_PX;
-        p.grounded = false;
-        p.airborne = true;
-    }
-
-    p.renderX += predVx * dtSec;
-
-    if (!p.grounded || Math.abs(p.predVy) > 1) {
-        p.predVy += GRAVITY_PX * dtSec;
-        p.renderY += p.predVy * dtSec;
-        const feetY = p.renderY + feetOff;
-        if (feetY >= FLOOR_Y) {
-            p.renderY = FLOOR_Y - feetOff;
-            p.predVy = 0;
-            p.grounded = true;
-            p.airborne = false;
-        } else {
-            const land = resolvePlatformLanding(
-                p.renderX,
-                feetY,
-                feetOff,
-                latestState?.G?.platforms,
-            );
-            if (land && p.predVy >= 0) {
-                p.renderY = land.renderY;
-                p.predVy = 0;
-                p.grounded = true;
-                p.airborne = false;
-            } else {
-                p.grounded = false;
-                p.airborne = true;
-            }
-        }
-    } else {
-        p.predVy = 0;
-        const land = resolvePlatformLanding(
-            p.renderX,
-            p.renderY + feetOff,
-            feetOff,
-            platforms,
-        );
-        if (land) {
-            p.renderY = land.renderY;
-            p.grounded = true;
-            p.airborne = false;
-        } else if (p.renderY + feetOff >= FLOOR_Y - 2) {
-            p.grounded = true;
-            p.airborne = false;
-        }
-    }
-
-    p.vx = predVx;
-    p.vy = p.predVy;
-
-    // Soft reconcile toward authoritative server pose.
-    const errX = p.torso.x - p.renderX;
-    const errY = p.torso.y - p.renderY;
-    const errDist = Math.hypot(errX, errY);
-    if (errDist > LOCAL_SNAP_DIST) {
-        p.renderX = p.torso.x;
-        p.renderY = p.torso.y;
-        p.predVy = p.vy ?? 0;
-    } else {
-        const xRate = predVx !== 0 ? LOCAL_RECONCILE_RATE_MOVING : LOCAL_RECONCILE_RATE;
-        const reconcileX = !p.airborne || predVx !== 0 || Math.abs(errX) > 24;
-        if (reconcileX) {
-            p.renderX += errX * expLerpFactor(xRate, dtSec);
-        }
-        if (!p.crouching) {
-            p.renderY += errY * expLerpFactor(LOCAL_RECONCILE_RATE, dtSec);
-        }
-    }
-
-    p.renderX = Math.max(PLAYER_HALF_W_PX, Math.min(ARENA_W - PLAYER_HALF_W_PX, p.renderX));
+    p.renderX = lerpToward(p.renderX, p.torso.x, t);
+    p.renderY = lerpToward(p.renderY, p.torso.y, t);
 };
 
 
@@ -3914,7 +3835,8 @@ app.ticker.add(() => {
             const roundInfo = document.getElementById('round-info');
             if (roundInfo && G) {
                 const mapName = MAPS[G.currentMapId]?.displayName ?? G.currentMapId;
-                roundInfo.innerHTML = `Round ${G.currentRound} — Best of 5<br/><span style="font-size:11px;color:#ccc;">${mapName}</span>`;
+                const target = G.roundsToWin ?? 3;
+                roundInfo.innerHTML = `Round ${G.currentRound} — First to ${target}<br/><span style="font-size:11px;color:#ccc;">${mapName}</span>`;
             }
             
             const turnInfo = document.getElementById('turn-info');
@@ -3930,10 +3852,11 @@ app.ticker.add(() => {
 
             if (G && G.scores) {
                 let scoreHtml = '';
+                const target = G.roundsToWin ?? 3;
                 if (G.gameMode === 'teams2v2') {
-                    scoreHtml = `Best of 5 (teams):<br/><span style="color:#6699ff">Team A: ${G.scores['0'] ?? 0}</span> | <span style="color:#ff8866">Team B: ${G.scores['1'] ?? 0}</span>`;
+                    scoreHtml = `First to ${target} (teams):<br/><span style="color:#6699ff">Team A: ${G.scores['0'] ?? 0}</span> | <span style="color:#ff8866">Team B: ${G.scores['1'] ?? 0}</span>`;
                 } else {
-                    scoreHtml = 'Best of 5:<br/>';
+                    scoreHtml = `First to ${target}:<br/>`;
                     for (const [pid, score] of Object.entries(G.scores)) {
                         const name = (latestState.names && latestState.names[pid]) || pid;
                         const color = pid === latestState.playerId ? '#ffffaa' : '#dddddd';

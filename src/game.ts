@@ -154,6 +154,7 @@ export type TeamId = 0 | 1;
 
 export interface GameConfig {
   mode?: GameMode;
+  roundsToWin?: number;
 }
 
 export interface PlayerInput {
@@ -180,6 +181,7 @@ export interface PlayerState {
   grounded: boolean;
   wallJumpUsed: boolean;
   jumpGrace: number;
+  onPlatformId?: number;
   team?: TeamId;
   input?: PlayerInput;
 }
@@ -269,10 +271,11 @@ export interface ShooterState {
   intermissionTicksLeft: number;
   lastRoundWinner: string | null;
   matchPhase: MatchPhase;
+  roundsToWin: number;
 }
 
 export const ROUNDS_TO_WIN = 3;
-const INTERMISSION_TICKS = 120;
+const INTERMISSION_TICKS = 50;
 const FLOOR_Y = ARENA_H;
 const FLOOR_PICKUP_Y = FLOOR_Y - 20;
 const PICKUP_FALL_SPEED = 8;
@@ -319,6 +322,10 @@ const CRATE_H = 36;
 const SPAWN_INTERVAL_TICKS = 480;
 const SPAWN_DELAY_TICKS = 60;
 const ELEVATOR_TTL_TICKS = 1800;
+const MAX_PLATFORMS_ON_SCREEN = 10;
+const MAX_INCOMING_ELEVATORS = 7;
+const MAX_ELEVATORS_PER_Y_BAND = 2;
+const Y_BAND_TOLERANCE_PX = 22;
 /** Max vertical jump height from JUMP_VY / GRAVITY (~178px). */
 const MAX_JUMP_HEIGHT = (JUMP_VY * JUMP_VY) / (2 * GRAVITY);
 /** Max horizontal travel during a full jump arc (~313px). */
@@ -335,7 +342,7 @@ const STICK_ARM_LEN_PX = 28;
 const STICK_CROUCH_DROP_PX = 22;
 const PLAYER_CROUCH_H = PLAYER_H - STICK_CROUCH_DROP_PX;
 /** Narrower playable platforms (map defs scaled at init). */
-const PLATFORM_WIDTH_MUL = 0.78;
+const PLATFORM_WIDTH_MUL = 0.68;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
 
@@ -671,6 +678,12 @@ function parseGameConfig(config?: Json): GameMode {
   return mode === "teams2v2" ? "teams2v2" : "ffa";
 }
 
+function parseRoundsToWin(config?: Json): number {
+  const raw = (config as GameConfig | undefined)?.roundsToWin;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return ROUNDS_TO_WIN;
+  return Math.max(3, Math.min(5, Math.round(raw)));
+}
+
 function initScores(playerIds: string[], gameMode: GameMode): Record<string, number> {
   if (gameMode === "teams2v2") {
     return { "0": 0, "1": 0 };
@@ -723,7 +736,7 @@ function checkRoundEnd(G: ShooterState) {
   G.scores[winner] = (G.scores[winner] ?? 0) + 1;
   G.lastRoundWinner = winner;
 
-  if ((G.scores[winner] ?? 0) >= ROUNDS_TO_WIN) {
+  if ((G.scores[winner] ?? 0) >= G.roundsToWin) {
     G.roundPhase = "intermission";
     G.intermissionTicksLeft = 0;
     return;
@@ -744,20 +757,20 @@ function startNextRound(G: ShooterState) {
 
 function buildMatchResult(G: ShooterState): GameResult | void {
   const maxScore = Math.max(...Object.values(G.scores).map((s) => Number(s)));
-  if (maxScore < ROUNDS_TO_WIN) return;
+  if (maxScore < G.roundsToWin) return;
 
   if (G.gameMode === "ffa") {
-    const winner = Object.entries(G.scores).find(([, s]) => s >= ROUNDS_TO_WIN)?.[0];
+    const winner = Object.entries(G.scores).find(([, s]) => s >= G.roundsToWin)?.[0];
     if (!winner) return;
-    return { winner, scores: G.scores, reason: "best-of-5" };
+    return { winner, scores: G.scores, reason: `first-to-${G.roundsToWin}` };
   }
 
-  const winningTeam = Object.entries(G.scores).find(([, s]) => s >= ROUNDS_TO_WIN)?.[0];
+  const winningTeam = Object.entries(G.scores).find(([, s]) => s >= G.roundsToWin)?.[0];
   if (winningTeam == null) return;
   const winners = Object.entries(G.teams)
     .filter(([, team]) => String(team) === winningTeam)
     .map(([id]) => id);
-  return { winners, scores: G.scores, reason: "best-of-5" };
+  return { winners, scores: G.scores, reason: `first-to-${G.roundsToWin}` };
 }
 
 function isPlayerAlive(G: ShooterState, id: string): boolean {
@@ -1115,9 +1128,19 @@ function handlePlayerPlatformPreSolve(
   const upNormal = playerIsA ? wm.normal.y : -wm.normal.y;
   const feetY = getFeetY(p);
   const platTop = plat.y;
+  const h = playerBodyHeight(p);
+  const playerTop = p.torso.y - h / 2;
 
-  if (feetY <= platTop + 10 && upNormal >= 0.35) return;
-  if (Math.abs(feetY - platTop) <= 14) return;
+  if (playerTop > platTop - 2) {
+    contact.setEnabled(false);
+    return;
+  }
+
+  const ridingThis = p.onPlatformId === plat.id;
+  const landingFromAbove =
+    feetY <= platTop + 6 && (p.vy > 0 || ridingThis) && upNormal >= 0.45;
+
+  if (landingFromAbove) return;
 
   contact.setEnabled(false);
 }
@@ -1131,30 +1154,106 @@ function resolvePlayerPlatformSideOverlap(
   const h = playerBodyHeight(p);
   const top = p.torso.y - h / 2;
   const bottom = getFeetY(p);
-  let nx = p.torso.x;
   let changed = false;
 
   for (const plat of G.platforms) {
     if (plat.broken) continue;
     const platTop = plat.y;
-    if (bottom <= platTop + 2) continue;
-    if (top >= plat.y + plat.h + 4) continue;
+    const platBottom = plat.y + plat.h;
+    if (top >= platBottom + 4) continue;
+    if (bottom <= platTop + 2 && top < platTop - 4) continue;
+
     const overlapsX =
-      nx + halfW > plat.x + 2 && nx - halfW < plat.x + plat.w - 2;
+      p.torso.x + halfW > plat.x + 2 && p.torso.x - halfW < plat.x + plat.w - 2;
     if (!overlapsX) continue;
-    if (Math.abs(bottom - platTop) <= 12) continue;
-    if (nx < plat.x + plat.w / 2) nx = plat.x - halfW - 1;
-    else nx = plat.x + plat.w + halfW + 1;
+
+    const onTop = Math.abs(bottom - platTop) <= 8 && top < platTop - 4;
+    if (onTop && p.onPlatformId === plat.id) continue;
+
+    p.onPlatformId = undefined;
+    if (p.vy <= 0) {
+      p.vy = Math.max(p.vy, 3 * SCALE);
+    }
     changed = true;
   }
 
   if (!changed) return;
-  p.torso.x = nx;
   syncHeadFromTorso(p);
   syncPlayerBodyTransform(p, b);
   const vel = b.getLinearVelocity();
-  b.setLinearVelocity(planck.Vec2(0, vel.y));
-  p.vx = 0;
+  b.setLinearVelocity(planck.Vec2(vel.x, Math.max(vel.y, p.vy / SCALE)));
+}
+
+function syncPlayerOnPlatformId(G: ShooterState, p: PlayerState) {
+  if (!p.grounded) {
+    p.onPlatformId = undefined;
+    return;
+  }
+  const feetY = getFeetY(p);
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    if (isEntityOnPlatform(p.torso.x, feetY, plat, 10)) {
+      p.onPlatformId = plat.id;
+      return;
+    }
+  }
+  p.onPlatformId = undefined;
+}
+
+function countPlatformsOnScreen(G: ShooterState): number {
+  return G.platforms.filter(
+    (p) => !p.broken && p.x + p.w > 0 && p.x < ARENA_W,
+  ).length;
+}
+
+function countIncomingElevators(G: ShooterState): number {
+  return G.platforms.filter(
+    (p) => !p.broken && p.kind === "elevator" && p.ttlTicks != null,
+  ).length;
+}
+
+function countElevatorsAtY(G: ShooterState, y: number): number {
+  return G.platforms.filter(
+    (p) =>
+      !p.broken &&
+      p.kind === "elevator" &&
+      Math.abs(p.y - y) <= Y_BAND_TOLERANCE_PX,
+  ).length;
+}
+
+function platformsOverlapAabb(a: PlatformState, b: PlatformState): boolean {
+  if (Math.abs(a.y - b.y) > Y_BAND_TOLERANCE_PX) return false;
+  return a.x < b.x + b.w && a.x + a.w > b.x;
+}
+
+function canSpawnIncomingElevator(G: ShooterState): boolean {
+  return (
+    countPlatformsOnScreen(G) < MAX_PLATFORMS_ON_SCREEN &&
+    countIncomingElevators(G) < MAX_INCOMING_ELEVATORS
+  );
+}
+
+function pickSpawnY(G: ShooterState, yChoices: number[], random: RandomAPI): number | null {
+  if (!yChoices.length) return 273;
+
+  const tiers = yChoices
+    .map((y, index) => ({
+      y,
+      index,
+      count: countElevatorsAtY(G, y),
+    }))
+    .filter((t) => t.count < MAX_ELEVATORS_PER_Y_BAND);
+
+  if (!tiers.length) return null;
+
+  tiers.sort((a, b) => {
+    if (a.count !== b.count) return a.count - b.count;
+    return b.index - a.index;
+  });
+
+  const bestCount = tiers[0].count;
+  const candidates = tiers.filter((t) => t.count === bestCount);
+  return random.pick(candidates).y;
 }
 
 function isPlayerOnPlatform(G: ShooterState, playerId: string, plat: PlatformState): boolean {
@@ -1187,33 +1286,64 @@ function applyPlatformRiderDelta(G: ShooterState, plat: PlatformState, dx: numbe
 function advancePlatformMotion(G: ShooterState, random: RandomAPI) {
   const dt = PHYSICS_DT;
   const expiredIds: number[] = [];
+  const movers = G.platforms
+    .filter((p) => !p.broken && p.kind === "elevator" && p.vx != null)
+    .sort((a, b) => a.id - b.id);
 
-  for (const plat of G.platforms) {
-    if (plat.broken || plat.kind !== "elevator" || plat.vx == null) continue;
-
+  for (const plat of movers) {
     const prevX = plat.x;
-    let newX = plat.x + plat.vx * dt;
+    let newX = plat.x + plat.vx! * dt;
 
     if (plat.minX != null && newX < plat.minX) {
       newX = plat.minX;
-      plat.vx = Math.abs(plat.vx);
+      plat.vx = Math.abs(plat.vx!);
     }
     if (plat.maxX != null && newX > plat.maxX) {
       newX = plat.maxX;
-      plat.vx = -Math.abs(plat.vx);
+      plat.vx = -Math.abs(plat.vx!);
+    }
+
+    plat.x = newX;
+
+    for (const other of movers) {
+      if (other.id === plat.id) continue;
+      const probe = { ...plat, x: newX };
+      if (!platformsOverlapAabb(probe, other)) continue;
+      plat.vx = plat.vx! > 0 ? -Math.abs(plat.vx!) : Math.abs(plat.vx!);
+      newX = plat.x;
+      if (plat.vx! > 0 && newX + plat.w >= other.x) {
+        newX = other.x - plat.w - 1;
+      } else if (plat.vx! < 0 && newX <= other.x + other.w) {
+        newX = other.x + other.w + 1;
+      }
+      plat.x = newX;
+      other.vx = other.vx! > 0 ? -Math.abs(other.vx!) : Math.abs(other.vx!);
+      break;
     }
 
     if (plat.ttlTicks != null) {
       plat.ttlTicks -= 1;
-      if (plat.ttlTicks <= 0 || newX < -200 || newX > ARENA_W + 200) {
+      if (plat.ttlTicks <= 0 || plat.x < -200 || plat.x > ARENA_W + 200) {
         expiredIds.push(plat.id);
         continue;
       }
     }
 
-    const dx = newX - prevX;
-    plat.x = newX;
+    const dx = plat.x - prevX;
     applyPlatformRiderDelta(G, plat, dx);
+
+    const body = bodyMap.get("platform_" + plat.id);
+    if (platformIntersectsArena(plat)) {
+      if (!body) createPlatformBody(plat);
+      const b = bodyMap.get("platform_" + plat.id);
+      if (b) {
+        b.setTransform(
+          planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE),
+          0,
+        );
+        b.setLinearVelocity(planck.Vec2(plat.vx! / SCALE, 0));
+      }
+    }
   }
 
   for (const id of expiredIds) {
@@ -1716,6 +1846,9 @@ function spawnJumpableElevator(
 }
 
 function spawnReplacementElevator(G: ShooterState, random: RandomAPI, y: number, w: number) {
+  if (!canSpawnIncomingElevator(G)) return;
+  if (countElevatorsAtY(G, y) >= MAX_ELEVATORS_PER_Y_BAND) return;
+
   const fromLeft = random.bool();
   const platW = w || Math.round(100 * PLATFORM_WIDTH_MUL);
   const x = fromLeft ? -platW - 40 : ARENA_W + 40;
@@ -1753,10 +1886,13 @@ function processPendingReplacementSpawns(G: ShooterState, random: RandomAPI) {
 }
 
 function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
-  const fromLeft = random.bool();
+  if (!canSpawnIncomingElevator(G)) return;
+
   const mapDef = getMap(G.currentMapId);
-  const yChoices = mapDef.elevatorYLevels;
-  const y = yChoices.length ? random.pick(yChoices) : 273;
+  const y = pickSpawnY(G, mapDef.elevatorYLevels, random);
+  if (y == null) return;
+
+  const fromLeft = random.bool();
   const id = G.nextPlatformId++;
   const w = Math.round(100 * PLATFORM_WIDTH_MUL);
   const x = fromLeft ? -140 : ARENA_W + 40;
@@ -2036,6 +2172,8 @@ function advanceWorld(G: ShooterState, random: RandomAPI) {
         p.vx = v.x * SCALE;
         p.vy = v.y * SCALE;
         syncHeadFromTorso(p);
+        p.grounded = isPlayerGroundedPlanck(p, b, G);
+        syncPlayerOnPlatformId(G, p);
       }
     }
 
@@ -2067,45 +2205,7 @@ function advanceWorld(G: ShooterState, random: RandomAPI) {
       }
     }
 
-    for (const plat of G.platforms) {
-      if (plat.broken || plat.kind !== "elevator" || plat.vx == null) continue;
-
-      const b = bodyMap.get("platform_" + plat.id);
-      if (!b) {
-        const prevX = plat.x;
-        let newX = plat.x + plat.vx * (1 / 30);
-        if (plat.minX != null && newX < plat.minX) {
-          newX = plat.minX;
-          plat.vx = Math.abs(plat.vx);
-        }
-        if (plat.maxX != null && newX > plat.maxX) {
-          newX = plat.maxX;
-          plat.vx = -Math.abs(plat.vx);
-        }
-        plat.x = newX;
-        applyPlatformRiderDelta(G, plat, newX - prevX);
-        if (platformIntersectsArena(plat)) {
-          createPlatformBody(plat);
-        }
-        continue;
-      }
-
-      const pos = b.getPosition();
-      plat.x = pos.x * SCALE - plat.w / 2;
-
-      if (plat.minX != null && plat.x < plat.minX) {
-        plat.x = plat.minX;
-        plat.vx = Math.abs(plat.vx);
-        b.setTransform(planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE), 0);
-        b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-      }
-      if (plat.maxX != null && plat.x > plat.maxX) {
-        plat.x = plat.maxX;
-        plat.vx = -Math.abs(plat.vx);
-        b.setTransform(planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE), 0);
-        b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-      }
-    }
+    advancePlatformMotion(G, random);
 
     processExplosions(G);
     processPendingHits(G, random);
@@ -2326,6 +2426,7 @@ export default defineGame<ShooterState>({
       intermissionTicksLeft: 0,
       lastRoundWinner: null,
       matchPhase: "active",
+      roundsToWin: parseRoundsToWin(ctx.config),
     };
     initPlatforms(G);
     setCurrentG(G);
