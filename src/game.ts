@@ -385,21 +385,7 @@ function ensureWorld(G: ShooterState) {
 
   for (const plat of G.platforms) {
     if (plat.broken) continue;
-    const isElevator = plat.kind === "elevator";
-    // plat.y is the top surface (Y-down); center the box below it.
-    const b = world.createBody({
-      type: isElevator ? "kinematic" : "static",
-      position: planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE),
-      userData: { type: "platform", id: plat.id }
-    });
-    b.createFixture(planck.Box(plat.w / 2 / SCALE, plat.h / 2 / SCALE), {
-      friction: 0.0,
-      restitution: 0.0
-    });
-    if (isElevator && plat.vx != null) {
-      b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-    }
-    bodyMap.set("platform_" + plat.id, b);
+    createPlatformBody(plat);
   }
 
   for (const crate of G.crates) {
@@ -441,6 +427,12 @@ function ensureWorld(G: ShooterState) {
       contact.setEnabled(false);
     }
     if (uA?.type === "bullet" && uB?.type === "bullet") {
+      contact.setEnabled(false);
+    }
+    if (uA?.type === "bullet" && currentG && !currentG.bullets.some((b) => b.id === uA.id)) {
+      contact.setEnabled(false);
+    }
+    if (uB?.type === "bullet" && currentG && !currentG.bullets.some((b) => b.id === uB.id)) {
       contact.setEnabled(false);
     }
   });
@@ -488,7 +480,7 @@ function ensureWorld(G: ShooterState) {
                 contactPx,
               );
               
-              const headPoint = isHeadshot ? headHitPointPx(G, otherU.id) : null;
+              const headPoint = isHeadshot ? headHitPointPx(currentG, otherU.id) : null;
               pendingHits.push({
                 x: headPoint?.x ?? bulletState.body.x,
                 y: headPoint?.y ?? bulletState.body.y,
@@ -496,6 +488,7 @@ function ensureWorld(G: ShooterState) {
                 damage,
                 isHeadshot,
               });
+              destroyBullet(currentG, bulletState.id);
            }
         }
       }
@@ -803,6 +796,7 @@ function breakPlatform(G: ShooterState, id: number, random?: RandomAPI) {
     damage: 0,
   });
 
+  destroyPlatformBody(id);
   G.platforms.splice(idx, 1);
 
   if (random) {
@@ -844,6 +838,41 @@ function removePickup(G: ShooterState, id: number) {
   if (idx >= 0) G.pickups.splice(idx, 1);
 }
 
+function platformIntersectsArena(plat: PlatformState): boolean {
+  return plat.x + plat.w > 0 && plat.x < ARENA_W && plat.y + plat.h > 0 && plat.y < ARENA_H;
+}
+
+function createPlatformBody(plat: PlatformState) {
+  if (!world || plat.broken) return;
+  const key = "platform_" + plat.id;
+  if (bodyMap.has(key)) return;
+  if (!platformIntersectsArena(plat)) return;
+
+  const isElevator = plat.kind === "elevator";
+  const b = world.createBody({
+    type: isElevator ? "kinematic" : "static",
+    position: planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE),
+    userData: { type: "platform", id: plat.id },
+  });
+  b.createFixture(planck.Box(plat.w / 2 / SCALE, plat.h / 2 / SCALE), {
+    friction: 0.0,
+    restitution: 0.0,
+  });
+  if (isElevator && plat.vx != null) {
+    b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
+  }
+  bodyMap.set(key, b);
+}
+
+function destroyPlatformBody(id: number) {
+  const key = "platform_" + id;
+  const body = bodyMap.get(key);
+  if (body && world) {
+    world.destroyBody(body);
+    bodyMap.delete(key);
+  }
+}
+
 function destroyBullet(G: ShooterState, bulletId: number) {
   const key = "bullet_" + bulletId;
   const body = bodyMap.get(key);
@@ -851,6 +880,7 @@ function destroyBullet(G: ShooterState, bulletId: number) {
     world.destroyBody(body);
     bodyMap.delete(key);
   }
+  pendingBulletDestroys.delete(bulletId);
   const idx = G.bullets.findIndex((b) => b.id === bulletId);
   if (idx >= 0) G.bullets.splice(idx, 1);
 }
@@ -1409,8 +1439,8 @@ function spawnJumpableElevator(
   const travel = 50 + random.float() * 110;
   let minX = x - travel * 0.5;
   let maxX = x + travel * 0.5;
-  minX = Math.max(-40, Math.min(minX, ARENA_W - w - 40));
-  maxX = Math.max(minX + 40, Math.min(ARENA_W - w + 40, maxX));
+  minX = Math.max(0, Math.min(minX, ARENA_W - w));
+  maxX = Math.max(minX + 40, Math.min(ARENA_W - w, maxX));
 
   // Keep at least one travel position within jump reach of the anchor.
   if (anchor) {
@@ -1422,8 +1452,8 @@ function spawnJumpableElevator(
         Math.min(ARENA_W - w - 16, anchor.x + (random.bool() ? -maxW * 0.5 : maxW * 0.5)),
       );
       x = targetX;
-      minX = Math.max(-40, x - travel * 0.5);
-      maxX = Math.min(ARENA_W - w + 40, x + travel * 0.5);
+      minX = Math.max(0, x - travel * 0.5);
+      maxX = Math.min(ARENA_W - w, x + travel * 0.5);
       if (maxX - minX < 40) {
         minX = Math.max(0, x - 40);
         maxX = Math.min(ARENA_W - w, x + 40);
@@ -1448,6 +1478,7 @@ function spawnJumpableElevator(
     ttlTicks: ELEVATOR_TTL_TICKS,
   };
   G.platforms.push(plat);
+  createPlatformBody(plat);
 }
 
 function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
@@ -1471,8 +1502,8 @@ function spawnIncomingElevator(G: ShooterState, random: RandomAPI) {
     broken: false,
     kind: "elevator",
     vx,
-    minX: fromLeft ? -160 : ARENA_W - 260,
-    maxX: fromLeft ? ARENA_W - 260 : ARENA_W + 160,
+    minX: 0,
+    maxX: ARENA_W - w,
     ttlTicks: ELEVATOR_TTL_TICKS,
   };
 
@@ -1679,7 +1710,7 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
   } else if (data.action === "right") {
     vx = MOVE_SPEED * speedMul;
   } else {
-    if (grounded) vx = 0;
+    vx = 0;
   }
 
   if (data.jumping) {
@@ -1755,23 +1786,42 @@ function advanceWorld(G: ShooterState, random: RandomAPI) {
     }
 
     for (const plat of G.platforms) {
-      if (plat.kind === "elevator") {
-        const b = bodyMap.get("platform_" + plat.id);
-        if (b) {
-          const pos = b.getPosition();
-          plat.x = pos.x * SCALE - plat.w / 2;
-          
-          if (plat.minX != null && plat.x < plat.minX) {
-            plat.x = plat.minX;
-            plat.vx = Math.abs(plat.vx!);
-            b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-          }
-          if (plat.maxX != null && plat.x > plat.maxX) {
-            plat.x = plat.maxX;
-            plat.vx = -Math.abs(plat.vx!);
-            b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-          }
+      if (plat.broken || plat.kind !== "elevator" || plat.vx == null) continue;
+
+      const b = bodyMap.get("platform_" + plat.id);
+      if (!b) {
+        const prevX = plat.x;
+        let newX = plat.x + plat.vx * (1 / 30);
+        if (plat.minX != null && newX < plat.minX) {
+          newX = plat.minX;
+          plat.vx = Math.abs(plat.vx);
         }
+        if (plat.maxX != null && newX > plat.maxX) {
+          newX = plat.maxX;
+          plat.vx = -Math.abs(plat.vx);
+        }
+        plat.x = newX;
+        applyPlatformRiderDelta(G, plat, newX - prevX);
+        if (platformIntersectsArena(plat)) {
+          createPlatformBody(plat);
+        }
+        continue;
+      }
+
+      const pos = b.getPosition();
+      plat.x = pos.x * SCALE - plat.w / 2;
+
+      if (plat.minX != null && plat.x < plat.minX) {
+        plat.x = plat.minX;
+        plat.vx = Math.abs(plat.vx);
+        b.setTransform(planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE), 0);
+        b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
+      }
+      if (plat.maxX != null && plat.x > plat.maxX) {
+        plat.x = plat.maxX;
+        plat.vx = -Math.abs(plat.vx);
+        b.setTransform(planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE), 0);
+        b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
       }
     }
 

@@ -77,6 +77,64 @@ test("jump updates player position upwards", () => {
   assert.ok(m.G.players["p1"].torso.y < startY - 10, `Player should have moved up after jump tick. Start Y: ${startY}, End Y: ${m.G.players["p1"].torso.y}`);
 });
 
+test("releasing horizontal input zeros vx in air", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "air-stop" });
+  m = advanceTicks(m, 40);
+
+  let r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, jumping: true, aimAngle: 0, crouching: false, shooting: false },
+  });
+  assertMoveOk(r);
+  m = advanceTicks(r.state, 4);
+
+  r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: "right", aimAngle: 0, crouching: false, shooting: false },
+  });
+  assertMoveOk(r);
+  m = advanceTicks(r.state, 2);
+  assert.ok(Math.abs(m.G.players["p1"].vx) > 0, "player should move horizontally in air while holding right");
+
+  r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
+  });
+  assertMoveOk(r);
+  m = advanceTicks(r.state, 1);
+  assert.equal(m.G.players["p1"].vx, 0, "horizontal velocity should stop immediately when input released in air");
+});
+
+test("player falls after platform beneath them breaks", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "plat-fall-body" });
+  const plat = m.G.platforms.find((p) => p.id === 0 && p.kind === "static");
+  assert.ok(plat, "expected static test platform");
+
+  const halfH = 1.06 * 30;
+  m.G.players["p1"].torso.x = plat!.x + plat!.w / 2;
+  m.G.players["p1"].torso.y = plat!.y - halfH;
+
+  let r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, crouching: false, shooting: false },
+  });
+  assertMoveOk(r);
+  m = advanceTicks(r.state, 12);
+  const yBefore = m.G.players["p1"].torso.y;
+
+  testUtils.breakPlatform(m.G, plat!.id);
+  m = advanceTicks(m, 25);
+
+  assert.ok(
+    m.G.players["p1"].torso.y > yBefore + 2 || m.G.players["p1"].vy > 1,
+    "player should fall once platform collision is removed",
+  );
+});
+
 test("shoot spawns a bullet for winchester", () => {
   let m = bootMatch({ players: ["p1", "p2"], seed: "t3" });
 

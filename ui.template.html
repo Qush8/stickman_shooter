@@ -101,6 +101,23 @@
       width: 100%;
       transition: width 0.1s;
     }
+    #fullscreen-btn {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      pointer-events: auto;
+      cursor: pointer;
+      background: rgba(0, 0, 0, 0.55);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      text-shadow: 1px 1px 2px black;
+    }
+    #fullscreen-btn:hover {
+      background: rgba(30, 30, 30, 0.85);
+    }
   </style>
 </head>
 <body>
@@ -113,7 +130,8 @@
       <div id="turn-info" style="color: #55ff55;"></div>
       <div id="scores-info" style="margin-top: 10px; color: #aaffaa;"></div>
     </div>
-    <div id="weapon-info" style="position:absolute;top:20px;right:20px;text-align:right;font-size:12px;text-shadow:1px 1px 2px black;"></div>
+    <div id="weapon-info" style="position:absolute;top:52px;right:20px;text-align:right;font-size:12px;text-shadow:1px 1px 2px black;"></div>
+    <button id="fullscreen-btn" type="button" aria-label="Toggle fullscreen">Fullscreen</button>
     <div id="hud-round-end"></div>
     <div id="hud-game-over"></div>
     <div id="labels-container"></div>

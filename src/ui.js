@@ -12,6 +12,7 @@ const SCALE = 30;
 const FEET_OFF = 1.06 * SCALE; // 31.8 — visual feet sit on bottom of physics AABB
 /** Must match game.ts STICK_CROUCH_DROP_PX so crouch feet stay on the box bottom. */
 const STICK_CROUCH_DROP_PX = 46;
+const VISUAL_CROUCH_DROP = 26;
 const CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
 /** Match game.ts movement constants (pixels / second). */
 const MOVE_SPEED_PX = 15 * SCALE;
@@ -347,25 +348,6 @@ const getPlatformsForRender = (G) => {
     return [];
 };
 
-const mixRgb = (from, to, t) => {
-    const clamp = Math.max(0, Math.min(1, t));
-    const r1 = (from >> 16) & 255;
-    const g1 = (from >> 8) & 255;
-    const b1 = from & 255;
-    const r2 = (to >> 16) & 255;
-    const g2 = (to >> 8) & 255;
-    const b2 = to & 255;
-    const r = Math.round(r1 + (r2 - r1) * clamp);
-    const g = Math.round(g1 + (g2 - g1) * clamp);
-    const b = Math.round(b1 + (b2 - b1) * clamp);
-    return (r << 16) | (g << 8) | b;
-};
-
-const platformFillForHp = (baseColor, hpRatio) => {
-    const dim = mixRgb(baseColor, 0x0d1218, 0.78);
-    return mixRgb(dim, baseColor, hpRatio);
-};
-
 /** Display-only platform positions (lerp toward server; never used for sync/input). */
 const localPlatformDisplay = new Map();
 
@@ -411,29 +393,40 @@ const drawPlatforms = (platforms, dtSec = 1 / 60) => {
         const drawX = display.renderX;
         const drawY = display.renderY;
 
+        if (drawX + plat.w <= 0 || drawX >= ARENA_W) continue;
+
+        const clipLeft = Math.max(0, drawX);
+        const clipRight = Math.min(ARENA_W, drawX + plat.w);
+        const visibleW = clipRight - clipLeft;
+        if (visibleW <= 0) continue;
+
         const g = new Graphics();
         const inset = PLATFORM_BORDER;
         const hpRatio = Math.max(0, Math.min(1, plat.health / (plat.maxHealth || 500)));
         const innerW = Math.max(0, plat.w - inset * 2);
         const innerH = Math.max(1, plat.h - inset * 2);
+        const fillW = innerW * hpRatio;
         const isElevator = plat.kind === "elevator";
         const shellColor = isElevator ? 0x1a3355 : 0x24384f;
         const baseFill = isElevator ? 0x44aaff : 0x3ecf6e;
         const baseBorder = isElevator ? 0x88ccff : 0xf0f6ff;
-        const fillColor = platformFillForHp(baseFill, hpRatio);
-        const fillAlpha = 0.22 + hpRatio * 0.78;
-        const borderAlpha = 0.35 + hpRatio * 0.65;
 
         g.beginFill(shellColor, 0.95);
-        g.drawRect(drawX, drawY, plat.w, plat.h);
+        g.drawRect(clipLeft, drawY, visibleW, plat.h);
         g.endFill();
 
-        g.beginFill(fillColor, fillAlpha);
-        g.drawRect(drawX + inset, drawY + inset, innerW, innerH);
-        g.endFill();
+        const innerLeft = drawX + inset;
+        const innerRight = drawX + inset + fillW;
+        const fillClipLeft = Math.max(clipLeft, innerLeft);
+        const fillClipRight = Math.min(clipRight, innerRight);
+        if (fillClipRight > fillClipLeft) {
+            g.beginFill(baseFill, 1);
+            g.drawRect(fillClipLeft, drawY + inset, fillClipRight - fillClipLeft, innerH);
+            g.endFill();
+        }
 
-        g.lineStyle(2, baseBorder, borderAlpha, 0.5, true);
-        g.drawRect(drawX, drawY, plat.w, plat.h);
+        g.lineStyle(2, baseBorder, 0.95, 0.5, true);
+        g.drawRect(clipLeft, drawY, visibleW, plat.h);
 
         platformsContainer.addChild(g);
     }
@@ -734,6 +727,47 @@ const fitUntilStable = () => {
     if (fitFrames++ < 8) requestAnimationFrame(fitUntilStable);
 };
 fitUntilStable();
+
+const fullscreenBtn = document.getElementById('fullscreen-btn');
+const getFullscreenElement = () =>
+    document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
+
+const updateFullscreenButton = () => {
+    if (!fullscreenBtn) return;
+    fullscreenBtn.textContent = getFullscreenElement() ? 'Exit Fullscreen' : 'Fullscreen';
+};
+
+const toggleFullscreen = async () => {
+    try {
+        if (getFullscreenElement()) {
+            if (document.exitFullscreen) await document.exitFullscreen();
+            else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
+            return;
+        }
+        const el = document.documentElement;
+        if (el.requestFullscreen) await el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
+        else console.warn('Fullscreen API not available');
+    } catch (err) {
+        console.warn('Fullscreen toggle failed:', err);
+    } finally {
+        updateFullscreenButton();
+        fitCanvas();
+    }
+};
+
+if (fullscreenBtn) {
+    fullscreenBtn.addEventListener('click', toggleFullscreen);
+}
+document.addEventListener('fullscreenchange', () => {
+    updateFullscreenButton();
+    fitCanvas();
+});
+document.addEventListener('webkitfullscreenchange', () => {
+    updateFullscreenButton();
+    fitCanvas();
+});
+updateFullscreenButton();
 
 // --- Procedural SFX (Web Audio API, no external files) ---
 const Sfx = (() => {
@@ -1475,6 +1509,17 @@ const handleGameState = (state) => {
         if (G && G.hitEvents) {
             for (const hit of G.hitEvents) {
                 if (hit.damage > 0) {
+                    if (hit.targetId) {
+                        for (const [bulletId, lb] of [...localBullets.entries()]) {
+                            if (!lb.body) continue;
+                            if (Math.hypot(lb.body.x - hit.x, lb.body.y - hit.y) > 48) continue;
+                            if (lb.g) {
+                                bulletsContainer.removeChild(lb.g);
+                                lb.g.destroy();
+                            }
+                            localBullets.delete(bulletId);
+                        }
+                    }
                     const targetPlayer = localPlayers[hit.targetId];
                     const hitX = hit.isHeadshot && targetPlayer?.renderX !== undefined
                         ? targetPlayer.renderX
@@ -2108,7 +2153,10 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
         p.predVy = p.vy ?? 0;
     } else {
         const xRate = predVx !== 0 ? LOCAL_RECONCILE_RATE_MOVING : LOCAL_RECONCILE_RATE;
-        p.renderX += errX * expLerpFactor(xRate, dtSec);
+        const reconcileX = !p.airborne || predVx !== 0 || Math.abs(errX) > 24;
+        if (reconcileX) {
+            p.renderX += errX * expLerpFactor(xRate, dtSec);
+        }
         p.renderY += errY * expLerpFactor(LOCAL_RECONCILE_RATE, dtSec);
     }
 
@@ -2133,19 +2181,19 @@ const getStickPose = (p) => {
     const tx = p.renderX + recoilX;
     const ty = p.renderY + recoilY;
     const crouch = !!p.crouching && p.grounded;
-    const drop = crouch ? STICK.crouchDrop : 0;
+    const drop = crouch ? VISUAL_CROUCH_DROP : 0;
     const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
     const f = p.facing || 1;
     // Feet rest exactly on the bottom edge of the Box2D player AABB.
     const feetOff = crouch ? CROUCH_FEET_OFF : FEET_OFF;
     const footY = ty + feetOff - standLift;
-    const hipY = ty + feetOff * 0.18 + drop * 0.28 - standLift * 0.4;
-    const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty, drop);
+    const hipY = ty + feetOff * 0.22 + drop * 0.15 - standLift * 0.4;
+    const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty, drop * 0.5);
     return {
         tx,
         ty,
         hx,
-        hy: crouch ? hy + drop * 0.12 : hy,
+        hy: crouch ? hy + drop * 0.06 : hy,
         neckTop,
         hipY,
         footY,
@@ -3065,12 +3113,12 @@ const computeLegPositions = (p, pose) => {
             lBend = 0.55 + Math.max(0, swing) * 0.5;
             rBend = 0.55 + Math.max(0, -swing) * 0.5;
         } else {
-            lFootX = tx - s - 2;
-            rFootX = tx + s + 2;
-            lFootY = footY + drop * 0.08;
-            rFootY = footY + drop * 0.08;
-            lBend = 1.55;
-            rBend = 1.55;
+            lFootX = tx - s - 1;
+            rFootX = tx + s + 1;
+            lFootY = footY + 2;
+            rFootY = footY + 2;
+            lBend = 0.9;
+            rBend = 0.9;
         }
     } else if (p.walking) {
         const swing = Math.sin(p.walkPhase);
