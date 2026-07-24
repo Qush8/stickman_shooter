@@ -8,12 +8,31 @@ const ARENA_W = 912;
 const ARENA_H = 500;
 const FLOOR_Y = ARENA_H;
 const SCALE = 30;
-const FEET_OFF = 32; // matches game.ts PLAYER_HALF_H * SCALE
+/** Half-height of standing Box2D player box (game.ts PLAYER_HALF_H * SCALE). */
+const FEET_OFF = 1.06 * SCALE; // 31.8 — visual feet sit on bottom of physics AABB
+/** Must match game.ts STICK_CROUCH_DROP_PX so crouch feet stay on the box bottom. */
+const STICK_CROUCH_DROP_PX = 46;
+const CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
+/** Match game.ts movement constants (pixels / second). */
+const MOVE_SPEED_PX = 15 * SCALE;
+const JUMP_VY_PX = -34 * SCALE;
+const GRAVITY_PX = 97.5 * SCALE;
+/** Exponential smoothing rates (higher = snappier). */
+const REMOTE_LERP_RATE = 20;
+const LOCAL_RECONCILE_RATE = 10;
+const LOCAL_RECONCILE_RATE_MOVING = 4;
+const LOCAL_SNAP_DIST = 120;
+const CAMERA_LERP_RATE = 14;
+const PLAYER_HALF_W_PX = 0.48 * SCALE;
 const FIT_PADDING = 0.9;
 
 let viewScale = 1;
 let viewOffsetX = 0;
 let viewOffsetY = 0;
+/** Smoothed viewport position (time-based; may include shake). */
+let cameraX = 0;
+let cameraY = 0;
+let cameraInitialized = false;
 
 const PLATFORM_BORDER = 2;
 
@@ -30,7 +49,7 @@ const STICK = {
   armLen: 25,
   stride: 10,
   lift: 5,
-  crouchDrop: 40,
+  crouchDrop: STICK_CROUCH_DROP_PX,
   kneeBend: 9,
 };
 
@@ -347,12 +366,50 @@ const platformFillForHp = (baseColor, hpRatio) => {
     return mixRgb(dim, baseColor, hpRatio);
 };
 
-const drawPlatforms = (platforms) => {
+/** Display-only platform positions (lerp toward server; never used for sync/input). */
+const localPlatformDisplay = new Map();
+
+const lerpToward = (from, to, t) => from + (to - from) * t;
+/** Frame-rate independent exponential lerp factor. */
+const expLerpFactor = (rate, dtSec) => 1 - Math.exp(-rate * Math.max(0, dtSec));
+
+const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60) => {
+    const liveIds = new Set();
+    const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
+    for (const plat of platforms ?? []) {
+        if (plat.broken) continue;
+        liveIds.add(plat.id);
+        const prev = localPlatformDisplay.get(plat.id);
+        if (!prev) {
+            localPlatformDisplay.set(plat.id, { renderX: plat.x, renderY: plat.y });
+            continue;
+        }
+        // Snap on large jumps (map swap / teleport) to avoid long trails.
+        if (Math.hypot(plat.x - prev.renderX, plat.y - prev.renderY) > 80) {
+            prev.renderX = plat.x;
+            prev.renderY = plat.y;
+        } else {
+            prev.renderX = lerpToward(prev.renderX, plat.x, t);
+            prev.renderY = lerpToward(prev.renderY, plat.y, t);
+        }
+    }
+    for (const id of [...localPlatformDisplay.keys()]) {
+        if (!liveIds.has(id)) localPlatformDisplay.delete(id);
+    }
+};
+
+const drawPlatforms = (platforms, dtSec = 1 / 60) => {
     platformsContainer.removeChildren();
     if (!platforms?.length) return;
 
+    syncPlatformDisplayTargets(platforms, dtSec);
+
     for (const plat of platforms) {
         if (plat.broken) continue;
+
+        const display = localPlatformDisplay.get(plat.id) ?? { renderX: plat.x, renderY: plat.y };
+        const drawX = display.renderX;
+        const drawY = display.renderY;
 
         const g = new Graphics();
         const inset = PLATFORM_BORDER;
@@ -368,15 +425,15 @@ const drawPlatforms = (platforms) => {
         const borderAlpha = 0.35 + hpRatio * 0.65;
 
         g.beginFill(shellColor, 0.95);
-        g.drawRect(plat.x, plat.y, plat.w, plat.h);
+        g.drawRect(drawX, drawY, plat.w, plat.h);
         g.endFill();
 
         g.beginFill(fillColor, fillAlpha);
-        g.drawRect(plat.x + inset, plat.y + inset, innerW, innerH);
+        g.drawRect(drawX + inset, drawY + inset, innerW, innerH);
         g.endFill();
 
         g.lineStyle(2, baseBorder, borderAlpha, 0.5, true);
-        g.drawRect(plat.x, plat.y, plat.w, plat.h);
+        g.drawRect(drawX, drawY, plat.w, plat.h);
 
         platformsContainer.addChild(g);
     }
@@ -658,7 +715,10 @@ const fitCanvas = () => {
     viewOffsetY = (ch - displayH) / 2;
 
     gameContainer.scale.set(viewScale);
-    gameContainer.position.set(viewOffsetX, viewOffsetY);
+    cameraX = viewOffsetX;
+    cameraY = viewOffsetY;
+    cameraInitialized = true;
+    gameContainer.position.set(cameraX, cameraY);
     updateOverlayLayout();
 };
 
@@ -1276,14 +1336,17 @@ const handleGameState = (state) => {
                 finalizeAllDeathCorpses();
             }
             if (G.roundPhase === "playing" && prevRoundPhase === "intermission") {
+                localPlatformDisplay.clear();
                 for (const [id, p] of Object.entries(G.players)) {
                     const lp = localPlayers[id];
                     if (!lp) continue;
                     lp.deathCorpse = null;
                     lp.prevHealth = p.health;
                     lp.health = p.health;
-                    if (p.torso) lp.displayTorso = { ...p.torso };
-                    if (p.head) lp.displayHead = { ...p.head };
+                    if (p.torso) {
+                        lp.renderX = p.torso.x;
+                        lp.renderY = p.torso.y;
+                    }
                     lp.torso = { ...p.torso };
                     lp.head = { ...p.head };
                 }
@@ -1312,8 +1375,8 @@ const handleGameState = (state) => {
                 if (!localPlayers[id]) {
                     localPlayers[id] = {
                         ...p,
-                        displayTorso: { ...p.torso },
-                        displayHead: { ...p.head },
+                        renderX: p.torso.x,
+                        renderY: p.torso.y,
                         prevHealth: p.health,
                         walkPhase: 0,
                         facing: 1,
@@ -1354,13 +1417,24 @@ const handleGameState = (state) => {
                     }
                     lp.prevHealth = p.health;
 
-                    lp.vx = p.torso.x - prevX;
-                    lp.vy = p.torso.y - prevY;
-                    if (
-                        id === latestState.playerId &&
-                        !resolveHorizontalAction()
-                    ) {
-                        lp.vx = 0;
+                    const isLocal = id === latestState.playerId;
+                    if (!isLocal) {
+                        lp.vx = p.torso.x - prevX;
+                        lp.vy = p.torso.y - prevY;
+                        lp.grounded = !!p.grounded;
+                    } else {
+                        // Local player keeps predicted renderX/Y; torso is authority for soft reconcile.
+                        if (typeof p.grounded === "boolean") {
+                            const ry = lp.renderY ?? p.torso.y;
+                            if (Math.abs(ry - p.torso.y) < 12) {
+                                lp.grounded = p.grounded;
+                                if (p.grounded) lp.predVy = 0;
+                            }
+                        }
+                        if (typeof p.vy === "number" && !lp.grounded) {
+                            // Softly pull predicted vertical velocity toward server while airborne.
+                            lp.predVy = (lp.predVy ?? p.vy) * 0.7 + p.vy * 0.3;
+                        }
                     }
                     lp.health = p.health;
                     lp.crouching = !!p.crouching;
@@ -1402,11 +1476,11 @@ const handleGameState = (state) => {
             for (const hit of G.hitEvents) {
                 if (hit.damage > 0) {
                     const targetPlayer = localPlayers[hit.targetId];
-                    const hitX = hit.isHeadshot && targetPlayer?.displayHead
-                        ? targetPlayer.displayHead.x
+                    const hitX = hit.isHeadshot && targetPlayer?.renderX !== undefined
+                        ? targetPlayer.renderX
                         : hit.x;
-                    const hitY = hit.isHeadshot && targetPlayer?.displayHead
-                        ? targetPlayer.displayHead.y
+                    const hitY = hit.isHeadshot && targetPlayer?.renderY !== undefined
+                        ? targetPlayer.renderY - 36
                         : hit.y;
                     createPlayerHitEffect(hitX, hitY, hit.isHeadshot);
                     if (targetPlayer) {
@@ -1452,11 +1526,16 @@ const handleGameState = (state) => {
                 if (!localBullets.has(b.id)) {
                     const g = new Graphics();
                     bulletsContainer.addChild(g);
-                    localBullets.set(b.id, { ...b, prevBody: { ...b.body }, displayBody: { ...b.body }, g });
+                    localBullets.set(b.id, { ...b, prevBody: { ...b.body }, renderX: b.body.x, renderY: b.body.y, g });
                     const wId = b.weaponId || localPlayers[b.owner]?.currentWeapon || "winchester";
-                    createMuzzleFlash(b.body.x, b.body.y, wId);
-                    Sfx.playShoot(wId);
                     const shooter = localPlayers[b.owner];
+                    if (shooter?.torso) {
+                        const gun = getGunPose(shooter);
+                        createMuzzleFlash(gun.muzzleX, gun.muzzleY, wId);
+                    } else {
+                        createMuzzleFlash(b.body.x, b.body.y, wId);
+                    }
+                    Sfx.playShoot(wId);
                     if (shooter) {
                         markShootFace(shooter);
                         triggerWeaponRecoil(shooter, wId);
@@ -1501,15 +1580,31 @@ function spawnParticle(x, y, vx, vy, color, size, lifeDecay, gravityMul = 0.5, i
 
 function createMuzzleFlash(x, y, weaponId = "winchester") {
     const scale = WEAPON_MUZZLE[weaponId] ?? 0.45;
-    const count = Math.min(5, Math.floor(2 + scale * 2));
-    const coreColor = weaponId === "bazooka" ? 0xff6622 : weaponId === "sniper" ? 0xffeeaa : 0xffdd66;
+    const count = Math.min(8, Math.floor(4 + scale * 3));
+    const coreColor = weaponId === "bazooka" ? 0xff6622 : weaponId === "sniper" ? 0xffeeaa : 0xffdd44;
+    const outerColor = weaponId === "bazooka" ? 0xff3300 : 0xff8800;
+
+    spawnParticle(x, y, 0, 0, 0xfff6c8, 3.5 + scale * 2.2, 0.12, 0.02);
+    spawnParticle(x, y, 0, 0, coreColor, 2.4 + scale * 1.6, 0.1, 0.04);
+    spawnParticle(x, y, 0, 0, outerColor, 1.6 + scale, 0.09, 0.05);
+
     for (let i = 0; i < count; i++) {
         const a = Math.random() * Math.PI * 2;
-        const s = (2 + Math.random() * 3) * scale;
-        spawnParticle(x, y, Math.cos(a) * s, Math.sin(a) * s, coreColor, 1.2 + scale * 0.8, 0.05, 0.2);
+        const s = (3 + Math.random() * 5) * scale;
+        const color = i % 2 === 0 ? coreColor : outerColor;
+        spawnParticle(
+            x,
+            y,
+            Math.cos(a) * s,
+            Math.sin(a) * s,
+            color,
+            1.4 + scale * 0.9,
+            0.08 + Math.random() * 0.04,
+            0.15,
+        );
     }
-    if (scale >= 0.7) {
-        spawnParticle(x, y, 0, 0, 0xff4422, 3 + scale * 1.5, 0.04, 0.08);
+    if (scale >= 0.55) {
+        spawnParticle(x, y, 0, 0, 0xff4422, 4 + scale * 1.8, 0.07, 0.06);
     }
 }
 
@@ -1831,7 +1926,7 @@ function createHitBurst(x, y) {
 }
 
 // Stickman drawing + animation helpers
-const VISUAL_STAND_LIFT = 5;
+const VISUAL_STAND_LIFT = 0;
 
 const smoothStep = (t) => {
     const x = Math.max(0, Math.min(1, t));
@@ -1926,30 +2021,98 @@ const drawMaterializeFlash = (g, bx, by, intensity) => {
     g.drawCircle(bx, by, 2 + intensity * 4);
 };
 
-const lerpPlayerDisplay = (p, dt, isMe, baseSmooth) => {
-    const targetTorso = p.torso;
-    const hdx = (p.head?.x ?? 0) - (p.torso?.x ?? 0);
-    const hdy = (p.head?.y ?? 0) - (p.torso?.y ?? 0);
-    const targetHead = {
-        ...p.head,
-        x: targetTorso.x + hdx,
-        y: targetTorso.y + hdy,
-    };
+/** Remote entities only — exponential blend toward authoritative server pose. */
+const lerpRemotePlayerDisplay = (p, dtSec) => {
+    if (!p.torso) return;
+    if (p.renderX === undefined || p.renderY === undefined) {
+        p.renderX = p.torso.x;
+        p.renderY = p.torso.y;
+        return;
+    }
+    const dx = p.torso.x - p.renderX;
+    const dy = p.torso.y - p.renderY;
+    if (Math.hypot(dx, dy) > 80) {
+        p.renderX = p.torso.x;
+        p.renderY = p.torso.y;
+        return;
+    }
+    const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
+    p.renderX = lerpToward(p.renderX, p.torso.x, t);
+    p.renderY = lerpToward(p.renderY, p.torso.y, t);
+};
 
-    let t = baseSmooth;
-    const snapDist = Math.hypot(
-        (p.displayTorso?.x ?? 0) - targetTorso.x,
-        (p.displayTorso?.y ?? 0) - targetTorso.y,
-    );
-    if (snapDist > 20) {
-        t = Math.min(1, 0.65 * dt);
+/**
+ * Local player: apply input velocity every render frame, then softly reconcile
+ * to the 30Hz server torso without hard snaps on small errors.
+ */
+const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gameplayActive) => {
+    if (!p.torso) return;
+    if (p.renderX === undefined || p.renderY === undefined) {
+        p.renderX = p.torso.x;
+        p.renderY = p.torso.y;
+        p.predVy = p.vy ?? 0;
+        return;
     }
 
-    p.displayTorso = lerpBody(p.displayTorso, targetTorso, t);
-    p.displayHead = lerpBody(p.displayHead, targetHead, t);
-    p.displayHead.x = p.displayTorso.x;
-    p.displayHead.angle = 0;
-    p.displayTorso.angle = 0;
+    if (!gameplayActive) {
+        const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
+        p.renderX = lerpToward(p.renderX, p.torso.x, t);
+        p.renderY = lerpToward(p.renderY, p.torso.y, t);
+        p.predVy = 0;
+        return;
+    }
+
+    const speedMul = crouching && p.grounded ? 0.45 : 1;
+    let predVx = 0;
+    if (action === "left") predVx = -MOVE_SPEED_PX * speedMul;
+    else if (action === "right") predVx = MOVE_SPEED_PX * speedMul;
+
+    if (typeof p.predVy !== "number") p.predVy = p.vy ?? 0;
+
+    if (jumpPressed && p.grounded) {
+        p.predVy = JUMP_VY_PX;
+        p.grounded = false;
+        p.airborne = true;
+    }
+
+    p.renderX += predVx * dtSec;
+
+    if (!p.grounded || Math.abs(p.predVy) > 1) {
+        p.predVy += GRAVITY_PX * dtSec;
+        p.renderY += p.predVy * dtSec;
+        const feetOff = crouching ? CROUCH_FEET_OFF : FEET_OFF;
+        const feetY = p.renderY + feetOff;
+        if (feetY >= FLOOR_Y) {
+            p.renderY = FLOOR_Y - feetOff;
+            p.predVy = 0;
+            p.grounded = true;
+            p.airborne = false;
+        } else {
+            p.grounded = false;
+            p.airborne = true;
+        }
+    } else {
+        p.predVy = 0;
+    }
+
+    p.vx = predVx;
+    p.vy = p.predVy;
+
+    // Soft reconcile toward authoritative server pose.
+    const errX = p.torso.x - p.renderX;
+    const errY = p.torso.y - p.renderY;
+    const errDist = Math.hypot(errX, errY);
+    if (errDist > LOCAL_SNAP_DIST) {
+        p.renderX = p.torso.x;
+        p.renderY = p.torso.y;
+        p.predVy = p.vy ?? 0;
+    } else {
+        const xRate = predVx !== 0 ? LOCAL_RECONCILE_RATE_MOVING : LOCAL_RECONCILE_RATE;
+        p.renderX += errX * expLerpFactor(xRate, dtSec);
+        p.renderY += errY * expLerpFactor(LOCAL_RECONCILE_RATE, dtSec);
+    }
+
+    p.renderX = Math.max(PLAYER_HALF_W_PX, Math.min(ARENA_W - PLAYER_HALF_W_PX, p.renderX));
 };
 
 
@@ -1967,14 +2130,16 @@ const getStickPose = (p) => {
     const dodgeVisual = isShadowTeleportActive(p) || isServerDodgeActive(p);
     const recoilX = dodgeVisual ? 0 : (p.recoilTorsoOffX ?? 0);
     const recoilY = dodgeVisual ? 0 : (p.recoilTorsoOffY ?? 0);
-    const tx = p.displayTorso.x + recoilX;
-    const ty = p.displayTorso.y + recoilY;
+    const tx = p.renderX + recoilX;
+    const ty = p.renderY + recoilY;
     const crouch = !!p.crouching && p.grounded;
     const drop = crouch ? STICK.crouchDrop : 0;
     const standLift = p.grounded && !p.airborne ? VISUAL_STAND_LIFT : 0;
     const f = p.facing || 1;
-    const footY = ty + FEET_OFF - standLift;
-    const hipY = ty + FEET_OFF * 0.18 + drop * 0.28 - standLift * 0.4;
+    // Feet rest exactly on the bottom edge of the Box2D player AABB.
+    const feetOff = crouch ? CROUCH_FEET_OFF : FEET_OFF;
+    const footY = ty + feetOff - standLift;
+    const hipY = ty + feetOff * 0.18 + drop * 0.28 - standLift * 0.4;
     const { hx, hy, neckTop } = stickHeadNeckFromTorso(tx, ty, drop);
     return {
         tx,
@@ -2407,12 +2572,11 @@ const markShootFace = (p) => {
 
 const startDeathCorpse = (p) => {
     if (p.deathCorpse) return;
-    if (!p.displayTorso && p.torso) p.displayTorso = { ...p.torso };
-    if (!p.displayHead && p.head) p.displayHead = { ...p.head };
-    if (!p.displayTorso || !p.displayHead) return;
+    if (p.renderX === undefined && p.torso) { p.renderX = p.torso.x; p.renderY = p.torso.y; }
+    if (p.renderX === undefined) return;
     p.deathCorpse = {
-        startTorso: { ...p.displayTorso },
-        startHead: { ...p.displayHead },
+        startTorso: { x: p.renderX, y: p.renderY },
+        startHead: { x: p.renderX, y: p.renderY - 36 },
         startedAt: Date.now(),
         bloodSpawned: false,
         finished: false,
@@ -2487,24 +2651,24 @@ const drawDeadFace = (g, hx, hy, isMe, alpha = 1) => {
     g.endFill();
 
     const ink = 0x111111;
-    const eyeGap = 4.2;
+    const eyeGap = 4.8;
     const eyeY = hy - 1;
-    g.lineStyle(2.4, ink, alpha, 0.5, true, LINE_CAP.ROUND);
+    g.lineStyle(3.2, ink, alpha, 0.5, true, LINE_CAP.ROUND);
 
-    g.moveTo(hx - eyeGap - 2.5, eyeY - 2.5);
-    g.lineTo(hx - eyeGap + 2.5, eyeY + 2.5);
-    g.moveTo(hx - eyeGap + 2.5, eyeY - 2.5);
-    g.lineTo(hx - eyeGap - 2.5, eyeY + 2.5);
-    g.moveTo(hx + eyeGap - 2.5, eyeY - 2.5);
-    g.lineTo(hx + eyeGap + 2.5, eyeY + 2.5);
-    g.moveTo(hx + eyeGap + 2.5, eyeY - 2.5);
-    g.lineTo(hx + eyeGap - 2.5, eyeY + 2.5);
+    g.moveTo(hx - eyeGap - 3, eyeY - 3);
+    g.lineTo(hx - eyeGap + 3, eyeY + 3);
+    g.moveTo(hx - eyeGap + 3, eyeY - 3);
+    g.lineTo(hx - eyeGap - 3, eyeY + 3);
+    g.moveTo(hx + eyeGap - 3, eyeY - 3);
+    g.lineTo(hx + eyeGap + 3, eyeY + 3);
+    g.moveTo(hx + eyeGap + 3, eyeY - 3);
+    g.lineTo(hx + eyeGap - 3, eyeY + 3);
 
-    g.moveTo(hx - 3.5, hy + 5);
-    g.quadraticCurveTo(hx, hy + 9.5, hx + 3.5, hy + 5);
+    g.moveTo(hx - 4.2, hy + 5);
+    g.quadraticCurveTo(hx, hy + 11, hx + 4.2, hy + 5);
 
     g.beginFill(0xcc4444, alpha * 0.9);
-    g.drawEllipse(hx, hy + 7.8, 2.2, 2.8);
+    g.drawEllipse(hx, hy + 8.2, 2.6, 3.2);
     g.endFill();
 };
 
@@ -2625,41 +2789,44 @@ const drawFace = (g, hx, hy, facing, expr, isMe) => {
     g.drawEllipse(hx - headR * 0.28, hy - headR * 0.38, headR * 0.22, headR * 0.14);
     g.endFill();
 
-    const ink = 0x222230;
-    const eyeGap = headR * 0.3;
-    const eyeY = hy - headR * 0.12;
-    const mouthY = hy + headR * 0.34;
+    const ink = 0x1a1a28;
+    const eyeGap = headR * 0.32;
+    const eyeY = hy - headR * 0.1;
+    const mouthY = hy + headR * 0.36;
     const s = headR / 14.8;
+    const stroke = 2.5 * s;
 
     const drawEyes = (style = "normal") => {
         const drawCuteEye = (ex, ey, pupilR, open = 1) => {
             g.beginFill(0xffffff, 1);
-            g.drawEllipse(ex, ey, 2.1 * s * open, 2.6 * s);
+            g.drawEllipse(ex, ey, 2.85 * s * open, 3.4 * s);
             g.endFill();
+            g.lineStyle(1.2 * s, ink, 0.35, 0.5, true);
+            g.drawEllipse(ex, ey, 2.85 * s * open, 3.4 * s);
             g.beginFill(ink, 1);
-            g.drawCircle(ex, ey + 0.25 * s, pupilR * s);
+            g.drawCircle(ex, ey + 0.3 * s, pupilR * s * 1.15);
             g.endFill();
             g.beginFill(0xffffff, 0.95);
-            g.drawCircle(ex + 0.65 * s, ey - 0.55 * s, 0.55 * s);
+            g.drawCircle(ex + 0.85 * s, ey - 0.7 * s, 0.75 * s);
             g.endFill();
         };
 
         if (style === "wide") {
-            drawCuteEye(hx - eyeGap, eyeY, 1.35, 1.15);
-            drawCuteEye(hx + eyeGap, eyeY, 1.35, 1.15);
+            drawCuteEye(hx - eyeGap, eyeY, 1.55, 1.2);
+            drawCuteEye(hx + eyeGap, eyeY, 1.55, 1.2);
             return;
         }
         if (style === "squint") {
-            g.lineStyle(1.6 * s, ink, 1, 0.5, true);
-            g.moveTo(hx - eyeGap - 2.8 * s, eyeY);
-            g.quadraticCurveTo(hx - eyeGap, eyeY + 1.6 * s, hx - eyeGap + 2.8 * s, eyeY);
-            g.moveTo(hx + eyeGap - 2.8 * s, eyeY);
-            g.quadraticCurveTo(hx + eyeGap, eyeY + 1.6 * s, hx + eyeGap + 2.8 * s, eyeY);
+            g.lineStyle(stroke, ink, 1, 0.5, true);
+            g.moveTo(hx - eyeGap - 3.4 * s, eyeY);
+            g.quadraticCurveTo(hx - eyeGap, eyeY + 2.1 * s, hx - eyeGap + 3.4 * s, eyeY);
+            g.moveTo(hx + eyeGap - 3.4 * s, eyeY);
+            g.quadraticCurveTo(hx + eyeGap, eyeY + 2.1 * s, hx + eyeGap + 3.4 * s, eyeY);
             return;
         }
         if (style === "x") {
-            g.lineStyle(1.5 * s, ink, 1, 0.5, true);
-            const d = 2 * s;
+            g.lineStyle(stroke, ink, 1, 0.5, true);
+            const d = 2.6 * s;
             g.moveTo(hx - eyeGap - d, eyeY - d);
             g.lineTo(hx - eyeGap + d, eyeY + d);
             g.moveTo(hx - eyeGap + d, eyeY - d);
@@ -2671,61 +2838,61 @@ const drawFace = (g, hx, hy, facing, expr, isMe) => {
             return;
         }
         if (style === "dizzy") {
-            g.lineStyle(1.4 * s, ink, 0.85, 0.5, true);
-            g.drawCircle(hx - eyeGap, eyeY, 2 * s);
-            g.drawCircle(hx + eyeGap, eyeY, 2 * s);
-            g.moveTo(hx - eyeGap, eyeY - 2 * s);
-            g.lineTo(hx - eyeGap, eyeY + 2 * s);
-            g.moveTo(hx + eyeGap, eyeY - 2 * s);
-            g.lineTo(hx + eyeGap, eyeY + 2 * s);
+            g.lineStyle(stroke * 0.9, ink, 0.9, 0.5, true);
+            g.drawCircle(hx - eyeGap, eyeY, 2.6 * s);
+            g.drawCircle(hx + eyeGap, eyeY, 2.6 * s);
+            g.moveTo(hx - eyeGap, eyeY - 2.6 * s);
+            g.lineTo(hx - eyeGap, eyeY + 2.6 * s);
+            g.moveTo(hx + eyeGap, eyeY - 2.6 * s);
+            g.lineTo(hx + eyeGap, eyeY + 2.6 * s);
             return;
         }
-        drawCuteEye(hx - eyeGap, eyeY, 1.15);
-        drawCuteEye(hx + eyeGap, eyeY, 1.15);
+        drawCuteEye(hx - eyeGap, eyeY, 1.35);
+        drawCuteEye(hx + eyeGap, eyeY, 1.35);
     };
 
     const drawBrows = (kind = "neutral") => {
-        g.lineStyle(1.4 * s, ink, 1, 0.5, true);
+        g.lineStyle(stroke, ink, 1, 0.5, true);
         if (kind === "angry") {
-            g.moveTo(hx - eyeGap - 3 * s, eyeY - 3.2 * s);
-            g.lineTo(hx - eyeGap + 1.8 * s, eyeY - 1.8 * s);
-            g.moveTo(hx + eyeGap + 3 * s, eyeY - 3.2 * s);
-            g.lineTo(hx + eyeGap - 1.8 * s, eyeY - 1.8 * s);
+            g.moveTo(hx - eyeGap - 3.6 * s, eyeY - 3.8 * s);
+            g.lineTo(hx - eyeGap + 2.2 * s, eyeY - 2 * s);
+            g.moveTo(hx + eyeGap + 3.6 * s, eyeY - 3.8 * s);
+            g.lineTo(hx + eyeGap - 2.2 * s, eyeY - 2 * s);
         }
     };
 
     const drawMouth = (kind = "neutral") => {
-        g.lineStyle(1.35 * s, ink, 1, 0.5, true);
+        g.lineStyle(stroke, ink, 1, 0.5, true);
         if (kind === "smile") {
-            g.beginFill(0xff8899, 0.18);
-            g.moveTo(hx - 3.2 * s, mouthY);
-            g.quadraticCurveTo(hx, mouthY + 3.2 * s, hx + 3.2 * s, mouthY);
+            g.beginFill(0xff8899, 0.22);
+            g.moveTo(hx - 4 * s, mouthY);
+            g.quadraticCurveTo(hx, mouthY + 4 * s, hx + 4 * s, mouthY);
             g.closePath();
             g.endFill();
-            g.lineStyle(1.35 * s, ink, 1, 0.5, true);
-            g.moveTo(hx - 3.2 * s, mouthY);
-            g.quadraticCurveTo(hx, mouthY + 3.2 * s, hx + 3.2 * s, mouthY);
+            g.lineStyle(stroke, ink, 1, 0.5, true);
+            g.moveTo(hx - 4 * s, mouthY);
+            g.quadraticCurveTo(hx, mouthY + 4 * s, hx + 4 * s, mouthY);
         } else if (kind === "open") {
-            g.beginFill(0x5a3038, 0.9);
-            g.drawEllipse(hx, mouthY + 0.8 * s, 2.2 * s, 1.8 * s);
+            g.beginFill(0x5a3038, 0.92);
+            g.drawEllipse(hx, mouthY + 0.9 * s, 2.8 * s, 2.3 * s);
             g.endFill();
-            g.lineStyle(1.2 * s, ink, 1, 0.5, true);
-            g.drawEllipse(hx, mouthY + 0.8 * s, 2.2 * s, 1.8 * s);
+            g.lineStyle(stroke * 0.85, ink, 1, 0.5, true);
+            g.drawEllipse(hx, mouthY + 0.9 * s, 2.8 * s, 2.3 * s);
         } else if (kind === "frown") {
-            g.moveTo(hx - 2.8 * s, mouthY + 1.2 * s);
-            g.quadraticCurveTo(hx, mouthY - 1 * s, hx + 2.8 * s, mouthY + 1.2 * s);
+            g.moveTo(hx - 3.4 * s, mouthY + 1.5 * s);
+            g.quadraticCurveTo(hx, mouthY - 1.4 * s, hx + 3.4 * s, mouthY + 1.5 * s);
         } else if (kind === "wavy") {
-            g.moveTo(hx - 3 * s, mouthY);
-            g.quadraticCurveTo(hx - 1.2 * s, mouthY + 1.6 * s, hx, mouthY);
-            g.quadraticCurveTo(hx + 1.2 * s, mouthY - 1.6 * s, hx + 3 * s, mouthY);
+            g.moveTo(hx - 3.6 * s, mouthY);
+            g.quadraticCurveTo(hx - 1.4 * s, mouthY + 2 * s, hx, mouthY);
+            g.quadraticCurveTo(hx + 1.4 * s, mouthY - 2 * s, hx + 3.6 * s, mouthY);
         } else if (kind === "grit") {
-            g.moveTo(hx - 2.5 * s, mouthY + 0.4 * s);
-            g.lineTo(hx - 0.8 * s, mouthY + 1.2 * s);
-            g.lineTo(hx + 0.8 * s, mouthY + 0.4 * s);
-            g.lineTo(hx + 2.5 * s, mouthY + 1.2 * s);
+            g.moveTo(hx - 3.1 * s, mouthY + 0.4 * s);
+            g.lineTo(hx - 1 * s, mouthY + 1.5 * s);
+            g.lineTo(hx + 1 * s, mouthY + 0.4 * s);
+            g.lineTo(hx + 3.1 * s, mouthY + 1.5 * s);
         } else {
-            g.moveTo(hx - 2.2 * s, mouthY + 0.5 * s);
-            g.quadraticCurveTo(hx, mouthY + 1.1 * s, hx + 2.2 * s, mouthY + 0.5 * s);
+            g.moveTo(hx - 2.8 * s, mouthY + 0.55 * s);
+            g.quadraticCurveTo(hx, mouthY + 1.4 * s, hx + 2.8 * s, mouthY + 0.55 * s);
         }
     };
 
@@ -2772,8 +2939,7 @@ const drawFace = (g, hx, hy, facing, expr, isMe) => {
 };
 
 const initPlayerRenderState = (p) => {
-    if (!p.displayTorso) p.displayTorso = { ...p.torso };
-    if (!p.displayHead) p.displayHead = { ...p.head };
+    if (p.renderX === undefined) { p.renderX = p.torso.x; p.renderY = p.torso.y; }
     if (p.walkPhase == null) p.walkPhase = 0;
     if (p.facing == null) p.facing = 1;
     if (p.walkDir == null) p.walkDir = p.facing;
@@ -2975,7 +3141,7 @@ const drawShadowAberrationFlash = (g, gun, legs, peak, dir) => {
 
 const drawStickmanLines = (g, p, isMe) => {
     g.clear();
-    if (!p || p.health <= 0 || !p.displayTorso || !p.displayHead) return;
+    if (!p || p.health <= 0 || p.renderX === undefined) return;
 
     const pal = stickPalette(isMe, p.team);
     const gun = getGunPose(p);
@@ -3068,7 +3234,7 @@ const drawStickmanLines = (g, p, isMe) => {
 
 const drawStickmanFills = (g, p, isMe) => {
     g.clear();
-    if (!p || p.health <= 0 || !p.displayTorso || !p.displayHead) return;
+    if (!p || p.health <= 0 || p.renderX === undefined) return;
 
     const gun = getGunPose(p);
     if (gun.stPhase === "travel") return;
@@ -3081,12 +3247,13 @@ let pendingJump = false;
 
 app.ticker.add(() => {
     try {
-        const dt = app.ticker.deltaTime;
+        const dtSec = Math.min(0.05, (app.ticker.deltaMS || 16) / 1000);
+        const dt = app.ticker.deltaTime; // keep frame units for legacy anim timers
         if (!latestState) return;
 
         const G = latestState.G;
         if (G?.currentMapId) applyMapTheme(G.currentMapId);
-        drawPlatforms(getPlatformsForRender(G));
+        drawPlatforms(getPlatformsForRender(G), dtSec);
         drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
 
         updateStartOverlay();
@@ -3095,6 +3262,7 @@ app.ticker.add(() => {
         const gameplayActive = isGameplayInputEnabled(G);
 
         let action = null;
+        let jumpPressedThisFrame = false;
         const crouching =
             isKeyPressed("KeyS", "s", "S", "ArrowDown") ||
             [...activeKeys].some((k) => isCrouchKey(k, k));
@@ -3110,19 +3278,16 @@ app.ticker.add(() => {
 
             if (jumpQueued) {
                 pendingJump = true;
+                jumpPressedThisFrame = true;
                 jumpQueued = false;
                 Sfx.playJump();
             }
 
             const pose = getStickPose(me);
-            me.aimAngle = Math.atan2(mouseY - pose.neckTop, mouseX - me.displayTorso.x);
+            me.aimAngle = Math.atan2(mouseY - pose.neckTop, mouseX - me.renderX);
 
             if (action === "left") me.facing = -1;
             else if (action === "right") me.facing = 1;
-
-            if (!resolveHorizontalAction()) {
-                me.vx = 0;
-            }
         } else {
             jumpQueued = false;
             pendingJump = false;
@@ -3157,21 +3322,28 @@ app.ticker.add(() => {
         inputDirty = false;
         pointerShootingDirty = false;
 
+        // Time-based camera / shake (does not snap rigidly each frame).
         if (recoilShake > 0.05) {
-            recoilShake *= 0.82;
-            dodgeShakeBoost *= 0.86;
-            const shakeMul = 0.35 + Math.min(0.4, dodgeShakeBoost * 0.11);
-            gameContainer.position.set(
-                viewOffsetX + recoilShakeX * recoilShake * shakeMul,
-                viewOffsetY + recoilShakeY * recoilShake * shakeMul,
-            );
+            recoilShake *= Math.exp(-10 * dtSec);
+            dodgeShakeBoost *= Math.exp(-8 * dtSec);
         } else {
             recoilShake = 0;
             dodgeShakeBoost = 0;
-            gameContainer.position.set(viewOffsetX, viewOffsetY);
         }
+        const shakeMul = 0.35 + Math.min(0.4, dodgeShakeBoost * 0.11);
+        const targetCamX = viewOffsetX + recoilShakeX * recoilShake * shakeMul;
+        const targetCamY = viewOffsetY + recoilShakeY * recoilShake * shakeMul;
+        if (!cameraInitialized) {
+            cameraX = targetCamX;
+            cameraY = targetCamY;
+            cameraInitialized = true;
+        } else {
+            const camT = expLerpFactor(CAMERA_LERP_RATE, dtSec);
+            cameraX = lerpToward(cameraX, targetCamX, camT);
+            cameraY = lerpToward(cameraY, targetCamY, camT);
+        }
+        gameContainer.position.set(cameraX, cameraY);
 
-        const smooth = Math.min(1, 0.28 * dt);
         const roundIdle = isIdleTickPhase(G);
         for (const [id, p] of Object.entries(localPlayers)) {
             if (p.deathCorpse && (p.health <= 0 || !p.torso)) continue;
@@ -3183,12 +3355,28 @@ app.ticker.add(() => {
                 p.grounded = true;
                 p.vx = 0;
                 p.vy = 0;
+                p.predVy = 0;
+                if (p.torso) {
+                    p.renderX = p.torso.x;
+                    p.renderY = p.torso.y;
+                }
                 continue;
             }
             tickWeaponRecoil(p, dt);
             tickKatanaSwing(p);
             tickKatanaEquip(p);
-            lerpPlayerDisplay(p, dt, p === me, smooth);
+            if (p === me) {
+                predictLocalPlayerDisplay(
+                    p,
+                    action,
+                    crouching,
+                    jumpPressedThisFrame,
+                    dtSec,
+                    gameplayActive,
+                );
+            } else {
+                lerpRemotePlayerDisplay(p, dtSec);
+            }
             if ((p.shadowFlash ?? 0) > 0) {
                 p.shadowFlash = Math.max(0, p.shadowFlash - 0.09 * dt);
             }
@@ -3209,20 +3397,29 @@ app.ticker.add(() => {
             }
         }
 
-        // Update Bullets
+        // Update Bullets (remote-style exponential lerp)
+        const bulletT = expLerpFactor(REMOTE_LERP_RATE, dtSec);
         for (const [, b] of localBullets.entries()) {
             if (!b.body || !b.g) continue;
 
-            if (!b.displayBody) {
-                b.displayBody = { ...b.body };
+            if (b.renderX === undefined || b.renderY === undefined) {
+                b.renderX = b.body.x;
+                b.renderY = b.body.y;
+            } else {
+                const dx = b.body.x - b.renderX;
+                const dy = b.body.y - b.renderY;
+                if (Math.hypot(dx, dy) > 120) {
+                    b.renderX = b.body.x;
+                    b.renderY = b.body.y;
+                } else {
+                    b.renderX = lerpToward(b.renderX, b.body.x, bulletT);
+                    b.renderY = lerpToward(b.renderY, b.body.y, bulletT);
+                }
             }
 
-            // Smoothly Lerp towards the authoritative server position
-            b.displayBody = lerpBody(b.displayBody, b.body, Math.min(1, 0.45 * dt));
-
-            let angle = b.displayBody.angle || 0;
+            let angle = 0;
             if (b.prevBody) {
-                angle = Math.atan2(b.displayBody.y - b.prevBody.y, b.displayBody.x - b.prevBody.x);
+                angle = Math.atan2(b.renderY - b.prevBody.y, b.renderX - b.prevBody.x);
             }
 
             const g = b.g;
@@ -3252,12 +3449,12 @@ app.ticker.add(() => {
                 g.drawCircle(Math.cos(angle) * 1.2, Math.sin(angle) * 1.2, 1.5);
                 g.endFill();
             }
-            g.position.set(b.displayBody.x, b.displayBody.y);
+            g.position.set(b.renderX, b.renderY);
 
             if (Math.random() < 0.35) {
                 spawnParticle(
-                    b.displayBody.x - Math.cos(angle) * 8,
-                    b.displayBody.y - Math.sin(angle) * 8,
+                    b.renderX - Math.cos(angle) * 8,
+                    b.renderY - Math.sin(angle) * 8,
                     -Math.cos(angle) * 2,
                     -Math.sin(angle) * 2,
                     0xffaa55,

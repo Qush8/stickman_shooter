@@ -197,7 +197,7 @@ export interface BulletState {
   vy: number;
   r: number;
   gravityScale: number;
-  bounceCount: number;
+  bounces: number;
 }
 
 export interface HitEvent {
@@ -291,7 +291,7 @@ const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
 /** Fixed physics timestep — one move advances one physics tick at 60Hz. */
 const PHYSICS_HZ = 60;
 const PHYSICS_DT = 1 / PHYSICS_HZ;
-const PHYSICS_STEPS_PER_TICK = 1;
+const PHYSICS_STEPS_PER_TICK = PHYSICS_HZ / 30;
 const MOVE_SPEED = 15 * SCALE;
 const JUMP_VY = -34 * SCALE;
 /** Target peak height = jump × this (impulse uses √ratio for energy scaling). */
@@ -306,9 +306,9 @@ const PLAYER_W = PLAYER_HALF_W * SCALE * 2;
 const PLAYER_H = PLAYER_HALF_H * SCALE * 2;
 const FEET_PIXELS = PLAYER_H / 2;
 const GROUNDED_VEL_Y = 12 * SCALE;
-const MAX_BULLET_BOUNCES = 2;
+const MAX_BULLET_BOUNCES = 3;
 /** Speed retained after each wall/platform bounce (1 = perfect elastic). */
-const BULLET_BOUNCE_RESTITUTION = 0.65;
+const BULLET_BOUNCE_RESTITUTION = 0.78;
 const RECOIL_IMPULSE = 34 * SCALE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP);
 const PLATFORM_HITS_TO_BREAK = 4;
 const PLATFORM_MAX_HEALTH = WEAPONS.winchester.damage * PLATFORM_HITS_TO_BREAK;
@@ -350,190 +350,32 @@ const pendingExplosions: { x: number; y: number; radius: number; damage: number;
   [];
 let currentG: ShooterState | null = null;
 
-let world: planck.World | null = null;
-let currentWorldTick = -1;
-const bodyMap = new Map<string, planck.Body>();
-
-function ensureWorld(G: ShooterState) {
-  if (world && currentWorldTick === G.worldTick) return;
-
-  world = new planck.World({ gravity: planck.Vec2(0, GRAVITY / SCALE) });
-  bodyMap.clear();
-  // ensureWorld running
-
-  const walls = world.createBody();
-  walls.createFixture(planck.Box(ARENA_W / 2 / SCALE, ARENA_WALL_THICK / 2 / SCALE, planck.Vec2(ARENA_W / 2 / SCALE, (FLOOR_Y + ARENA_WALL_THICK / 2) / SCALE), 0));
-  walls.createFixture(planck.Box(ARENA_WALL_THICK / 2 / SCALE, ARENA_H / 2 / SCALE, planck.Vec2(-ARENA_WALL_THICK / 2 / SCALE, ARENA_H / 2 / SCALE), 0));
-  walls.createFixture(planck.Box(ARENA_WALL_THICK / 2 / SCALE, ARENA_H / 2 / SCALE, planck.Vec2((ARENA_W + ARENA_WALL_THICK / 2) / SCALE, ARENA_H / 2 / SCALE), 0));
-  walls.createFixture(planck.Box(ARENA_W / 2 / SCALE, ARENA_WALL_THICK / 2 / SCALE, planck.Vec2(ARENA_W / 2 / SCALE, -ARENA_WALL_THICK / 2 / SCALE), 0));
-
-  for (const [id, p] of Object.entries(G.players)) {
-    const b = world.createDynamicBody({
-      position: planck.Vec2(p.torso.x / SCALE, p.torso.y / SCALE),
-      fixedRotation: true,
-      userData: { type: "player", id }
-    });
-    const h = p.crouching ? PLAYER_CROUCH_H : PLAYER_H;
-    b.createFixture(planck.Box(PLAYER_W / 2 / SCALE, h / 2 / SCALE), {
-      friction: 0.0,
-      restitution: 0.0,
-      density: 1.0,
-    });
-    b.setLinearVelocity(planck.Vec2(p.vx / SCALE, p.vy / SCALE));
-    bodyMap.set("player_" + id, b);
-  }
-
-  for (const plat of G.platforms) {
-    if (plat.broken) continue;
-    const isElevator = plat.kind === "elevator";
-    // plat.y is the top surface (Y-down); center the box below it.
-    const b = world.createBody({
-      type: isElevator ? "kinematic" : "static",
-      position: planck.Vec2((plat.x + plat.w / 2) / SCALE, (plat.y + plat.h / 2) / SCALE),
-      userData: { type: "platform", id: plat.id }
-    });
-    b.createFixture(planck.Box(plat.w / 2 / SCALE, plat.h / 2 / SCALE), {
-      friction: 0.0,
-      restitution: 0.0
-    });
-    if (isElevator && plat.vx != null) {
-      b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-    }
-    bodyMap.set("platform_" + plat.id, b);
-  }
-
-  for (const crate of G.crates) {
-    const b = world.createBody({
-      type: "static",
-      position: planck.Vec2((crate.x + crate.w / 2) / SCALE, (crate.y + crate.h / 2) / SCALE),
-      userData: { type: "crate", id: crate.id }
-    });
-    b.createFixture(planck.Box(crate.w / 2 / SCALE, crate.h / 2 / SCALE));
-    bodyMap.set("crate_" + crate.id, b);
-  }
-
-  for (const bullet of G.bullets) {
-    const b = world.createDynamicBody({
-      position: planck.Vec2(bullet.body.x / SCALE, bullet.body.y / SCALE),
-      bullet: true,
-      gravityScale: bullet.gravityScale,
-      userData: { type: "bullet", id: bullet.id, owner: bullet.owner }
-    });
-    b.createFixture(planck.Circle(bullet.r / SCALE), {
-      friction: 0.0,
-      restitution: BULLET_BOUNCE_RESTITUTION,
-      density: 0.1,
-    });
-    b.setLinearVelocity(planck.Vec2(bullet.vx / SCALE, bullet.vy / SCALE));
-    bodyMap.set("bullet_" + bullet.id, b);
-  }
-
-  world.on('pre-solve', function(contact, oldManifold) {
-    const fA = contact.getFixtureA();
-    const fB = contact.getFixtureB();
-    const uA = fA.getBody().getUserData() as any;
-    const uB = fB.getBody().getUserData() as any;
-    
-    if (uA?.type === "bullet" && uB?.type === "player" && uA.owner === uB.id) {
-      contact.setEnabled(false);
-    }
-    if (uB?.type === "bullet" && uA?.type === "player" && uB.owner === uA.id) {
-      contact.setEnabled(false);
-    }
-    if (uA?.type === "bullet" && uB?.type === "bullet") {
-      contact.setEnabled(false);
-    }
-  });
-
-  world.on('begin-contact', function(contact) {
-    const fA = contact.getFixtureA();
-    const fB = contact.getFixtureB();
-    const uA = fA.getBody().getUserData() as any;
-    const uB = fB.getBody().getUserData() as any;
-
-    if (uA?.type === "bullet" || uB?.type === "bullet") {
-      const bulletU = uA?.type === "bullet" ? uA : uB;
-      const otherU = uA?.type === "bullet" ? uB : uA;
-      
-      if (!currentG) return;
-      const bulletState = currentG.bullets.find(b => b.id === bulletU.id);
-      if (!bulletState) return;
-
-      if (otherU?.type === "platform") {
-        pendingPlatformDamages.push({
-          id: otherU.id,
-          damage: bulletState.damage,
-          x: bulletState.body.x,
-          y: bulletState.body.y,
-        });
-      } else if (otherU?.type === "crate") {
-        pendingCrateDamages.push({
-          id: otherU.id,
-          damage: bulletState.damage,
-          x: bulletState.body.x,
-          y: bulletState.body.y,
-        });
-      } else if (otherU?.type === "player") {
-        const wm = contact.getWorldManifold(null as any);
-        const contactPx = wm && wm.points && wm.points.length > 0 ? { x: wm.points[0].x * SCALE, y: wm.points[0].y * SCALE } : { x: bulletState.body.x, y: bulletState.body.y };
-        if (otherU.id !== bulletState.owner && isPlayerAlive(currentG, otherU.id) && canDamage(currentG, bulletState.owner, otherU.id)) {
-           if (!handledBulletPlayerHitsThisStep.has(String(bulletState.id))) {
-              handledBulletPlayerHitsThisStep.add(String(bulletState.id));
-              pendingBulletDestroys.add(bulletState.id);
-              const { damage, isHeadshot } = resolveBulletPlayerDamage(
-                currentG,
-                otherU.id,
-                "player",
-                bulletState,
-                contactPx,
-              );
-              
-              const headPoint = isHeadshot ? headHitPointPx(G, otherU.id) : null;
-              pendingHits.push({
-                x: headPoint?.x ?? bulletState.body.x,
-                y: headPoint?.y ?? bulletState.body.y,
-                targetId: otherU.id,
-                damage,
-                isHeadshot,
-              });
-           }
-        }
-      }
-
-      // Count bounces against walls, platforms, crates (anything that isn't a damaging player hit).
-      const isDamagingPlayerHit =
-        otherU?.type === "player" &&
-        otherU.id !== bulletState.owner &&
-        isPlayerAlive(currentG, otherU.id) &&
-        canDamage(currentG, bulletState.owner, otherU.id);
-      if (!isDamagingPlayerHit) {
-        bulletState.bounceCount = (bulletState.bounceCount || 0) + 1;
-        if (bulletState.bounceCount >= MAX_BULLET_BOUNCES) {
-          pendingBulletDestroys.add(bulletState.id);
-        }
-      }
-    }
-  });
-
-  currentWorldTick = G.worldTick;
-}
-
-function updatePlayerCrouchFixture(p: PlayerState, b: planck.Body) {
-  let fix = b.getFixtureList();
-  while (fix) {
-    b.destroyFixture(fix);
-    fix = fix.getNext();
-  }
-  const h = p.crouching ? PLAYER_CROUCH_H : PLAYER_H;
-  b.createFixture(planck.Box(PLAYER_W / 2 / SCALE, h / 2 / SCALE), {
-    friction: 0.0,
-    restitution: 0.0,
-    density: 1.0,
-  });
-}
+const FLOOR_AABB: AABB = {
+  x: 0,
+  y: FLOOR_Y - ARENA_WALL_THICK,
+  w: ARENA_W,
+  h: ARENA_WALL_THICK,
+};
+const LEFT_WALL_AABB: AABB = {
+  x: -ARENA_WALL_THICK,
+  y: -ARENA_WALL_THICK,
+  w: ARENA_WALL_THICK,
+  h: ARENA_H + ARENA_WALL_THICK * 2,
+};
+const RIGHT_WALL_AABB: AABB = {
+  x: ARENA_W,
+  y: -ARENA_WALL_THICK,
+  w: ARENA_WALL_THICK,
+  h: ARENA_H + ARENA_WALL_THICK * 2,
+};
+const CEILING_AABB: AABB = {
+  x: -ARENA_WALL_THICK,
+  y: -ARENA_WALL_THICK,
+  w: ARENA_W + ARENA_WALL_THICK * 2,
+  h: ARENA_WALL_THICK,
+};
 
 function setCurrentG(G: ShooterState) {
-  ensureWorld(G);
   currentG = G;
 }
 
@@ -636,6 +478,17 @@ function isPlayerAlive(G: ShooterState, id: string): boolean {
   return !!p && p.health > 0;
 }
 
+function toPlatformArcade(plat: PlatformState): ArcadePlatform {
+  return {
+    x: plat.x,
+    y: plat.y,
+    w: plat.w,
+    h: plat.h,
+    vx: plat.vx,
+    isElevator: plat.kind === "elevator",
+  };
+}
+
 function syncHeadFromTorso(p: PlayerState) {
   p.head = { x: p.torso.x, y: p.torso.y - HEAD_OFFSET, angle: 0 };
   p.torso.angle = 0;
@@ -663,6 +516,16 @@ function playerBodyHeight(p: PlayerState): number {
 
 function getFeetY(p: PlayerState): number {
   return p.torso.y + playerBodyHeight(p) / 2;
+}
+
+function playerTorsoAABB(p: PlayerState): AABB {
+  const h = playerBodyHeight(p);
+  return {
+    x: p.torso.x - PLAYER_W / 2,
+    y: p.torso.y - h / 2,
+    w: PLAYER_W,
+    h,
+  };
 }
 
 function applyCrouchPose(p: PlayerState, crouching: boolean) {
@@ -845,12 +708,6 @@ function removePickup(G: ShooterState, id: number) {
 }
 
 function destroyBullet(G: ShooterState, bulletId: number) {
-  const key = "bullet_" + bulletId;
-  const body = bodyMap.get(key);
-  if (body && world) {
-    world.destroyBody(body);
-    bodyMap.delete(key);
-  }
   const idx = G.bullets.findIndex((b) => b.id === bulletId);
   if (idx >= 0) G.bullets.splice(idx, 1);
 }
@@ -988,11 +845,140 @@ function applyVerticalJump(p: PlayerState, opts: { keepVx?: number; horizImpulse
   p.jumpGrace = 8;
 }
 
+function scanPlayerWallContact(G: ShooterState, playerId: string) {
+  const p = G.players[playerId];
+  if (!p) return null;
+  const box = playerTorsoAABB(p);
+  const headY = p.head.y;
+
+  if (box.x <= 1) return { nx: 1, ny: 0 };
+  if (box.x + box.w >= ARENA_W - 1) return { nx: -1, ny: 0 };
+
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
+    if (box.x + box.w > platBox.x && box.x < platBox.x + platBox.w) {
+      if (headY <= platBox.y + platBox.h + 2 && box.y + box.h > platBox.y + platBox.h) continue;
+    }
+    if (Math.abs(box.x + box.w - platBox.x) <= 3 && box.y + box.h > platBox.y + 4) {
+      return { nx: -1, ny: 0 };
+    }
+    if (Math.abs(box.x - (platBox.x + platBox.w)) <= 3 && box.y + box.h > platBox.y + 4) {
+      return { nx: 1, ny: 0 };
+    }
+  }
+  return null;
+}
+
+function updatePlayerWallContacts(G: ShooterState) {
+  for (const [id, p] of Object.entries(G.players)) {
+    if (!isPlayerAlive(G, id)) continue;
+    if (isPlayerGrounded(p)) {
+      p.wallJumpUsed = false;
+    }
+  }
+}
+
+function resolvePlayerWalls(player: ArcadePlayer) {
+  const halfW = player.w / 2;
+  if (player.x - halfW < 0) {
+    player.x = halfW;
+    player.vx = Math.max(0, player.vx);
+  }
+  if (player.x + halfW > ARENA_W) {
+    player.x = ARENA_W - halfW;
+    player.vx = Math.min(0, player.vx);
+  }
+  const halfH = player.h / 2;
+  if (player.y - halfH < 0) {
+    player.y = halfH;
+    player.vy = Math.max(0, player.vy);
+  }
+}
+
+function resolvePlayerSideStick(G: ShooterState) {
+  for (const [id, p] of Object.entries(G.players)) {
+    if (!isPlayerAlive(G, id)) continue;
+    if (isPlayerGrounded(p)) continue;
+    if (p.jumpGrace > 0) continue;
+    if (p.vy < -2 * SCALE) continue;
+
+    const wall = scanPlayerWallContact(G, id);
+    if (wall && Math.abs(wall.nx) > 0.5) {
+      if (p.vy >= 0) p.vy = Math.max(p.vy, 5 * SCALE);
+    }
+  }
+
+  for (const p of Object.values(G.players)) {
+    if (p.jumpGrace > 0) p.jumpGrace -= 1;
+  }
+}
+
+function stepArcadePlayers(G: ShooterState) {
+  const arcadePlayers: { id: string; player: ArcadePlayer; wasGrounded: boolean }[] = [];
+
+  for (const [id, p] of Object.entries(G.players)) {
+    if (!isPlayerAlive(G, id)) continue;
+    ensurePlayerPhysics(p);
+
+    const wasGrounded = p.grounded;
+    const moveInput = p.input?.action === "left" || p.input?.action === "right";
+    const player: ArcadePlayer = {
+      x: p.torso.x,
+      y: p.torso.y,
+      w: PLAYER_W,
+      h: playerBodyHeight(p),
+      vx: p.vx,
+      vy: p.vy,
+      grounded: false,
+      moveInput,
+    };
+
+    if (!moveInput) {
+      player.vx = 0;
+    }
+
+    stepPlayer(player, PHYSICS_DT, GRAVITY, !wasGrounded);
+    resolvePlayerPlatform(player, FLOOR_AABB, wasGrounded);
+    for (const plat of G.platforms) {
+      if (!plat.broken) resolvePlayerPlatform(player, toPlatformArcade(plat), wasGrounded);
+    }
+    resolvePlayerWalls(player);
+
+    arcadePlayers.push({ id, player, wasGrounded });
+  }
+
+  for (let i = 0; i < arcadePlayers.length; i += 1) {
+    for (let j = i + 1; j < arcadePlayers.length; j += 1) {
+      resolvePlayerPlayer(arcadePlayers[i].player, arcadePlayers[j].player, ARENA_W);
+    }
+  }
+
+  for (const { player } of arcadePlayers) {
+    resolvePlayerWalls(player);
+  }
+
+  for (const { id, player } of arcadePlayers) {
+    const p = G.players[id];
+    if (!p) continue;
+    p.torso.x = player.x;
+    p.torso.y = player.y;
+    p.vx = player.vx;
+    p.vy = player.vy;
+    p.grounded = player.grounded;
+    syncHeadFromTorso(p);
+  }
+}
+
 function bulletRadiusForKind(kind: BulletState["kind"]): number {
   if (kind === "rocket") return 0.11 * SCALE;
   if (kind === "grenade") return 0.09 * SCALE;
   if (kind === "pellet") return 0.05 * SCALE;
   return 0.07 * SCALE;
+}
+
+function syncStateFromPhysics(_G: ShooterState) {
+  /* state is authoritative in arcade mode */
 }
 
 function queueExplosion(x: number, y: number, radius: number, damage: number, owner: string) {
@@ -1130,14 +1116,12 @@ function spawnProjectile(
   owner: string,
   weaponId: WeaponId,
   weapon: WeaponDef,
-  x: number,
-  y: number,
-  angle: number,
+  startX: number,
+  startY: number,
+  shotAngle: number,
 ) {
-  const vx = Math.cos(angle) * weapon.speed * BULLET_SPEED_MUL * SCALE;
-  const vy = Math.sin(angle) * weapon.speed * BULLET_SPEED_MUL * SCALE;
-
-  const kind: BulletState["kind"] =
+  const bulletId = G.nextBulletId++;
+  const kind =
     weapon.kind === "rocket"
       ? "rocket"
       : weapon.kind === "grenade"
@@ -1146,39 +1130,29 @@ function spawnProjectile(
           ? "pellet"
           : "bullet";
 
-  const bState: BulletState = {
-    id: G.nextBulletId++,
+  const speed = (weapon.speed || BULLET_SPEED / SCALE) * SCALE * BULLET_SPEED_MUL;
+  const gravityScale = weapon.gravityScale ?? BULLET_GRAVITY_SCALE;
+  const r = bulletRadiusForKind(kind);
+  const clampedX = Math.max(r, Math.min(ARENA_W - r, startX));
+  const clampedY = Math.max(r, Math.min(ARENA_H - r, startY));
+
+  G.bullets.push({
+    id: bulletId,
     owner,
-    body: { x, y, angle },
+    body: { x: clampedX, y: clampedY, angle: shotAngle },
     kind,
     weaponId,
     damage: weapon.damage,
     aoeRadius: weapon.aoeRadius,
     fuseTicks: weapon.fuseTicks,
-    vx,
-    vy,
-    r: bulletRadiusForKind(kind),
-    gravityScale: weapon.gravityScale ?? 1,
-    bounceCount: 0,
-  };
-  G.bullets.push(bState);
-
-  if (world) {
-    const b = world.createDynamicBody({
-      position: planck.Vec2(x / SCALE, y / SCALE),
-      bullet: true,
-      gravityScale: bState.gravityScale,
-      userData: { type: "bullet", id: bState.id, owner: bState.owner }
-    });
-    b.createFixture(planck.Circle(bState.r / SCALE), {
-      friction: 0.0,
-      restitution: BULLET_BOUNCE_RESTITUTION,
-      density: 0.1,
-    });
-    b.setLinearVelocity(planck.Vec2(vx / SCALE, vy / SCALE));
-    bodyMap.set("bullet_" + bState.id, b);
-  }
+    vx: Math.cos(shotAngle) * speed,
+    vy: Math.sin(shotAngle) * speed,
+    r,
+    gravityScale,
+    bounces: 0,
+  });
 }
+
 function applyRecoil(
   p: PlayerState,
   aimAngle: number,
@@ -1534,29 +1508,10 @@ function processPendingHits(G: ShooterState, random: RandomAPI) {
   pendingBulletDestroys.clear();
 }
 
-function isHeadshotHit(G: ShooterState, targetId: string, hitX: number, hitY: number, bullet?: BulletState): boolean {
+function isHeadshotHit(G: ShooterState, targetId: string, hitX: number, hitY: number): boolean {
   const target = G.players[targetId];
   if (!target) return false;
-  
-  if (Math.hypot(hitX - target.head.x, hitY - target.head.y) <= HEAD_HIT_RADIUS_PX) {
-    return true;
-  }
-  
-  if (bullet) {
-    const speed = Math.hypot(bullet.vx, bullet.vy);
-    if (speed > 0.01) {
-      const nx = bullet.vx / speed;
-      const ny = bullet.vy / speed;
-      const fwdPx = 40; // Look ahead 40 pixels (1 tick of movement)
-      const x2 = hitX + nx * fwdPx;
-      const y2 = hitY + ny * fwdPx;
-      if (distPointToSegment(target.head.x, target.head.y, hitX, hitY, x2, y2) <= HEAD_HIT_RADIUS_PX + 2) {
-        return true;
-      }
-    }
-  }
-  
-  return false;
+  return Math.hypot(hitX - target.head.x, hitY - target.head.y) <= HEAD_HIT_RADIUS_PX;
 }
 
 function bulletHitsHeadZone(G: ShooterState, targetId: string, bullet: BulletState): boolean {
@@ -1565,7 +1520,7 @@ function bulletHitsHeadZone(G: ShooterState, targetId: string, bullet: BulletSta
 
   const bx = bullet.body.x;
   const by = bullet.body.y;
-  if (isHeadshotHit(G, targetId, bx, by, bullet)) return true;
+  if (isHeadshotHit(G, targetId, bx, by)) return true;
 
   const speed = Math.hypot(bullet.vx, bullet.vy);
   if (speed < 0.01) return false;
@@ -1613,7 +1568,7 @@ function resolveBulletPlayerDamage(
   const headshot =
     hitPart === "head" ||
     bulletHitsHeadZone(G, targetId, bullet) ||
-    (contactPx != null && isHeadshotHit(G, targetId, contactPx.x, contactPx.y, bullet));
+    (contactPx != null && isHeadshotHit(G, targetId, contactPx.x, contactPx.y));
 
   if (headshot) {
     return { damage: HEADSHOT_DAMAGE, isHeadshot: true };
@@ -1621,74 +1576,254 @@ function resolveBulletPlayerDamage(
   return { damage: BODY_BULLET_DAMAGE, isHeadshot: false };
 }
 
-function isPlayerGroundedPlanck(p: PlayerState, b: planck.Body): boolean {
-  if (Math.abs(p.vy) > 2 * SCALE) return false;
-  for (let ce = b.getContactList(); ce; ce = ce.next) {
-    const c = ce.contact;
-    if (c.isTouching()) {
-      const wm = c.getWorldManifold(null);
-      if (wm) {
-         return true; // Simple heuristic: any contact while low velocity is grounded
+function bulletHitsSolid(G: ShooterState, b: BulletState, prevX?: number, prevY?: number): boolean {
+  const circle = { x: b.body.x, y: b.body.y, r: b.r };
+  if (checkBulletWall(circle, FLOOR_AABB, prevX, prevY)) return true;
+  if (checkBulletWall(circle, LEFT_WALL_AABB, prevX, prevY)) return true;
+  if (checkBulletWall(circle, RIGHT_WALL_AABB, prevX, prevY)) return true;
+  if (checkBulletWall(circle, CEILING_AABB, prevX, prevY)) return true;
+
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    const platBox: AABB = { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h };
+    if (checkBulletWall(circle, platBox, prevX, prevY)) return true;
+  }
+
+  for (const crate of G.crates) {
+    const crateBox: AABB = { x: crate.x, y: crate.y, w: crate.w, h: crate.h };
+    if (checkBulletWall(circle, crateBox, prevX, prevY)) return true;
+  }
+
+  return false;
+}
+
+function resolveBulletSolidBounce(
+  G: ShooterState,
+  b: BulletState,
+  bulletState: ArcadeBullet,
+  prevX: number,
+  prevY: number,
+): boolean {
+  const bounces = b.bounces ?? 0;
+  type SolidHit =
+    | { kind: "arena"; box: AABB }
+    | { kind: "platform"; box: AABB; id: number }
+    | { kind: "crate"; box: AABB; id: number };
+
+  const solids: SolidHit[] = [
+    { kind: "arena", box: FLOOR_AABB },
+    { kind: "arena", box: LEFT_WALL_AABB },
+    { kind: "arena", box: RIGHT_WALL_AABB },
+    { kind: "arena", box: CEILING_AABB },
+  ];
+
+  for (const plat of G.platforms) {
+    if (plat.broken) continue;
+    solids.push({
+      kind: "platform",
+      id: plat.id,
+      box: { x: plat.x, y: plat.y - plat.h, w: plat.w, h: plat.h },
+    });
+  }
+
+  for (const crate of G.crates) {
+    solids.push({
+      kind: "crate",
+      id: crate.id,
+      box: { x: crate.x, y: crate.y, w: crate.w, h: crate.h },
+    });
+  }
+
+  for (const solid of solids) {
+    if (!checkBulletWall(bulletState, solid.box, prevX, prevY)) continue;
+
+    const hit = getCircleAABBCollision(bulletState, solid.box);
+    if (!hit.hit) continue;
+    if (bounces >= MAX_BULLET_BOUNCES) return true;
+
+    bounceBullet(bulletState, hit.nx, hit.ny, BULLET_BOUNCE_RESTITUTION);
+    b.body.x = bulletState.x;
+    b.body.y = bulletState.y;
+    b.vx = bulletState.vx;
+    b.vy = bulletState.vy;
+    b.bounces = bounces + 1;
+    b.body.angle = Math.atan2(b.vy, b.vx);
+    pendingHits.push({ x: b.body.x, y: b.body.y, targetId: "", damage: 0 });
+
+    if (solid.kind === "platform") {
+      pendingPlatformDamages.push({
+        id: solid.id,
+        damage: b.damage,
+        x: b.body.x,
+        y: b.body.y,
+      });
+    } else if (solid.kind === "crate") {
+      pendingCrateDamages.push({
+        id: solid.id,
+        damage: b.damage,
+        x: b.body.x,
+        y: b.body.y,
+      });
+    }
+
+    return false;
+  }
+
+  return false;
+}
+
+function stepArcadeBullets(G: ShooterState) {
+  handledBulletPlayerHitsThisStep.clear();
+
+  for (const b of [...G.bullets]) {
+    if (pendingBulletDestroys.has(b.id)) continue;
+
+    const prevX = b.body.x;
+    const prevY = b.body.y;
+    const bulletState = { x: b.body.x, y: b.body.y, r: b.r, vx: b.vx, vy: b.vy };
+    stepBullet(bulletState, PHYSICS_DT, GRAVITY, b.gravityScale);
+    b.body.x = bulletState.x;
+    b.body.y = bulletState.y;
+    b.vx = bulletState.vx;
+    b.vy = bulletState.vy;
+    b.body.angle = Math.atan2(b.vy, b.vx);
+
+    if (b.fuseTicks != null) {
+      b.fuseTicks -= 1;
+      if (b.fuseTicks <= 0) {
+        queueExplosion(b.body.x, b.body.y, b.aoeRadius ?? 70, b.damage, b.owner);
+        pendingBulletDestroys.add(b.id);
+        continue;
       }
     }
+
+    if (b.kind === "rocket" || b.kind === "grenade") {
+      if (bulletHitsSolid(G, b, prevX, prevY)) {
+        queueExplosion(b.body.x, b.body.y, b.aoeRadius ?? 70, b.damage, b.owner);
+        pendingBulletDestroys.add(b.id);
+        continue;
+      }
+    } else {
+      let hitPlayer = false;
+      for (const [targetId, target] of Object.entries(G.players)) {
+        if (targetId === b.owner || target.health <= 0 || !isPlayerAlive(G, targetId)) continue;
+        if (G.roundPhase !== "playing") continue;
+        if (!canDamage(G, b.owner, targetId)) continue;
+        if (handledBulletPlayerHitsThisStep.has(String(b.id))) continue;
+
+        const headBox = {
+          x: target.head.x - HEAD_HIT_RADIUS_PX,
+          y: target.head.y - HEAD_HIT_RADIUS_PX,
+          w: HEAD_HIT_RADIUS_PX * 2,
+          h: HEAD_HIT_RADIUS_PX * 2,
+        };
+        const torsoBox = playerTorsoAABB(target);
+        const circle = { x: b.body.x, y: b.body.y, r: b.r };
+        const headHit =
+          checkBulletWall(circle, headBox, prevX, prevY) || checkCircleAABB(circle, headBox);
+        const torsoHit =
+          checkBulletWall(circle, torsoBox, prevX, prevY) || checkCircleAABB(circle, torsoBox);
+        if (!headHit && !torsoHit) continue;
+
+        handledBulletPlayerHitsThisStep.add(String(b.id));
+        pendingBulletDestroys.add(b.id);
+        const hitPart = headHit ? "head" : "player";
+        const { damage, isHeadshot } = resolveBulletPlayerDamage(
+          G,
+          targetId,
+          hitPart,
+          b,
+          { x: b.body.x, y: b.body.y },
+        );
+        const headPoint = isHeadshot ? headHitPointPx(G, targetId) : null;
+        pendingHits.push({
+          x: headPoint?.x ?? b.body.x,
+          y: headPoint?.y ?? b.body.y,
+          targetId,
+          damage,
+          isHeadshot,
+        });
+        hitPlayer = true;
+        break;
+      }
+      if (hitPlayer || pendingBulletDestroys.has(b.id)) continue;
+
+      const destroyOnImpact = resolveBulletSolidBounce(G, b, bulletState, prevX, prevY);
+      if (destroyOnImpact) {
+        pendingBulletDestroys.add(b.id);
+        continue;
+      }
+    }
+
+    if (
+      b.body.x < -20 ||
+      b.body.x > ARENA_W + 20 ||
+      b.body.y > ARENA_H + 20 ||
+      b.body.y < -20
+    ) {
+      pendingBulletDestroys.add(b.id);
+    }
   }
-  return false;
+
+  for (let i = 0; i < G.bullets.length; i += 1) {
+    for (let j = i + 1; j < G.bullets.length; j += 1) {
+      const a = G.bullets[i];
+      const b = G.bullets[j];
+      if (pendingBulletDestroys.has(a.id) || pendingBulletDestroys.has(b.id)) continue;
+      if (a.owner === b.owner) continue;
+      if (a.kind === "rocket" || a.kind === "grenade" || b.kind === "rocket" || b.kind === "grenade") {
+        continue;
+      }
+
+      const hit = checkCircleCircle(
+        { x: a.body.x, y: a.body.y, r: a.r },
+        { x: b.body.x, y: b.body.y, r: b.r },
+      );
+      if (!hit) continue;
+
+      pendingBulletDestroys.add(a.id);
+      pendingBulletDestroys.add(b.id);
+      pendingHits.push({ x: (a.body.x + b.body.x) / 2, y: (a.body.y + b.body.y) / 2, targetId: "", damage: 0 });
+    }
+  }
 }
 
 function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI) {
   const p = G.players[playerId];
   if (!p || p.health <= 0 || !p.input) return;
+  ensurePlayerPhysics(p);
 
   const data = p.input;
-  const b = bodyMap.get("player_" + playerId);
-  if (!b) return;
-
-  const pos = b.getPosition();
-  if (Math.abs(pos.x * SCALE - p.torso.x) > 0.1 || Math.abs(pos.y * SCALE - p.torso.y) > 0.1) {
-    b.setPosition(planck.Vec2(p.torso.x / SCALE, p.torso.y / SCALE));
-  }
-
-  const v = b.getLinearVelocity();
-  p.vx = v.x * SCALE;
-  p.vy = v.y * SCALE;
-
-  const grounded = isPlayerGroundedPlanck(p, b);
-  p.grounded = grounded;
-
   const wantCrouch = data.crouching === true || data.action === "crouch";
+  const grounded = isPlayerGrounded(p);
   if (wantCrouch && grounded) {
-    if (!p.crouching) {
-      p.crouching = true;
-      applyCrouchPose(p, true);
-      updatePlayerCrouchFixture(p, b);
-    }
+    applyCrouchPose(p, true);
   } else if (!wantCrouch && p.crouching) {
-    p.crouching = false;
     applyCrouchPose(p, false);
-    updatePlayerCrouchFixture(p, b);
   } else {
     p.crouching = wantCrouch && grounded;
   }
-  
   const speedMul = p.crouching ? 0.45 : 1;
-  let vx = p.vx;
-  let vy = p.vy;
 
   if (data.action === "left") {
-    vx = -MOVE_SPEED * speedMul;
+    p.vx = -MOVE_SPEED * speedMul;
   } else if (data.action === "right") {
-    vx = MOVE_SPEED * speedMul;
+    p.vx = MOVE_SPEED * speedMul;
   } else {
-    if (grounded) vx = 0;
+    p.vx = 0;
   }
 
   if (data.jumping) {
+    const wall = scanPlayerWallContact(G, playerId);
     const standingJump = canPerformStandingJump(G, playerId, p.crouching);
-    if (standingJump || grounded) {
-      vy = JUMP_VY;
-      p.grounded = false;
-    } else {
-      // console.log("Did not jump");
+
+    if (standingJump) {
+      applyVerticalJump(p, { keepVx: p.vx });
+      p.wallJumpUsed = false;
+    } else if (wall && !p.wallJumpUsed) {
+      const awayX = wall.nx >= 0 ? 1 : -1;
+      applyVerticalJump(p, { horizImpulse: WALL_JUMP_IMPULSE_X * awayX });
+      p.wallJumpUsed = true;
     }
     data.jumping = false;
   }
@@ -1697,84 +1832,29 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
     fireWeapon(G, playerId, data.aimAngle, data.facing, random);
   }
 
-  b.setAwake(true);
-  b.setLinearVelocity(planck.Vec2(vx / SCALE, vy / SCALE));
-  p.vx = vx;
-  p.vy = vy;
+  if (
+    data.action !== "left" &&
+    data.action !== "right" &&
+    data.action !== "crouch" &&
+    !(wantCrouch && !data.action)
+  ) {
+    if (Math.abs(p.vx) > 0.05) p.vx = 0;
+  }
 }
+
 function advanceWorld(G: ShooterState, random: RandomAPI) {
   setCurrentG(G);
   G.hitEvents = [];
   G.worldTick += 1;
-  currentWorldTick = G.worldTick;
 
   if (G.roundPhase === "playing") {
     runSpawnCycle(G, random);
+    advancePlatformMotion(G, random);
     updatePickupDrops(G);
-    
-    world!.step(1 / 30);
-    currentWorldTick = G.worldTick;
-    
-    for (const [id, p] of Object.entries(G.players)) {
-      const b = bodyMap.get("player_" + id);
-      if (b) {
-        const pos = b.getPosition();
-        const v = b.getLinearVelocity();
-        p.torso.x = pos.x * SCALE;
-        p.torso.y = pos.y * SCALE;
-        p.vx = v.x * SCALE;
-        p.vy = v.y * SCALE;
-        syncHeadFromTorso(p);
-      }
-    }
-    
-    for (const bullet of G.bullets) {
-      const b = bodyMap.get("bullet_" + bullet.id);
-      if (b) {
-        const pos = b.getPosition();
-        // console.log("Bullet Y:", pos.y * SCALE, "X:", pos.x * SCALE);
-        const v = b.getLinearVelocity();
-        bullet.body.x = pos.x * SCALE;
-        bullet.body.y = pos.y * SCALE;
-        bullet.vx = v.x * SCALE;
-        bullet.vy = v.y * SCALE;
-        bullet.body.angle = Math.atan2(bullet.vy, bullet.vx);
-
-        if (bullet.fuseTicks != null) {
-          bullet.fuseTicks -= 1;
-          if (bullet.fuseTicks <= 0) {
-            queueExplosion(bullet.body.x, bullet.body.y, bullet.aoeRadius ?? 70, bullet.damage, bullet.owner);
-            pendingBulletDestroys.add(bullet.id);
-          }
-        }
-        
-        if (bullet.body.x < -20 || bullet.body.x > ARENA_W + 20 || bullet.body.y > ARENA_H + 20 || bullet.body.y < -20) {
-          pendingBulletDestroys.add(bullet.id);
-        }
-      }
-    }
-
-    for (const plat of G.platforms) {
-      if (plat.kind === "elevator") {
-        const b = bodyMap.get("platform_" + plat.id);
-        if (b) {
-          const pos = b.getPosition();
-          plat.x = pos.x * SCALE - plat.w / 2;
-          
-          if (plat.minX != null && plat.x < plat.minX) {
-            plat.x = plat.minX;
-            plat.vx = Math.abs(plat.vx!);
-            b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-          }
-          if (plat.maxX != null && plat.x > plat.maxX) {
-            plat.x = plat.maxX;
-            plat.vx = -Math.abs(plat.vx!);
-            b.setLinearVelocity(planck.Vec2(plat.vx / SCALE, 0));
-          }
-        }
-      }
-    }
-
+    stepArcadePlayers(G);
+    updatePlayerWallContacts(G);
+    resolvePlayerSideStick(G);
+    stepArcadeBullets(G);
     processExplosions(G);
     processPendingHits(G, random);
     fixOrphanedPickups(G);
@@ -1783,6 +1863,7 @@ function advanceWorld(G: ShooterState, random: RandomAPI) {
     checkRoundEnd(G);
   }
 }
+
 function resetRound(G: ShooterState) {
   handledBulletPlayerHitsThisStep.clear();
   G.bullets = [];
@@ -1836,16 +1917,16 @@ function fireWeapon(
   random: RandomAPI,
 ) {
   const p = G.players[playerId];
-  if (!p || p.health <= 0) { return false; }
+  if (!p || p.health <= 0) return false;
   ensurePlayerPhysics(p);
 
   const weaponId = p.currentWeapon;
   const weapon = WEAPONS[weaponId];
-  if (!weapon) { return false; }
+  if (!weapon) return false;
 
-  if (p.lastFireTick >= 0 && G.worldTick - p.lastFireTick < weapon.fireRateTicks) { return false; }
+  if (p.lastFireTick >= 0 && G.worldTick - p.lastFireTick < weapon.fireRateTicks) return false;
 
-  const onGround = isPlayerGroundedPlanck(p, bodyMap.get("player_" + playerId)!);
+  const onGround = isPlayerGrounded(p);
 
   if (weapon.kind === "melee") {
     applyRecoil(p, aimAngle, onGround, p.crouching, weaponId);
@@ -1857,11 +1938,11 @@ function fireWeapon(
   const pellets = weapon.pelletCount ?? 1;
   const activeCount = G.bullets.filter((b) => b.owner === playerId).length;
   if (activeCount + pellets > weapon.maxActive) {
-    if (activeCount >= weapon.maxActive) { return false; }
+    if (activeCount >= weapon.maxActive) return false;
   }
 
   const weaponActive = countActiveProjectiles(G, playerId, weaponId);
-  if (weaponActive >= weapon.maxActive) { return false; }
+  if (weaponActive >= weapon.maxActive) return false;
 
   applyRecoil(p, aimAngle, onGround, p.crouching, weaponId);
 
@@ -1881,7 +1962,6 @@ function fireWeapon(
   }
 
   p.lastFireTick = G.worldTick;
-  // spawned
   return true;
 }
 
@@ -1929,7 +2009,6 @@ export default defineGame<ShooterState>({
   },
 
   setup: (ctx) => {
-    // Setup called
     try {
     const gameMode = parseGameConfig(ctx.config);
     if (gameMode === "teams2v2" && ctx.numPlayers !== 4) {
@@ -2091,8 +2170,8 @@ export const testUtils = {
     bullet: BulletState,
     contactPx: { x: number; y: number } | null,
   ) => resolveBulletPlayerDamage(G, targetId, hitPart, bullet, contactPx).damage,
-  isHeadshotHit: (G: ShooterState, targetId: string, hitX: number, hitY: number, bullet?: BulletState) =>
-    isHeadshotHit(G, targetId, hitX, hitY, bullet),
+  isHeadshotHit: (G: ShooterState, targetId: string, hitX: number, hitY: number) =>
+    isHeadshotHit(G, targetId, hitX, hitY),
   bulletHitsHeadZone: (G: ShooterState, targetId: string, bullet: BulletState) =>
     bulletHitsHeadZone(G, targetId, bullet),
 };

@@ -219,7 +219,11 @@ test("pickup falls when platform beneath it is destroyed", () => {
   assert.ok(pickup!.y >= 470, `pickup should reach floor, y=${pickup!.y}`);
   assert.equal(pickup!.targetY, undefined);
   assert.equal(pickup!.fallToFloor, false);
-  assert.ok(m.G.platforms.find((p) => p.id === 1)?.broken);
+  assert.equal(
+    m.G.platforms.find((p) => p.id === 1),
+    undefined,
+    "broken platform should be removed",
+  );
 });
 
 test("weapon pickup falls to floor when platform is destroyed", () => {
@@ -539,17 +543,29 @@ test("side torso contact at chest height is not a headshot", () => {
 
 test("shooting aimed at head deals 500 damage", () => {
   let m = bootMatch( { players: ["p1", "p2"], seed: "t3" });
-  m = applyMove(game, m, {
-    type: "input",
-    playerId: "p1",
-    payload: { action: "right", aimAngle: 0, crouching: false, shooting: false },
-  }).state;
-  m = advanceTicks(m, 120);
+  m = advanceTicks(m, 20);
 
   const p1 = m.G.players["p1"];
   const p2 = m.G.players["p2"];
-  const aimHead = Math.atan2(p2.head.y - p1.torso.y, p2.torso.x - p1.torso.x);
-  const hpBefore = p2.health;
+  // Short-range line of sight so gravity drop stays inside the head hit zone.
+  p1.torso.x = p2.torso.x - 160;
+  p1.torso.y = p2.torso.y;
+  p1.head.x = p1.torso.x;
+  p1.head.y = p1.torso.y - 36;
+  p1.facing = 1;
+
+  let aimHead = Math.atan2(p2.head.y - p1.torso.y, p2.head.x - p1.torso.x);
+  for (let i = 0; i < 3; i++) {
+    const muzzle = testUtils.computeMuzzlePx(
+      p1.torso.x,
+      p1.torso.y,
+      aimHead,
+      1,
+      false,
+      p1.currentWeapon,
+    );
+    aimHead = Math.atan2(p2.head.y - muzzle.y, p2.head.x - muzzle.x);
+  }
 
   m = applyMove(game, m, {
     type: "input",

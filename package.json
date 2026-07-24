@@ -23,7 +23,8 @@
     "test": "node --test \"test/*.test.ts\""
   },
   "dependencies": {
-    "@bordiko/sdk": "^0.2.0"
+    "@bordiko/sdk": "^0.2.0",
+    "planck": "^1.4.2"
   },
   "devDependencies": {
     "@bordiko/cli": "^0.1.0",
