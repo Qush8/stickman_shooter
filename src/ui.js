@@ -3,6 +3,7 @@ import { connectBordiko } from '@bordiko/sdk/ui';
 
 import { GUN_PISTOL_B64, GUN_SHOTGUN_B64, GUN_RIFLE_B64 } from './sfx-buffers.js';
 import { MAPS } from './maps.ts';
+import { expLerpFactor, lerpToward, reconcileAxis } from './reconcile.js';
 
 /**
  * Reducer-owned constants.
@@ -424,9 +425,6 @@ const getLocalPlatformSnapId = (player, platforms) => {
     return null;
 };
 
-const lerpToward = (from, to, t) => from + (to - from) * t;
-/** Frame-rate independent exponential lerp factor. */
-const expLerpFactor = (rate, dtSec) => 1 - Math.exp(-rate * Math.max(0, dtSec));
 
 let sharedConstsApplied = false;
 
@@ -529,9 +527,8 @@ const observeSnapshotTiming = (state) => {
     }
 };
 
-const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60, snapPlatformId = null) => {
+const syncPlatformDisplayTargets = (platforms, dtSec = 0, snapPlatformId = null) => {
     const liveIds = new Set();
-    const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
     for (const plat of platforms ?? []) {
         if (plat.broken) continue;
         liveIds.add(plat.id);
@@ -573,14 +570,8 @@ const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60, snapPlatformId = 
         } else {
             // Per axis: an elevator respawning off-screen on X must not also
             // teleport its Y, which is smoothly tracking a moving platform.
-            prev.renderX =
-                Math.abs(plat.x - prev.renderX) > SNAP_DIST_X
-                    ? plat.x
-                    : lerpToward(prev.renderX, plat.x, t);
-            prev.renderY =
-                Math.abs(plat.y - prev.renderY) > SNAP_DIST_Y
-                    ? plat.y
-                    : lerpToward(prev.renderY, plat.y, t);
+            prev.renderX = reconcileAxis(prev.renderX, plat.x, REMOTE_LERP_RATE, dtSec, SNAP_DIST_X);
+            prev.renderY = reconcileAxis(prev.renderY, plat.y, REMOTE_LERP_RATE, dtSec, SNAP_DIST_Y);
         }
     }
     for (const id of [...localPlatformDisplay.keys()]) {
@@ -600,7 +591,14 @@ const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60, snapPlatformId = 
     }
 };
 
-const drawPlatforms = (platforms, dtSec = 1 / 60, snapPlatformId = null) => {
+/**
+ * @param dtSec  Seconds since the previous FRAME, or 0 when called from the
+ *   state handler. Pass 0 there: easing once per snapshot makes convergence
+ *   depend on when packets land instead of on frame time — the same bug as
+ *   easing by a fixed fraction per frame, just against the network. The frame
+ *   loop is the only place allowed to advance the smoothing.
+ */
+const drawPlatforms = (platforms, dtSec = 0, snapPlatformId = null) => {
     platformsContainer.removeChildren();
     const renderPlatforms = platforms?.length ? platforms : [];
 
@@ -844,7 +842,11 @@ const drawWeaponDrop = (container, pickup, drawX, drawY, falling, fallRot) => {
     container.position.set(drawX, drawY);
 };
 
-const drawPickups = (pickups, platforms) => {
+/**
+ * @param dtSec  Seconds since the previous FRAME, or 0 from the state handler.
+ *   Smoothing is advanced by the frame loop only — see drawPlatforms.
+ */
+const drawPickups = (pickups, platforms, dtSec = 0) => {
     pickupsContainer.removeChildren();
     if (!pickups?.length) return;
 
@@ -854,7 +856,6 @@ const drawPickups = (pickups, platforms) => {
         if (!liveIds.has(Number(id))) delete localPickupMeta[id];
     }
 
-    const dtSec = Math.min(0.05, (app.ticker.deltaMS || 16) / 1000);
 
     for (const pickup of pickups) {
         const goal = pickupFallGoal(pickup, plats);
@@ -1428,7 +1429,6 @@ let latestState = null;
 let localPlayers = {};
 let localBullets = new Map();
 let particles = [];
-let prevPlatformBroken = {};
 let prevRoundPhase = null;
 let prevLastRoundWinner = null;
 let prevMatchEnded = false;
@@ -1535,6 +1535,106 @@ const sendInputIfChanged = (input) => {
     lastInputSendTime = Date.now();
     return true;
 };
+
+/**
+ * Set by any impact event, cleared by the next snapshot. Replaces the old
+ * "did this snapshot carry hitEvents" check.
+ */
+let impactSinceLastSnapshot = false;
+
+/**
+ * Reducer-emitted presentation events.
+ *
+ * These are fire-and-forget: a missed one just skips an effect, and replays and
+ * reconnection ignore them entirely. Nothing here may drive game logic — every
+ * fact that must be true lives in the authoritative state G.
+ *
+ * This replaces diffing state to guess what changed, which also fixes a real
+ * loss: the reducer's per-tick hit array was only observable if that exact tick
+ * happened to be broadcast, and the tick clock fans out snapshots on its own
+ * schedule. Emitted events are always relayed immediately.
+ */
+bordikoHost.onEvent((e) => {
+    if (!e || typeof e.type !== "string") return;
+    const d = e.data ?? {};
+
+    switch (e.type) {
+        case "hit": {
+            impactSinceLastSnapshot = true;
+            // Retire any local bullet near the impact — the server says it landed.
+            for (const [bulletId, lb] of [...localBullets.entries()]) {
+                if (!lb.body) continue;
+                if (Math.hypot(lb.body.x - d.x, lb.body.y - d.y) > 48) continue;
+                if (lb.g) {
+                    bulletsContainer.removeChild(lb.g);
+                    lb.g.destroy();
+                }
+                localBullets.delete(bulletId);
+            }
+
+            const targetPlayer = localPlayers[d.targetId];
+            let hitX = d.x;
+            let hitY = d.y;
+            if (d.isHeadshot && targetPlayer) {
+                const gun = getGunPose(targetPlayer);
+                hitX = gun.hx;
+                hitY = gun.hy;
+            }
+            createPlayerHitEffect(hitX, hitY, d.isHeadshot);
+            if (targetPlayer) markBulletHitFace(targetPlayer, d.isHeadshot);
+            if (d.isHeadshot) {
+                createHeadshotMarker(hitX, hitY);
+                Sfx.playHeadshot();
+            } else {
+                Sfx.playBulletHit(true);
+            }
+            break;
+        }
+
+        case "wallHit": {
+            impactSinceLastSnapshot = true;
+            createWallHit(d.x, d.y);
+            Sfx.playBulletHit(false);
+            break;
+        }
+
+        case "blast": {
+            impactSinceLastSnapshot = true;
+            createSparkHit(d.x, d.y, Math.max(0.6, (d.r ?? 60) / 60));
+            triggerRecoilShake("bazooka");
+            Sfx.playBulletHit(true);
+            break;
+        }
+
+        case "platformBreak": {
+            createSparkHit(d.x + (d.w ?? 0) / 2, d.y + (d.h ?? 0) / 2, 0.35);
+            break;
+        }
+
+        case "death": {
+            const lp = localPlayers[d.playerId];
+            if (lp) startDeathCorpse(lp);
+            Sfx.playDeath();
+            break;
+        }
+
+        case "pickup": {
+            if (d.kind === "weapon") Sfx.playPickupLand();
+            break;
+        }
+
+        case "weaponSwitch": {
+            const lp = localPlayers[d.playerId];
+            if (lp && d.weaponId === "katana") startKatanaEquip(lp);
+            break;
+        }
+
+        case "debug": {
+            if (d.message) console.warn("[reducer]", d.message);
+            break;
+        }
+    }
+});
 
 bordikoHost.onAck((ack) => {
     if (!ack) return;
@@ -1747,7 +1847,6 @@ function isKeyPressed(...k) {
     return k.some(key => activeKeys.has(key));
 }
 
-let prevPickupIds = new Set();
 
 // Network Sync
 const handleGameState = (state) => {
@@ -1784,10 +1883,6 @@ const handleGameState = (state) => {
             Sfx.playMatchWin();
         }
         prevMatchEnded = !!latestState.ended;
-
-        const curPickupIds = new Set((G?.pickups ?? []).map((p) => p.id));
-        const pickupCollected = [...prevPickupIds].some((id) => !curPickupIds.has(id));
-        prevPickupIds = curPickupIds;
 
         if (G && G.players) {
             if (
@@ -1870,15 +1965,16 @@ const handleGameState = (state) => {
                     const lp = localPlayers[id];
                     const prevX = lp.torso?.x ?? p.torso.x;
                     const prevY = lp.torso?.y ?? p.torso.y;
-                    const prevWeapon = lp.currentWeapon;
                     const prevFireTick = lp.lastFireTick ?? 0;
 
                     if (p.health < lp.prevHealth) {
                         lp.faceTimer = Math.max(lp.faceTimer ?? 0, 0.35);
                     }
-                    if (p.health <= 0 && lp.prevHealth > 0) {
+                    // Death corpse + sound come from the `death` event, not from
+                    // diffing health here. Kept as a safety net only for a client
+                    // that joined or reconnected after the death was emitted.
+                    if (p.health <= 0 && lp.prevHealth > 0 && !lp.deathCorpse) {
                         startDeathCorpse(lp);
-                        Sfx.playDeath();
                     }
                     if (p.health > 0) {
                         lp.deathCorpse = null;
@@ -1925,9 +2021,8 @@ const handleGameState = (state) => {
                     lp.ownedWeapons = p.ownedWeapons?.length ? [...p.ownedWeapons] : ["winchester"];
                     lp.lastFireTick = p.lastFireTick ?? 0;
 
-                    if (p.currentWeapon === "katana" && prevWeapon !== "katana" && pickupCollected) {
-                        startKatanaEquip(lp);
-                    }
+                    // Katana equip is driven by the `weaponSwitch` event; the
+                    // pickupCollected state-diff it used to need is gone.
                     if (p.currentWeapon === "katana" && lp.lastFireTick > prevFireTick) {
                         if (id !== latestState.playerId) {
                             startKatanaSwing(lp);
@@ -1948,54 +2043,15 @@ const handleGameState = (state) => {
                     cached.health = plat.health;
                     cached.maxHealth = plat.maxHealth ?? cached.maxHealth ?? PLATFORM_MAX_HP;
                 }
-                const wasBroken = prevPlatformBroken[plat.id];
-                if (wasBroken === false && plat.broken) {
-                    createSparkHit(plat.x + plat.w / 2, plat.y + plat.h / 2, 0.35);
-                }
-                prevPlatformBroken[plat.id] = plat.broken;
             }
         }
 
-        if (G && G.hitEvents) {
-            for (const hit of G.hitEvents) {
-                if (hit.damage > 0) {
-                    if (hit.targetId) {
-                        for (const [bulletId, lb] of [...localBullets.entries()]) {
-                            if (!lb.body) continue;
-                            if (Math.hypot(lb.body.x - hit.x, lb.body.y - hit.y) > 48) continue;
-                            if (lb.g) {
-                                bulletsContainer.removeChild(lb.g);
-                                lb.g.destroy();
-                            }
-                            localBullets.delete(bulletId);
-                        }
-                    }
-                    const targetPlayer = localPlayers[hit.targetId];
-                    let hitX = hit.x;
-                    let hitY = hit.y;
-                    if (hit.isHeadshot && targetPlayer) {
-                        const gun = getGunPose(targetPlayer);
-                        hitX = gun.hx;
-                        hitY = gun.hy;
-                    }
-                    createPlayerHitEffect(hitX, hitY, hit.isHeadshot);
-                    if (targetPlayer) {
-                        markBulletHitFace(targetPlayer, hit.isHeadshot);
-                    }
-                    if (hit.isHeadshot) {
-                        createHeadshotMarker(hitX, hitY);
-                        Sfx.playHeadshot();
-                    } else {
-                        Sfx.playBulletHit(true);
-                    }
-                } else if (!pickupCollected) {
-                    createWallHit(hit.x, hit.y);
-                    Sfx.playBulletHit(false);
-                }
-            }
-        }
-
-        const hadHitEvents = !!(G && G.hitEvents && G.hitEvents.length);
+        // Hit / wall-spark effects are driven by host.onEvent, not by reading
+        // state. `hadHitEvents` only asks whether an impact was reported since
+        // the previous snapshot, so a bullet that despawned because it struck
+        // something does not also get the generic "flew off screen" treatment.
+        const hadHitEvents = impactSinceLastSnapshot;
+        impactSinceLastSnapshot = false;
 
         if (G && G.bullets) {
             const serverBulletIds = new Set(G.bullets.map(b => b.id));
@@ -2540,18 +2596,8 @@ const lerpRemotePlayerDisplay = (p, dtSec) => {
         p.renderY = p.torso.y;
         return;
     }
-    const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
-    // Each axis is judged on its own error. A combined Math.hypot() test lets a
-    // large vertical error (a respawn drop) teleport X too, which reads to the
-    // player as a sideways yank on an opponent who was only falling.
-    p.renderX =
-        Math.abs(p.torso.x - p.renderX) > SNAP_DIST_X
-            ? p.torso.x
-            : lerpToward(p.renderX, p.torso.x, t);
-    p.renderY =
-        Math.abs(p.torso.y - p.renderY) > SNAP_DIST_Y
-            ? p.torso.y
-            : lerpToward(p.renderY, p.torso.y, t);
+    p.renderX = reconcileAxis(p.renderX, p.torso.x, REMOTE_LERP_RATE, dtSec, SNAP_DIST_X);
+    p.renderY = reconcileAxis(p.renderY, p.torso.y, REMOTE_LERP_RATE, dtSec, SNAP_DIST_Y);
 };
 
 /**
@@ -2575,18 +2621,8 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
     if (p.crouching) p.grounded = true;
 
     const rate = gameplayActive ? 25 : REMOTE_LERP_RATE;
-    const t = expLerpFactor(rate, dtSec);
-
-    // Same per-axis rule as remote players: a respawn drop snaps Y without
-    // dragging X along with it.
-    p.renderX =
-        Math.abs(p.torso.x - p.renderX) > SNAP_DIST_X
-            ? p.torso.x
-            : lerpToward(p.renderX, p.torso.x, t);
-    p.renderY =
-        Math.abs(p.torso.y - p.renderY) > SNAP_DIST_Y
-            ? p.torso.y
-            : lerpToward(p.renderY, p.torso.y, t);
+    p.renderX = reconcileAxis(p.renderX, p.torso.x, rate, dtSec, SNAP_DIST_X);
+    p.renderY = reconcileAxis(p.renderY, p.torso.y, rate, dtSec, SNAP_DIST_Y);
 };
 
 
@@ -3737,7 +3773,7 @@ app.ticker.add(() => {
         const meForPlatform = localPlayers[latestState.playerId];
         const snapPlatformId = getLocalPlatformSnapId(meForPlatform, G?.platforms);
         drawPlatforms(getPlatformsForRender(G), dtSec, snapPlatformId);
-        drawPickups(G?.pickups ?? [], getPlatformsForRender(G));
+        drawPickups(G?.pickups ?? [], getPlatformsForRender(G), dtSec);
 
         updateStartOverlay();
         tickCountdownOverlay(G, dt);
@@ -3891,7 +3927,6 @@ app.ticker.add(() => {
         }
 
         // Update Bullets (remote-style exponential lerp)
-        const bulletT = expLerpFactor(REMOTE_LERP_RATE, dtSec);
         for (const [, b] of localBullets.entries()) {
             if (!b.body || !b.g) continue;
 
@@ -3901,14 +3936,8 @@ app.ticker.add(() => {
             } else {
                 // Per axis, same rule as players. Bullets bounce, so a large
                 // error on one axis is routine and must not drag the other.
-                b.renderX =
-                    Math.abs(b.body.x - b.renderX) > BULLET_SNAP_DIST
-                        ? b.body.x
-                        : lerpToward(b.renderX, b.body.x, bulletT);
-                b.renderY =
-                    Math.abs(b.body.y - b.renderY) > BULLET_SNAP_DIST
-                        ? b.body.y
-                        : lerpToward(b.renderY, b.body.y, bulletT);
+                b.renderX = reconcileAxis(b.renderX, b.body.x, REMOTE_LERP_RATE, dtSec, BULLET_SNAP_DIST);
+                b.renderY = reconcileAxis(b.renderY, b.body.y, REMOTE_LERP_RATE, dtSec, BULLET_SNAP_DIST);
             }
 
             let angle = 0;

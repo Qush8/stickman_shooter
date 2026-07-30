@@ -4,6 +4,8 @@ import {
   createMatch,
   applyMove,
   applyTick,
+  chooseBotMove,
+  getPlayerView,
   movesFromLog,
   replay,
   type CreateMatchOptions,
@@ -1043,4 +1045,163 @@ test("shared constants ship in the state for the UI to read", () => {
   // The declared tick rate is what the manifest and the host clock agree on.
   assert.equal(c.tickRate, 30);
   assert.ok(c.tickRate <= 30, "the platform caps tickRate at 30");
+});
+
+// ---------------------------------------------------------------------------
+// Presentation events
+//
+// Effects are emitted, never stored. A per-tick array in G is only observable
+// if that exact tick is broadcast, and snapshot rate is not tick rate — so
+// storing them silently drops effects between snapshots.
+// ---------------------------------------------------------------------------
+
+const collectTickEvents = (m: MatchState<ShooterState>, ticks: number) => {
+  let state = m;
+  const events: Array<{ type: string; data?: any }> = [];
+  for (let i = 0; i < ticks; i++) {
+    const r = applyTick(game, state, TICK_DT_MS);
+    assert.ok(r.ok, r.error ?? "tick failed");
+    events.push(...(r.events ?? []));
+    state = r.state;
+  }
+  return { state, events };
+};
+
+test("effects are emitted, not stored in state", () => {
+  const m = bootMatch({ players: ["p1", "p2"], seed: "events" });
+  assert.equal(
+    (m.G as Record<string, unknown>).hitEvents,
+    undefined,
+    "hitEvents must not live in the authoritative state",
+  );
+});
+
+test("shooting emits a fire event", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "fire-evt" });
+  m = advanceTicks(m, 20);
+
+  const r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: 0, facing: 1, crouching: false, shooting: true },
+  });
+  assertMoveOk(r);
+
+  const { events } = collectTickEvents(r.state, 1);
+  const fire = events.find((e) => e.type === "fire");
+  assert.ok(fire, `expected a fire event, got: ${events.map((e) => e.type).join(",") || "none"}`);
+  assert.equal(fire!.data.playerId, "p1");
+  assert.equal(typeof fire!.data.angle, "number");
+});
+
+test("damaging a player emits a hit event carrying the impact", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "hit-evt" });
+  m = advanceTicks(m, 20);
+
+  // Same technique as the damage tests above: move the SHOOTER into a clean
+  // line of sight (the physics body owns the target's position, not G.torso).
+  const p1 = m.G.players["p1"];
+  const p2 = m.G.players["p2"];
+  p1.torso.x = p2.torso.x - 160;
+  p1.torso.y = p2.torso.y;
+  p1.head.x = p1.torso.x;
+  p1.head.y = p1.torso.y - 36;
+  p1.facing = 1;
+
+  let aim = Math.atan2(p2.head.y - p1.torso.y, p2.head.x - p1.torso.x);
+  for (let i = 0; i < 3; i++) {
+    const muzzle = testUtils.computeMuzzlePx(
+      p1.torso.x, p1.torso.y, aim, 1, false, p1.currentWeapon,
+    );
+    aim = Math.atan2(p2.head.y - muzzle.y, p2.head.x - muzzle.x);
+  }
+
+  const r = applyMove(game, m, {
+    type: "input",
+    playerId: "p1",
+    payload: { action: null, aimAngle: aim, facing: 1, crouching: false, shooting: true },
+  });
+  assertMoveOk(r);
+
+  const { events } = collectTickEvents(r.state, 60);
+  const hit = events.find((e) => e.type === "hit");
+  assert.ok(hit, `expected a hit event, got: ${events.map((e) => e.type).join(",") || "none"}`);
+  assert.equal(hit!.data.targetId, "p2");
+  assert.ok(hit!.data.damage > 0, "a hit event should carry the damage dealt");
+  assert.equal(typeof hit!.data.x, "number");
+});
+
+test("playerView hides other seats' buffered input", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "redact" });
+  for (const id of ["p1", "p2"]) {
+    const r = applyMove(game, m, {
+      type: "input",
+      playerId: id,
+      payload: { action: "right", aimAngle: 1, facing: 1, crouching: false, shooting: true },
+    });
+    assertMoveOk(r);
+    m = r.state;
+  }
+
+  assert.ok(m.G.players["p1"].input, "reducer state should hold the buffered input");
+
+  const view = getPlayerView(game, m, "p1").G as ShooterState;
+  assert.ok(view.players["p1"].input, "you can see your own intent");
+  assert.equal(
+    view.players["p2"].input,
+    undefined,
+    "an opponent's un-simulated intent must never reach the client",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Bots
+// ---------------------------------------------------------------------------
+
+test("enumerate offers a real move vocabulary", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "enum" });
+  m = advanceTicks(m, 10);
+
+  const moves = game.enumerate!(m.G, "p1", m.flow);
+  assert.ok(moves.length > 1, "a single no-op move leaves bot seats standing still");
+  const actions = moves.map((mv) => (mv.payload as any)?.action);
+  assert.ok(actions.includes("left") && actions.includes("right"), "bots need to move");
+  assert.ok(
+    moves.some((mv) => (mv.payload as any)?.shooting),
+    "bots need to be able to shoot",
+  );
+});
+
+test("the bot aims at a living opponent and plays legal moves", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "bot" });
+  m = advanceTicks(m, 20);
+
+  m.G.players["p2"].torso.x = m.G.players["p1"].torso.x + 200;
+  m.G.players["p2"].torso.y = m.G.players["p1"].torso.y;
+
+  const mv = chooseBotMove(game, m, "p1");
+  assert.ok(mv, "bot should return a move");
+  assert.equal(mv!.type, "input");
+
+  const r = applyMove(game, m, { ...mv!, playerId: "p1" });
+  assertMoveOk(r);
+
+  const aim = (mv!.payload as any).aimAngle as number;
+  assert.ok(Math.abs(aim) < 0.4, `bot should aim right at the target, got ${aim}`);
+  assert.equal((mv!.payload as any).facing, 1);
+});
+
+test("a bot match plays to completion without an illegal move", () => {
+  let m = bootMatch({ players: ["p1", "p2"], seed: "bot-selfplay" });
+  for (let i = 0; i < 400 && !m.ended; i++) {
+    for (const seat of ["p1", "p2"]) {
+      const mv = chooseBotMove(game, m, seat);
+      if (!mv) continue;
+      const r = applyMove(game, m, { ...mv, playerId: seat });
+      assertMoveOk(r);
+      m = r.state;
+    }
+    m = advanceTicks(m, 3);
+  }
+  assert.ok(m.G.worldTick > 0, "the world should have advanced");
 });

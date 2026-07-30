@@ -1,6 +1,6 @@
 {
   "name": "my-shooter-game",
-  "version": "0.1.54",
+  "version": "0.1.55",
   "type": "module",
   "private": true,
   "bordiko": {
@@ -8,6 +8,9 @@
     "displayName": "Counter Stick",
     "minPlayers": 2,
     "maxPlayers": 4,
+    "categories": [
+      "action"
+    ],
     "board": "custom",
     "realtime": {
       "tick": true,

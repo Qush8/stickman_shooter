@@ -3,6 +3,7 @@ import {
   INVALID_MOVE,
   type GameResult,
   type Json,
+  type MoveDescriptor,
   type RandomAPI,
   type TickContext,
 } from "@bordiko/sdk";
@@ -202,6 +203,7 @@ export interface BulletState {
   bounceCount: number;
 }
 
+/** Internal pending-hit record. Never stored in G — it is emitted, not shipped. */
 export interface HitEvent {
   x: number;
   y: number;
@@ -285,7 +287,6 @@ export interface ShooterState {
   worldTick: number;
   matchSeed: string;
   scores: Record<string, number>;
-  hitEvents: HitEvent[];
   gameMode: GameMode;
   teams: Record<string, TeamId>;
   currentMapId: MapId;
@@ -712,6 +713,36 @@ function setCurrentG(G: ShooterState) {
   currentG = G;
 }
 
+/**
+ * Presentation events — sparks, blasts, sounds, damage numbers.
+ *
+ * These are fire-and-forget and deliberately NOT part of G. Two reasons, both
+ * from docs.md: state that only drives effects bloats every snapshot every
+ * client downloads, and — the real bug it fixes here — a per-tick array is only
+ * observable if that exact tick happens to be broadcast. Snapshot rate is not
+ * tick rate, so effects stored in state are silently dropped between snapshots.
+ * Emitted events are always relayed immediately.
+ *
+ * Never read these back to decide game logic; anything that must be true lives
+ * in G.
+ */
+type EmitFn = (type: string, data?: Json) => void;
+const noopEmit: EmitFn = () => {};
+let currentEmit: EmitFn = noopEmit;
+
+function setCurrentEmit(emit: EmitFn | undefined) {
+  currentEmit = typeof emit === "function" ? emit : noopEmit;
+}
+
+/** Emit that never throws — a broken effect must not abort the simulation. */
+function fx(type: string, data?: Json) {
+  try {
+    currentEmit(type, data);
+  } catch {
+    // presentation only; ignore
+  }
+}
+
 function parseGameConfig(config?: Json): GameMode {
   const mode = (config as GameConfig | undefined)?.mode;
   return mode === "teams2v2" ? "teams2v2" : "ffa";
@@ -1001,6 +1032,7 @@ function breakPlatform(G: ShooterState, id: number, random?: RandomAPI) {
 
   plat.broken = true;
   plat.health = 0;
+  fx("platformBreak", { id, x: brokenX, y: brokenY, w: brokenW, h: plat.h });
   releasePickupsFromPlatform(G, id, plat);
   pendingHits.push({
     x: plat.x + plat.w / 2,
@@ -1428,6 +1460,7 @@ function queueExplosion(x: number, y: number, radius: number, damage: number, ow
 
 function processExplosions(G: ShooterState) {
   for (const ex of pendingExplosions) {
+    fx("blast", { x: ex.x, y: ex.y, r: ex.radius });
     pendingHits.push({ x: ex.x, y: ex.y, targetId: "", damage: 0 });
 
     for (const [id, p] of Object.entries(G.players)) {
@@ -1674,10 +1707,25 @@ function applyPickupToPlayer(G: ShooterState, playerId: string, pickup: PickupSt
     p.health = Math.min(MAX_HEALTH, p.health + HEALTH_PICKUP_AMOUNT);
   } else if (pickup.kind === "weapon" && pickup.weaponId) {
     addOwnedWeapon(p, pickup.weaponId);
+    const before = p.currentWeapon;
     p.currentWeapon = pickup.weaponId;
+    // Collecting a weapon auto-equips it, so it is a weapon switch too — the UI
+    // drives its equip animation off this rather than diffing state.
+    if (p.currentWeapon !== before) {
+      fx("weaponSwitch", { playerId, weaponId: p.currentWeapon });
+    }
   }
 
-  pendingHits.push({ x: pickup.x, y: pickup.y, targetId: "", damage: 0 });
+  // A pickup is its own event, not a zero-damage "hit". Faking a hit here is
+  // what forced the UI to suppress wall-spark effects whenever a pickup landed
+  // in the same snapshot.
+  fx("pickup", {
+    playerId,
+    kind: pickup.kind,
+    weaponId: pickup.weaponId ?? null,
+    x: pickup.x,
+    y: pickup.y,
+  });
   removePickup(G, pickup.id);
   return true;
 }
@@ -1975,7 +2023,8 @@ function runSpawnCycle(G: ShooterState, random: RandomAPI) {
 function processPendingHits(G: ShooterState, random: RandomAPI) {
   for (const hit of pendingHits) {
     if (!hit.targetId) {
-      if (hit.damage === 0) G.hitEvents.push(hit);
+      // Geometry hit — a bullet striking wall, platform or crate.
+      if (hit.damage === 0) fx("wallHit", { x: hit.x, y: hit.y });
       continue;
     }
 
@@ -1987,9 +2036,21 @@ function processPendingHits(G: ShooterState, random: RandomAPI) {
     }
 
     target.health = Math.max(0, target.health - hit.damage);
-    G.hitEvents.push(hit);
+    fx("hit", {
+      x: hit.x,
+      y: hit.y,
+      targetId: hit.targetId,
+      damage: hit.damage,
+      isHeadshot: !!hit.isHeadshot,
+      health: target.health,
+    });
 
     if (target.health <= 0) {
+      fx("death", {
+        playerId: hit.targetId,
+        x: target.torso.x,
+        y: target.torso.y,
+      });
       freezePlayerBody(hit.targetId, target);
       continue;
     }
@@ -2188,7 +2249,6 @@ function applyMovementInput(G: ShooterState, playerId: string, random: RandomAPI
 }
 function advanceWorld(G: ShooterState, random: RandomAPI) {
   setCurrentG(G);
-  G.hitEvents = [];
   G.worldTick += 1;
   currentWorldTick = G.worldTick;
 
@@ -2259,7 +2319,6 @@ function resetRound(G: ShooterState) {
   G.bullets = [];
   G.crates = [];
   G.pickups = [];
-  G.hitEvents = [];
   G.spawnTick = 0;
   G.worldTick = 0;
   pendingHits.length = 0;
@@ -2353,7 +2412,14 @@ function fireWeapon(
   }
 
   p.lastFireTick = G.worldTick;
-  // spawned
+  fx("fire", {
+    playerId,
+    weaponId,
+    x: p.torso.x,
+    y: p.torso.y,
+    angle: aimAngle,
+    facing,
+  });
   return true;
 }
 
@@ -2378,6 +2444,7 @@ export default defineGame<ShooterState>({
   tick: (G: ShooterState, dt: number | undefined, ctx: TickContext) => {
     try {
       setCurrentG(G);
+      setCurrentEmit(ctx.emit);
 
       const steps = PHYSICS_STEPS_PER_TICK;
 
@@ -2397,12 +2464,17 @@ export default defineGame<ShooterState>({
     } catch (err: unknown) {
       const message = err instanceof Error ? err.stack ?? err.message : String(err);
       ctx.emit("debug", { message: `WASM CRASH (tick): ${message}` });
+    } finally {
+      // Never leave a tick's emit installed — a later call would fire events
+      // into a context the host has already closed.
+      setCurrentEmit(undefined);
     }
   },
 
   setup: (ctx) => {
-    // Setup called
     try {
+      // No emit context during setup — effects belong to ticks and moves.
+      setCurrentEmit(undefined);
     const gameMode = parseGameConfig(ctx.config);
     if (gameMode === "teams2v2" && ctx.numPlayers !== 4) {
       throw new Error("teams2v2 requires exactly 4 players");
@@ -2457,7 +2529,6 @@ export default defineGame<ShooterState>({
       worldTick: 0,
       matchSeed: ctx.players.slice().sort().join("|"),
       scores: initScores(ctx.players, gameMode),
-      hitEvents: [],
       gameMode,
       teams,
       currentMapId: "default",
@@ -2503,12 +2574,14 @@ export default defineGame<ShooterState>({
     switchWeapon: (G, payload, ctx) => {
       try {
         setCurrentG(G);
+        setCurrentEmit(ctx.emit);
         if (G.roundPhase === "intermission") return;
 
         const p = G.players[ctx.playerId];
         if (!p || p.health <= 0) return INVALID_MOVE;
 
         const data = payload as { weaponId?: WeaponId; cycle?: boolean };
+        const before = p.currentWeapon;
         if (data.cycle) {
           if (p.ownedWeapons.length <= 1) return INVALID_MOVE;
           cycleOwnedWeapon(p);
@@ -2518,31 +2591,124 @@ export default defineGame<ShooterState>({
         } else {
           return INVALID_MOVE;
         }
+        if (p.currentWeapon !== before) {
+          fx("weaponSwitch", { playerId: ctx.playerId, weaponId: p.currentWeapon });
+        }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         ctx.log(`WASM CRASH (switchWeapon): ${message}`);
         return INVALID_MOVE;
+      } finally {
+        setCurrentEmit(undefined);
       }
     },
   },
   endIf: (G) => buildMatchResult(G),
 
+  /**
+   * Redaction. There are no hidden cards here, but a player's buffered `input`
+   * is their intent for a tick the world has not simulated yet — shipping every
+   * seat's held keys to every client hands out a one-tick lookahead on when an
+   * opponent is about to fire, jump or dodge. It runs server-side, so a client
+   * simply never receives it.
+   */
+  playerView: (G, playerId) => ({
+    ...G,
+    players: Object.fromEntries(
+      Object.entries(G.players).map(([id, p]) => [
+        id,
+        id === playerId ? p : { ...p, input: undefined },
+      ]),
+    ),
+  }),
+
+  /**
+   * Legal moves right now. In a real-time game the move set is a small fixed
+   * vocabulary of intents rather than a board of cells, so this enumerates the
+   * representative ones. It powers bot seats and rule fuzzing to completion.
+   */
   enumerate: (G, playerId) => {
     const p = G.players[playerId];
     if (!p || p.health <= 0 || G.roundPhase === "intermission") return [];
-    return [
-      {
-        type: "input",
-        payload: {
-          action: null,
-          jumping: false,
-          aimAngle: p.aimAngle,
-          facing: p.facing,
-          crouching: false,
-          shooting: false,
-        },
-      },
+
+    const base = {
+      aimAngle: p.aimAngle,
+      facing: p.facing,
+      crouching: false,
+      jumping: false,
+      shooting: false,
+    };
+
+    const moves: MoveDescriptor[] = [
+      { type: "input", payload: { ...base, action: null } },
+      { type: "input", payload: { ...base, action: "left", facing: -1 } },
+      { type: "input", payload: { ...base, action: "right", facing: 1 } },
+      { type: "input", payload: { ...base, action: null, jumping: true } },
+      { type: "input", payload: { ...base, action: "crouch", crouching: true } },
+      { type: "input", payload: { ...base, action: null, shooting: true } },
     ];
+
+    if (p.ownedWeapons.length > 1) {
+      moves.push({ type: "switchWeapon", payload: { cycle: true } });
+    }
+
+    return moves;
+  },
+
+  /**
+   * Fills empty seats and stands in for absent players.
+   *
+   * `random` is a private stream — it never disturbs the match RNG, and the
+   * returned move is validated against enumerate before it is applied, so a
+   * mistake here degrades to a random legal move rather than an illegal one.
+   */
+  bot: (G, playerId, _flow, random) => {
+    const me = G.players[playerId];
+    if (!me || me.health <= 0 || G.roundPhase === "intermission") return undefined;
+
+    // Nearest living opponent we are actually allowed to shoot.
+    let target: PlayerState | undefined;
+    let bestDist = Infinity;
+    for (const [id, other] of Object.entries(G.players)) {
+      if (id === playerId || other.health <= 0) continue;
+      if (!canDamage(G, playerId, id)) continue;
+      const d = Math.hypot(other.torso.x - me.torso.x, other.torso.y - me.torso.y);
+      if (d < bestDist) {
+        bestDist = d;
+        target = other;
+      }
+    }
+
+    if (!target) {
+      return { type: "input", payload: {
+        action: null, jumping: false, aimAngle: me.aimAngle,
+        facing: me.facing, crouching: false, shooting: false,
+      } };
+    }
+
+    const dx = target.torso.x - me.torso.x;
+    const dy = target.torso.y - me.torso.y;
+    const aimAngle = Math.atan2(dy, dx);
+    const facing = dx >= 0 ? 1 : -1;
+
+    // Close the gap when far, back off when crowded, otherwise hold and fire.
+    let action: string | null = null;
+    if (bestDist > 260) action = dx >= 0 ? "right" : "left";
+    else if (bestDist < 90) action = dx >= 0 ? "left" : "right";
+
+    // Fire once roughly on target. The reducer still enforces cooldown and ammo.
+    const aimError = Math.abs(
+      Math.atan2(Math.sin(aimAngle - me.aimAngle), Math.cos(aimAngle - me.aimAngle)),
+    );
+    const shooting = aimError < 0.35 && bestDist < 620;
+
+    // Hop toward a target that is above us, and occasionally to break aim.
+    const jumping = me.grounded && (dy < -70 ? random.bool(0.35) : random.bool(0.04));
+
+    return {
+      type: "input",
+      payload: { action, jumping, aimAngle, facing, crouching: false, shooting },
+    };
   },
 });
 
