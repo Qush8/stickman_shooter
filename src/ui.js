@@ -4,22 +4,31 @@ import { connectBordiko } from '@bordiko/sdk/ui';
 import { GUN_PISTOL_B64, GUN_SHOTGUN_B64, GUN_RIFLE_B64 } from './sfx-buffers.js';
 import { MAPS } from './maps.ts';
 
-const ARENA_W = 912;
-const ARENA_H = 500;
-const FLOOR_Y = ARENA_H;
-const SCALE = 30;
-/** Half-height of standing Box2D player box (game.ts PLAYER_HALF_H * SCALE). */
-const FEET_OFF = 1.06 * SCALE; // 31.8 — visual feet sit on bottom of physics AABB
-/** Must match game.ts STICK_CROUCH_DROP_PX so crouch feet stay on the box bottom. */
-const STICK_CROUCH_DROP_PX = 22;
+/**
+ * Reducer-owned constants.
+ *
+ * These are NOT the source of truth — they are boot defaults used only until the
+ * first snapshot lands, after which `applySharedConsts` overwrites them from
+ * `G.consts`. Never hard-code a reducer constant here: the .wasm and this file
+ * ship as independently versioned artifacts, so a mirrored copy drifts silently
+ * and looks exactly like a netcode bug (docs.md, "Don't mirror constants").
+ */
+let ARENA_W = 912;
+let ARENA_H = 500;
+let FLOOR_Y = ARENA_H;
+let SCALE = 30;
+/** Half-height of standing Box2D player box (game.ts playerHalfH * scale). */
+let FEET_OFF = 1.06 * SCALE; // 31.8 — visual feet sit on bottom of physics AABB
+/** game.ts crouchDropPx — keeps crouch feet on the box bottom. */
+let STICK_CROUCH_DROP_PX = 22;
+let CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
+let PLAYER_HALF_W_PX = 0.48 * SCALE;
+let RECOIL_IMPULSE_PX = 34 * SCALE * Math.sqrt(0.9);
+let PLATFORM_MAX_HP = 1000;
+/** Declared host tick rate; the measured rate lives in `netStats` (see below). */
+let DECLARED_TICK_RATE = 30;
+
 const CROUCH_BODY_LEN_MUL = 0.74;
-const CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
-/** Match game.ts movement constants (pixels / second). */
-const MOVE_SPEED_PX = 15 * SCALE;
-const JUMP_VY_PX = -34 * SCALE;
-const GRAVITY_PX = 97.5 * SCALE;
-const RECOIL_HEIGHT_OF_JUMP = 0.9;
-const RECOIL_IMPULSE_PX = 34 * SCALE * Math.sqrt(RECOIL_HEIGHT_OF_JUMP);
 const WEAPON_RECOIL_SCALE = {
     bazooka: 1.35,
     sniper: 1.15,
@@ -27,11 +36,21 @@ const WEAPON_RECOIL_SCALE = {
 };
 /** Exponential smoothing rates (higher = snappier). */
 const REMOTE_LERP_RATE = 20;
-const LOCAL_RECONCILE_RATE = 10;
-const LOCAL_RECONCILE_RATE_MOVING = 4;
-const LOCAL_SNAP_DIST = 120;
 const CAMERA_LERP_RATE = 14;
-const PLAYER_HALF_W_PX = 0.48 * SCALE;
+/**
+ * Hard-snap thresholds, judged per axis.
+ *
+ * Never a 2D Math.hypot() test: error on the axis the server owns would teleport
+ * the axis we predict, which players read as a sideways yank while running
+ * (docs.md, "Judge each axis on its own error"). Sized for teleports only —
+ * respawn / round-reset distances, not ordinary drift. At 450 px/s run speed a
+ * 200 ms hiccup is ~90 px on X; a jump at 1020 px/s covers ~204 px on Y, so both
+ * thresholds sit well above normal play and well below an arena-crossing reset.
+ */
+const SNAP_DIST_X = 220;
+const SNAP_DIST_Y = 280;
+/** Bullets travel ~1200 px/s and bounce, so they get their own budget. */
+const BULLET_SNAP_DIST = 120;
 const FIT_PADDING = 0.46;
 /** Cap windowed scale on large monitors so stickman/platforms stay readable. */
 const WINDOWED_MAX_CONTAINER_W = 540;
@@ -51,7 +70,6 @@ let cameraInitialized = false;
 
 const PLATFORM_BORDER = 2;
 const PLATFORM_VIS_H = 11;
-const PLATFORM_MAX_HP = 1000;
 const PLATFORM_LAND_TOLERANCE = 10;
 const CROUCH_BLEND_MS = 150;
 
@@ -410,6 +428,107 @@ const lerpToward = (from, to, t) => from + (to - from) * t;
 /** Frame-rate independent exponential lerp factor. */
 const expLerpFactor = (rate, dtSec) => 1 - Math.exp(-rate * Math.max(0, dtSec));
 
+let sharedConstsApplied = false;
+
+/**
+ * Adopt the reducer's constants from `G.consts` (see game.ts SharedConsts).
+ *
+ * Runs once, on the first snapshot that carries them. Any value that differs
+ * from our boot default is reported to the debug panel: that difference means
+ * the .wasm moved without a matching ui.html rebuild, and saying so out loud is
+ * the whole point of shipping them in the state rather than mirroring them.
+ */
+const applySharedConsts = (consts) => {
+    if (sharedConstsApplied || !consts) return;
+    sharedConstsApplied = true;
+
+    const drift = [];
+    const adopt = (label, next, current) => {
+        if (typeof next !== "number" || !Number.isFinite(next)) return current;
+        if (Math.abs(next - current) > 1e-6) drift.push(`${label}: ui=${current} wasm=${next}`);
+        return next;
+    };
+
+    ARENA_W = adopt("arenaW", consts.arenaW, ARENA_W);
+    ARENA_H = adopt("arenaH", consts.arenaH, ARENA_H);
+    SCALE = adopt("scale", consts.scale, SCALE);
+    STICK_CROUCH_DROP_PX = adopt("crouchDropPx", consts.crouchDropPx, STICK_CROUCH_DROP_PX);
+    PLATFORM_MAX_HP = adopt("platformMaxHealth", consts.platformMaxHealth, PLATFORM_MAX_HP);
+    RECOIL_IMPULSE_PX = adopt("recoilImpulse", consts.recoilImpulse, RECOIL_IMPULSE_PX);
+    DECLARED_TICK_RATE = adopt("tickRate", consts.tickRate, DECLARED_TICK_RATE);
+
+    // Derived — recompute after the primitives land, never before.
+    FLOOR_Y = ARENA_H;
+    if (typeof consts.playerHalfH === "number") FEET_OFF = consts.playerHalfH * SCALE;
+    if (typeof consts.playerHalfW === "number") PLAYER_HALF_W_PX = consts.playerHalfW * SCALE;
+    CROUCH_FEET_OFF = FEET_OFF - STICK_CROUCH_DROP_PX / 2;
+
+    if (drift.length) {
+        bordikoHost.debug(
+            `[consts] ui.html is stale against the reducer — ${drift.join(", ")}`,
+        );
+    }
+};
+
+/**
+ * Measured simulation rate, from `state.tick` and `state.serverTs`.
+ *
+ * The host drops ticks rather than queueing them when a tick costs more than its
+ * interval, so the declared tickRate is an upper bound, not a fact. Anything we
+ * size against the clock sizes against `netStats.tickRate` instead (docs.md,
+ * "Measure the real rate — it is not the one you declared").
+ */
+const netStats = {
+    tickRate: 30,
+    lastTick: null,
+    lastServerTs: null,
+    /** Snapshot interval in ms — what actually paces our input sends. */
+    snapshotIntervalMs: 1000 / 30,
+    lastSnapshotAt: null,
+    samples: 0,
+};
+
+const observeSnapshotTiming = (state) => {
+    const tick = state?.tick;
+    const serverTs = state?.serverTs;
+    if (typeof tick === "number" && typeof serverTs === "number") {
+        if (
+            netStats.lastTick !== null &&
+            tick > netStats.lastTick &&
+            serverTs > netStats.lastServerTs
+        ) {
+            const measured =
+                ((tick - netStats.lastTick) * 1000) / (serverTs - netStats.lastServerTs);
+            // Smooth it — a single interval is noisy; the trend is what matters.
+            netStats.tickRate = netStats.tickRate * 0.8 + measured * 0.2;
+        }
+        netStats.lastTick = tick;
+        netStats.lastServerTs = serverTs;
+    }
+
+    const now = performance.now();
+    if (netStats.lastSnapshotAt !== null) {
+        const gap = now - netStats.lastSnapshotAt;
+        if (gap > 0 && gap < 1000) {
+            netStats.snapshotIntervalMs = netStats.snapshotIntervalMs * 0.8 + gap * 0.2;
+        }
+    }
+    netStats.lastSnapshotAt = now;
+
+    // Report a shortfall to the debug panel every ~5 s. A real rate well under
+    // the declared one means the reducer is too slow per tick — no amount of
+    // client-side tuning fixes that, so it is worth saying plainly.
+    netStats.samples = (netStats.samples ?? 0) + 1;
+    if (netStats.samples % 150 === 0 && netStats.lastTick !== null) {
+        if (netStats.tickRate < DECLARED_TICK_RATE * 0.85) {
+            bordikoHost.debug(
+                `[rate] simulating ${netStats.tickRate.toFixed(1)}/s of a declared ` +
+                    `${DECLARED_TICK_RATE}/s — the tick reducer is over budget`,
+            );
+        }
+    }
+};
+
 const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60, snapPlatformId = null) => {
     const liveIds = new Set();
     const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
@@ -451,12 +570,17 @@ const syncPlatformDisplayTargets = (platforms, dtSec = 1 / 60, snapPlatformId = 
         if (snapPlatformId === plat.id) {
             prev.renderX = plat.x;
             prev.renderY = plat.y;
-        } else if (Math.hypot(plat.x - prev.renderX, plat.y - prev.renderY) > 80) {
-            prev.renderX = plat.x;
-            prev.renderY = plat.y;
         } else {
-            prev.renderX = lerpToward(prev.renderX, plat.x, t);
-            prev.renderY = lerpToward(prev.renderY, plat.y, t);
+            // Per axis: an elevator respawning off-screen on X must not also
+            // teleport its Y, which is smoothly tracking a moving platform.
+            prev.renderX =
+                Math.abs(plat.x - prev.renderX) > SNAP_DIST_X
+                    ? plat.x
+                    : lerpToward(prev.renderX, plat.x, t);
+            prev.renderY =
+                Math.abs(plat.y - prev.renderY) > SNAP_DIST_Y
+                    ? plat.y
+                    : lerpToward(prev.renderY, plat.y, t);
         }
     }
     for (const id of [...localPlatformDisplay.keys()]) {
@@ -1312,7 +1436,8 @@ let prevMatchEnded = false;
 const bordikoHost = connectBordiko();
 const hostMove = bordikoHost.move.bind(bordikoHost);
 bordikoHost.move = (type, payload) => {
-    hostMove(type, payload);
+    // Must return the id: it is the only handle onAck can be correlated against.
+    return hostMove(type, payload);
 };
 
 let hostStateCount = 0;
@@ -1351,13 +1476,83 @@ const inputsAreEqual = (a, b) =>
     a.facing === b.facing &&
     Math.abs(a.aimAngle - b.aimAngle) <= AIM_SEND_THRESHOLD;
 
+/**
+ * The in-flight jump, tracked by move id.
+ *
+ * A jump is the one input we predict that the server can refuse (it checks
+ * grounded / wall-jump / jumpGrace). Rather than ignoring the server for a fixed
+ * grace period and hoping, we ask it: the ack carries the moveCount the jump
+ * landed at, so every snapshot at or past that number provably includes it
+ * (docs.md, "Has the server seen my input yet?").
+ */
+const pendingJumpAck = { id: null, appliedAt: null, sentAtSnapshot: 0 };
+
+/**
+ * Whether this host acks at all. Acks are an SDK >= 0.4.0 host feature; if we
+ * never see one we must not gate reconciliation on a verdict that will never
+ * arrive, so the whole mechanism degrades to trusting the server as before.
+ */
+let hostSendsAcks = false;
+
+/** Snapshots to wait before giving up on a verdict (~0.7 s at 30 Hz). */
+const JUMP_ACK_SNAPSHOT_LIMIT = 20;
+
+const clearPendingJumpAck = () => {
+    pendingJumpAck.id = null;
+    pendingJumpAck.appliedAt = null;
+};
+
+/** True while a sent jump has not yet been proven present in the snapshot. */
+const jumpAwaitingServer = () => {
+    if (!hostSendsAcks) return false;
+    if (pendingJumpAck.id === null && pendingJumpAck.appliedAt === null) return false;
+    if (hostStateCount - pendingJumpAck.sentAtSnapshot > JUMP_ACK_SNAPSHOT_LIMIT) {
+        // Verdict never came. Stop waiting rather than block reconciliation.
+        clearPendingJumpAck();
+        return false;
+    }
+    return true;
+};
+
+/** The server rejected the jump — undo the predicted takeoff now, not later. */
+const rollBackPredictedJump = () => {
+    clearPendingJumpAck();
+    const me = latestState ? localPlayers[latestState.playerId] : null;
+    if (!me) return;
+    if ((me.predVy ?? 0) < 0) me.predVy = 0;
+    if (me.torso) me.renderY = me.torso.y;
+};
+
 const sendInputIfChanged = (input) => {
     if (lastSentInput && inputsAreEqual(lastSentInput, input)) return false;
-    bordikoHost.move("input", input);
+    const moveId = bordikoHost.move("input", input);
+    if (input.jumping) {
+        pendingJumpAck.id = moveId ?? null;
+        pendingJumpAck.appliedAt = null;
+        pendingJumpAck.sentAtSnapshot = hostStateCount;
+    }
     lastSentInput = { ...input, jumping: false };
     lastInputSendTime = Date.now();
     return true;
 };
+
+bordikoHost.onAck((ack) => {
+    if (!ack) return;
+    hostSendsAcks = true;
+    if (!ack.ok) {
+        bordikoHost.debug(`[ack] move ${ack.id} rejected: ${ack.reason ?? "no reason given"}`);
+    }
+    if (ack.id !== pendingJumpAck.id) return;
+    if (!ack.ok) {
+        rollBackPredictedJump();
+        return;
+    }
+    // Accepted — remember which moveCount it landed at, then wait for a snapshot
+    // at or past it before believing the server's grounded/vy again.
+    pendingJumpAck.id = null;
+    pendingJumpAck.appliedAt =
+        typeof ack.moveCount === "number" ? ack.moveCount : null;
+});
 
 // Input
 const activeKeys = new Set();
@@ -1559,8 +1754,22 @@ const handleGameState = (state) => {
         hostStateCount += 1;
 
         latestState = state;
+        observeSnapshotTiming(state);
+        applySharedConsts(state?.G?.consts);
         fitCanvas();
         const G = latestState.G;
+
+        // Resolve the in-flight jump against this snapshot's moveCount. Once the
+        // counter has reached the ack'd value the jump is provably applied, so
+        // the server's grounded/vy become trustworthy again.
+        if (
+            pendingJumpAck.appliedAt !== null &&
+            typeof state.moveCount === "number" &&
+            state.moveCount >= pendingJumpAck.appliedAt
+        ) {
+            clearPendingJumpAck();
+        }
+        const jumpUnconfirmed = jumpAwaitingServer();
 
         if (G && localCountdownStartAt == null) {
             beginStartCountdown();
@@ -1683,14 +1892,19 @@ const handleGameState = (state) => {
                         lp.grounded = !!p.grounded;
                     } else {
                         // Local player keeps predicted renderX/Y; torso is authority for soft reconcile.
-                        if (typeof p.grounded === "boolean") {
+                        //
+                        // While a jump is in flight the server's `grounded` is stale
+                        // by definition — it describes a world that has not seen the
+                        // takeoff yet. Adopting it here would re-ground us and cancel
+                        // our own jump on the very frame we launched.
+                        if (typeof p.grounded === "boolean" && !jumpUnconfirmed) {
                             const ry = lp.renderY ?? p.torso.y;
                             if (Math.abs(ry - p.torso.y) < 12) {
                                 lp.grounded = p.grounded;
                                 if (p.grounded) lp.predVy = 0;
                             }
                         }
-                        if (typeof p.vy === "number" && !lp.grounded) {
+                        if (typeof p.vy === "number" && !lp.grounded && !jumpUnconfirmed) {
                             // Softly pull predicted vertical velocity toward server while airborne.
                             lp.predVy = (lp.predVy ?? p.vy) * 0.7 + p.vy * 0.3;
                         }
@@ -2326,16 +2540,18 @@ const lerpRemotePlayerDisplay = (p, dtSec) => {
         p.renderY = p.torso.y;
         return;
     }
-    const dx = p.torso.x - p.renderX;
-    const dy = p.torso.y - p.renderY;
-    if (Math.hypot(dx, dy) > 80) {
-        p.renderX = p.torso.x;
-        p.renderY = p.torso.y;
-        return;
-    }
     const t = expLerpFactor(REMOTE_LERP_RATE, dtSec);
-    p.renderX = lerpToward(p.renderX, p.torso.x, t);
-    p.renderY = lerpToward(p.renderY, p.torso.y, t);
+    // Each axis is judged on its own error. A combined Math.hypot() test lets a
+    // large vertical error (a respawn drop) teleport X too, which reads to the
+    // player as a sideways yank on an opponent who was only falling.
+    p.renderX =
+        Math.abs(p.torso.x - p.renderX) > SNAP_DIST_X
+            ? p.torso.x
+            : lerpToward(p.renderX, p.torso.x, t);
+    p.renderY =
+        Math.abs(p.torso.y - p.renderY) > SNAP_DIST_Y
+            ? p.torso.y
+            : lerpToward(p.renderY, p.torso.y, t);
 };
 
 /**
@@ -2361,8 +2577,16 @@ const predictLocalPlayerDisplay = (p, action, crouching, jumpPressed, dtSec, gam
     const rate = gameplayActive ? 25 : REMOTE_LERP_RATE;
     const t = expLerpFactor(rate, dtSec);
 
-    p.renderX = lerpToward(p.renderX, p.torso.x, t);
-    p.renderY = lerpToward(p.renderY, p.torso.y, t);
+    // Same per-axis rule as remote players: a respawn drop snaps Y without
+    // dragging X along with it.
+    p.renderX =
+        Math.abs(p.torso.x - p.renderX) > SNAP_DIST_X
+            ? p.torso.x
+            : lerpToward(p.renderX, p.torso.x, t);
+    p.renderY =
+        Math.abs(p.torso.y - p.renderY) > SNAP_DIST_Y
+            ? p.torso.y
+            : lerpToward(p.renderY, p.torso.y, t);
 };
 
 
@@ -3571,7 +3795,15 @@ app.ticker.add(() => {
                 gameplayActive ? pointerHeld : false,
             );
 
-            if (Date.now() - lastInputSendTime > 33) {
+            // Pace sends against the rate the server is actually simulating at,
+            // not the rate we declared. If the host is dropping ticks (30 -> 22),
+            // sending faster buys nothing: extra inputs are overwritten before a
+            // tick ever reads them. Clamped so a bad measurement can't stall input.
+            const sendIntervalMs = Math.min(
+                100,
+                Math.max(16, 1000 / Math.max(1, netStats.tickRate)),
+            );
+            if (Date.now() - lastInputSendTime > sendIntervalMs) {
                 if (sendInputIfChanged(input)) {
                     pendingJump = false;
                 }
@@ -3667,15 +3899,16 @@ app.ticker.add(() => {
                 b.renderX = b.body.x;
                 b.renderY = b.body.y;
             } else {
-                const dx = b.body.x - b.renderX;
-                const dy = b.body.y - b.renderY;
-                if (Math.hypot(dx, dy) > 120) {
-                    b.renderX = b.body.x;
-                    b.renderY = b.body.y;
-                } else {
-                    b.renderX = lerpToward(b.renderX, b.body.x, bulletT);
-                    b.renderY = lerpToward(b.renderY, b.body.y, bulletT);
-                }
+                // Per axis, same rule as players. Bullets bounce, so a large
+                // error on one axis is routine and must not drag the other.
+                b.renderX =
+                    Math.abs(b.body.x - b.renderX) > BULLET_SNAP_DIST
+                        ? b.body.x
+                        : lerpToward(b.renderX, b.body.x, bulletT);
+                b.renderY =
+                    Math.abs(b.body.y - b.renderY) > BULLET_SNAP_DIST
+                        ? b.body.y
+                        : lerpToward(b.renderY, b.body.y, bulletT);
             }
 
             let angle = 0;

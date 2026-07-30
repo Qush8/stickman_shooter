@@ -4,6 +4,8 @@ import {
   createMatch,
   applyMove,
   applyTick,
+  movesFromLog,
+  replay,
   type CreateMatchOptions,
   type MatchState,
 } from "@bordiko/sdk";
@@ -948,4 +950,97 @@ test("crouch stays active while key held on ground", () => {
     m = advanceTicks(r.state, 1);
     assert.equal(m.G.players["p1"].crouching, true, `tick ${i}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Determinism
+//
+// The platform's one invariant: same seed + same ordered log => byte-identical
+// state. Server authority, replays, reconnection and bots all rest on it, and a
+// real-time game is the easy place to break it — a tick that reads a wall clock
+// or Math.random() passes every other test in this file and fails only here.
+// ---------------------------------------------------------------------------
+
+test("replaying the log reproduces byte-identical state", () => {
+  const players = ["p1", "p2"];
+  const seed = "determinism";
+  let m = bootMatch({ players, seed });
+
+  // A mixed workload: movement, jumps, firing, weapon switches, and enough
+  // ticks for bullets, platform spawns and pickups to all be in flight.
+  const script: Array<{ playerId: string; payload: Record<string, unknown> }> = [
+    { playerId: "p1", payload: { action: "right", jumping: false, aimAngle: 0.2, facing: 1, crouching: false, shooting: true } },
+    { playerId: "p2", payload: { action: "left", jumping: true, aimAngle: -2.9, facing: -1, crouching: false, shooting: true } },
+    { playerId: "p1", payload: { action: "left", jumping: true, aimAngle: -0.6, facing: -1, crouching: false, shooting: false } },
+    { playerId: "p2", payload: { action: null, jumping: false, aimAngle: 3.0, facing: -1, crouching: true, shooting: true } },
+  ];
+
+  for (let round = 0; round < 12; round++) {
+    for (const step of script) {
+      const r = applyMove(game, m, { type: "input", ...step });
+      assertMoveOk(r);
+      m = r.state;
+    }
+    m = advanceTicks(m, 10);
+  }
+
+  assert.ok(m.log.length > 100, "expected a substantial log to replay");
+  assert.ok(
+    m.log.some((e) => e.type === "__tick"),
+    "expected ticks in the log — this is a real-time game",
+  );
+
+  const replayed = replay(game, m.seed, players, movesFromLog(m));
+
+  assert.equal(
+    JSON.stringify(replayed.G),
+    JSON.stringify(m.G),
+    "replayed state diverged from the original",
+  );
+});
+
+test("the same seed produces the same match twice over", () => {
+  const players = ["p1", "p2"];
+  const run = () => {
+    let m = bootMatch({ players, seed: "twice" });
+    for (let i = 0; i < 8; i++) {
+      const r = applyMove(game, m, {
+        type: "input",
+        playerId: "p1",
+        payload: { action: "right", jumping: i % 3 === 0, aimAngle: i * 0.3, facing: 1, crouching: false, shooting: true },
+      });
+      assertMoveOk(r);
+      m = advanceTicks(r.state, 12);
+    }
+    return m;
+  };
+
+  assert.equal(JSON.stringify(run().G), JSON.stringify(run().G));
+});
+
+test("shared constants ship in the state for the UI to read", () => {
+  // The UI must never mirror these — see game.ts SharedConsts and the
+  // applySharedConsts drift check in src/ui.js.
+  const m = bootMatch({ players: ["p1", "p2"], seed: "consts" });
+  const c = m.G.consts;
+
+  for (const key of [
+    "scale",
+    "arenaW",
+    "arenaH",
+    "playerHalfW",
+    "playerHalfH",
+    "crouchDropPx",
+    "platformMaxHealth",
+    "recoilImpulse",
+    "tickRate",
+    "physicsStepsPerTick",
+  ] as const) {
+    assert.equal(typeof c[key], "number", `consts.${key} must be a number`);
+    assert.ok(Number.isFinite(c[key]), `consts.${key} must be finite`);
+  }
+
+  // The declared tick rate is what the manifest and the host clock agree on.
+  assert.equal(c.tickRate, 30);
+  assert.ok(c.tickRate <= 30, "the platform caps tickRate at 30");
 });

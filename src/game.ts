@@ -248,7 +248,30 @@ export interface PickupState {
   fallToFloor?: boolean;
 }
 
+/**
+ * Constants the UI needs but must not mirror.
+ *
+ * The .wasm and ui.html are versioned independently — a reducer update that
+ * changes SCALE or the player box without a matching ui.html rebuild would drift
+ * silently and read exactly like a netcode bug. Shipping them in the state makes
+ * the reducer the single source of truth (see docs.md, "Don't mirror constants").
+ */
+export interface SharedConsts {
+  scale: number;
+  arenaW: number;
+  arenaH: number;
+  playerHalfW: number;
+  playerHalfH: number;
+  crouchDropPx: number;
+  platformMaxHealth: number;
+  recoilImpulse: number;
+  tickRate: number;
+  physicsStepsPerTick: number;
+}
+
 export interface ShooterState {
+  /** Reducer-owned constants the UI reads instead of hard-coding. */
+  consts: SharedConsts;
   players: Record<string, PlayerState>;
   bullets: BulletState[];
   platforms: PlatformState[];
@@ -295,6 +318,8 @@ const HEAD_RADIUS = HEAD_VISUAL_RADIUS_PX / SCALE;
 const PHYSICS_HZ = 60;
 const PHYSICS_DT = 1 / PHYSICS_HZ;
 const PHYSICS_STEPS_PER_TICK = 1;
+/** Host clock rate — also declared in the manifest and the `realtime` block below. */
+const TICK_RATE = 30;
 const MOVE_SPEED = 15 * SCALE;
 const JUMP_VY = -34 * SCALE;
 /** Target peak height = jump × this (impulse uses √ratio for energy scaling). */
@@ -345,6 +370,20 @@ const PLAYER_CROUCH_H = PLAYER_H - STICK_CROUCH_DROP_PX;
 const PLATFORM_WIDTH_MUL = 0.68;
 const GUN_BARREL_PX = 23;
 const GUN_TIP_PX = 2.4;
+
+/** Snapshot of the reducer's constants, shipped to the UI in `G.consts`. */
+const buildSharedConsts = (): SharedConsts => ({
+  scale: SCALE,
+  arenaW: ARENA_W,
+  arenaH: ARENA_H,
+  playerHalfW: PLAYER_HALF_W,
+  playerHalfH: PLAYER_HALF_H,
+  crouchDropPx: STICK_CROUCH_DROP_PX,
+  platformMaxHealth: PLATFORM_MAX_HEALTH,
+  recoilImpulse: RECOIL_IMPULSE,
+  tickRate: TICK_RATE,
+  physicsStepsPerTick: PHYSICS_STEPS_PER_TICK,
+});
 
 const spawnOnFloor = (x: number) => ({
   x,
@@ -2330,7 +2369,7 @@ export default defineGame<ShooterState>({
   // @ts-ignore - Force real-time mode for the production build
   realtime: {
     tick: true,
-    tickRate: 30,
+    tickRate: TICK_RATE,
   },
 
   initialActive: (G) => Object.keys(G.players),
@@ -2404,6 +2443,7 @@ export default defineGame<ShooterState>({
     });
 
     const G: ShooterState = {
+      consts: buildSharedConsts(),
       players,
       bullets: [],
       platforms: [],
